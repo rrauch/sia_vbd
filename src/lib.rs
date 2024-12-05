@@ -1,6 +1,6 @@
-use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use futures::AsyncReadExt;
+use std::cmp::min;
 use tokio::net::TcpListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -28,37 +28,36 @@ pub async fn run(addr: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) trait AsyncReadBytesExt: AsyncReadExt + Unpin {
-    /// Reads a `u16` in network byte order from the reader
-    async fn get_u16(&mut self) -> std::io::Result<u16> {
-        let mut buf = [0u8; 2];
-        self.read_exact(&mut buf).await?;
-        Ok(BigEndian::read_u16(&buf))
-    }
-
-    /// Reads a `u32` in network byte order from the reader
-    async fn get_u32(&mut self) -> std::io::Result<u32> {
-        let mut buf = [0u8; 4];
-        self.read_exact(&mut buf).await?;
-        Ok(BigEndian::read_u32(&buf))
-    }
-
-    /// Reads a `u64` in network byte order from the reader
-    async fn get_u64(&mut self) -> std::io::Result<u64> {
-        let mut buf = [0u8; 8];
-        self.read_exact(&mut buf).await?;
-        Ok(BigEndian::read_u64(&buf))
-    }
-
     /// Reads exactly `n` bytes into a new buffer
     async fn get_exact(&mut self, n: usize) -> std::io::Result<Bytes> {
         let mut buf = BytesMut::zeroed(n);
         self.read_exact(buf.as_mut()).await?;
         Ok(buf.freeze())
     }
+
+    /// Skips exactly `n` bytes from the reader
+    async fn skip(&mut self, n: usize) -> std::io::Result<()> {
+        //todo: find option that does not need allocating
+        let mut remaining = n;
+        let mut buffer = [0u8; 8192];
+        while remaining > 0 {
+            let to_read = min(remaining, buffer.len());
+            let bytes_read = self.read(&mut buffer[..to_read]).await?;
+            if bytes_read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Reached EOF",
+                ));
+            }
+            remaining -= bytes_read;
+        }
+        Ok(())
+    }
 }
 // Blanket implementation for all types that implement AsyncReadExt
 impl<T: AsyncReadExt + ?Sized + Unpin> AsyncReadBytesExt for T {}
 
-pub(crate) trait BlockDevice {
-
+/*pub(crate) trait AsyncWriteBytesExt: AsyncWriteExt + Unpin {
 }
+// Blanket implementation for all types that implement AsyncReadExt
+impl<T: AsyncWriteExt + ?Sized + Unpin> AsyncWriteBytesExt for T {}*/

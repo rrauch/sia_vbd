@@ -1,9 +1,9 @@
-use crate::nbd::TransmissionMode;
+use crate::nbd::{TransmissionMode, MAX_PAYLOAD_LEN};
 use crate::AsyncReadBytesExt;
-use anyhow::anyhow;
 use bitflags::bitflags;
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use compact_bytes::CompactBytes;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::net::SocketAddr;
 use thiserror::Error;
@@ -60,53 +60,153 @@ bitflags! {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, TryFromPrimitive, IntoPrimitive,
-)]
-#[repr(u16)]
-/// `ReplyType` is only used when structured responses are active.
-enum ReplyType {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Reply {
     /// Indicates a request was handled successfully
     ///
     /// **MUST** always be used with the `NBD_REPLY_FLAG_DONE` bit set.
     /// Valid as a reply to any request.
-    None = 0u16,
+    None,
     /// Content chunk with `offset` and `length`
     ///
     /// The data **MUST** lie within the bounds of the requested range.
     /// May be used more than once unless `NBD_CMD_FLAG_DF` was set.
     /// Valid for `NBD_CMD_READ` only.
-    OffsetData = 1u16,
+    OffsetData(u64, u64),
     /// Empty chunk (all zeroes) with `offset` and `length`
     ///
     /// Contains no actual data as content is all zeroes.
     /// The range **MUST** lie within the bounds of the requested range
     /// and **MUST NOT** overlap with any previously sent chunks within the same reply.
     /// Valid for `NBD_CMD_READ` only.
-    OffsetHole = 2u16,
-    BlockStatus = 5u16,
-    ExtendedBlockStatus = 6u16,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, TryFromPrimitive, IntoPrimitive,
-)]
-#[repr(u16)]
-/// `ReplyError` is only used when structured responses are active.
-enum ReplyError {
+    OffsetHole(u64, u32),
+    BlockStatus,
+    ExtendedBlockStatus,
     /// *SHOULD NOT* be sent more than once per reply.
     /// A mandatory [ErrorType] as to be supplied.
     /// Can contain an optional error message. The message length **MUST NOT** exceed 4096 bytes.
     /// *Note*: does not automatically indicate the completion of the reply. The `NBD_REPLY_FLAG_DONE`
     /// flag still has to be set if this completes the reply.
-    Error = (1 << 15) | (1),
+    Error(ErrorType, Option<String>),
     /// Error with an additional offset indicator
     ///
     /// Similar to [ReplyError::Error], but with an additional offset.
     /// Valid as a reply to:
     /// `NBD_CMD_READ`, `NBD_CMD_WRITE`, `NBD_CMD_TRIM`, `NBD_CMD_CACHE`, `NBD_CMD_WRITE_ZEROES`,
     /// and `NBD_CMD_BLOCK_STATUS`.
-    OffsetError = (1 << 15) | (2),
+    OffsetError(ErrorType, u64, Option<String>),
+}
+
+impl Reply {
+    async fn serialize(
+        self,
+        tx: &mut (impl AsyncWrite + Unpin),
+        transmission_mode: TransmissionMode,
+        cookie: u64,
+        offset: u64,
+        done: bool,
+    ) -> std::io::Result<()> {
+        use Reply::*;
+
+        let mut buf = [0u8; 32];
+        let (magic, header_len) = match transmission_mode {
+            TransmissionMode::Simple => (SIMPLE_REPLY_MAGIC, 16),
+            TransmissionMode::Structured => (STRUCTURED_REPLY_MAGIC, 20),
+            TransmissionMode::Extended => (EXTENDED_REPLY_MAGIC, 32),
+        };
+        let mut header = &mut buf[..header_len];
+        header.put_u32(magic);
+
+        if transmission_mode == TransmissionMode::Simple {
+            // Simple responses are very limited
+            let error = match self {
+                Error(error_type, _) | OffsetError(error_type, _, _) => error_type.into(),
+                _ => 0, // not an error
+            };
+            header.put_u32(error);
+            header.put_u64(cookie);
+            tx.write_all(&buf[..header_len]).await?;
+            return Ok(());
+        }
+
+        let mut flags = StructuredReplyFlags::empty();
+        if done {
+            // last reply for this request
+            flags |= StructuredReplyFlags::DONE;
+        }
+        header.put_u16(flags.bits());
+
+        let rep_type: u16 = match &self {
+            None => 0,
+            OffsetData(_, _) => 1,
+            OffsetHole(_, _) => 2,
+            BlockStatus => 5,
+            ExtendedBlockStatus => 6,
+            Error(_, _) => (1 << 15) | (1),
+            OffsetError(_, _, _) => (1 << 15) | (2),
+        };
+        header.put_u16(rep_type);
+        header.put_u64(cookie);
+
+        let mut payload = CompactBytes::default();
+
+        let additional_length = match self {
+            None => 0,
+            OffsetData(offset, length) => {
+                payload.extend_from_slice(offset.to_be_bytes().as_slice());
+                length
+            }
+            OffsetHole(offset, length) => {
+                payload.extend_from_slice(offset.to_be_bytes().as_slice());
+                payload.extend_from_slice(length.to_be_bytes().as_slice());
+                0
+            }
+            BlockStatus => unimplemented!("NBD_REPLY_TYPE_BLOCK_STATUS is unimplemented"),
+            ExtendedBlockStatus => {
+                unimplemented!("NBD_REPLY_TYPE_BLOCK_STATUS_EXT is unimplemented")
+            }
+            Error(error_type, msg) => {
+                payload.extend_from_slice(Into::<u32>::into(error_type).to_be_bytes().as_slice());
+                let msg = msg.map(|s| s.into_bytes()).unwrap_or_default();
+                payload.extend_from_slice((msg.len() as u16).to_be_bytes().as_slice());
+                if msg.len() > 0 {
+                    payload.extend_from_slice(msg.as_slice());
+                }
+                0
+            }
+            OffsetError(error_type, offset, msg) => {
+                payload.extend_from_slice(Into::<u32>::into(error_type).to_be_bytes().as_slice());
+                let msg = msg.map(|s| s.into_bytes()).unwrap_or_default();
+                payload.extend_from_slice((msg.len() as u16).to_be_bytes().as_slice());
+                payload.extend_from_slice(offset.to_be_bytes().as_slice());
+                if msg.len() > 0 {
+                    payload.extend_from_slice(msg.as_slice());
+                }
+                0
+            }
+        };
+        let length = payload.len() as u64 + additional_length;
+
+        match transmission_mode {
+            TransmissionMode::Structured => {
+                header.put_u32(length as u32);
+            }
+            TransmissionMode::Extended => {
+                header.put_u64(offset);
+                header.put_u64(length);
+            }
+            TransmissionMode::Simple => {
+                unreachable!()
+            }
+        }
+        tx.write_all(&buf[..header_len]).await?;
+
+        if payload.len() > 0 {
+            tx.write_all(payload.as_slice()).await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(
@@ -165,6 +265,157 @@ enum RequestType {
     Resize = 8u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct RequestId {
+    cookie: u64,
+    offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Command {
+    Read {
+        offset: u64,
+        length: u64,
+        dont_fragment: bool,
+    },
+    Write {
+        offset: u64,
+        length: u64,
+        fua: bool,
+    },
+    Disconnect,
+    Flush,
+    Trim {
+        offset: u64,
+        length: u64,
+    },
+    Cache {
+        offset: u64,
+        length: u64,
+    },
+    WriteZeroes {
+        offset: u64,
+        length: u64,
+        no_hole: bool,
+        fast_only: bool,
+    },
+    BlockStatus,
+    Resize,
+}
+
+struct Request {
+    id: RequestId,
+    command: Command,
+    payload_length: u32,
+}
+
+impl Request {
+    fn deserialize(
+        mut buf: impl Buf,
+        transmission_mode: TransmissionMode,
+    ) -> Result<Self, RequestError> {
+        use RequestError::*;
+        let magic = buf.get_u32();
+        match magic {
+            REQUEST_MAGIC => {
+                if transmission_mode == TransmissionMode::Extended {
+                    return Err(ExtendedRequestHeaderRequired);
+                }
+                // all good
+            }
+            EXTENDED_REQUEST_MAGIC => {
+                if transmission_mode != TransmissionMode::Extended {
+                    return Err(ExtendedRequestHeaderNotAllowed);
+                }
+                // all good
+            }
+            _ => {
+                // invalid header received from client
+                return Err(InvalidRequestHeader);
+            }
+        }
+
+        let flags = CommandFlags::from_bits(buf.get_u16()).ok_or(InvalidCommandFlags)?;
+        let req_type = RequestType::try_from(buf.get_u16()).map_err(|_| UnknownRequestType)?;
+        let cookie = buf.get_u64();
+        let offset = buf.get_u64();
+        let id = RequestId { cookie, offset };
+
+        let length;
+        if transmission_mode == TransmissionMode::Extended {
+            // extended requests have a 64-bit length field
+            length = buf.get_u64();
+        } else {
+            // compact requests have a 32-bit length field
+            length = buf.get_u32() as u64;
+        }
+
+        let payload_length = match transmission_mode {
+            TransmissionMode::Simple | TransmissionMode::Structured => {
+                match req_type {
+                    RequestType::Write => length as u32,
+                    _ => {
+                        // only `Write` commands can have a payload in non-extended mode
+                        0
+                    }
+                }
+            }
+            TransmissionMode::Extended => {
+                // In extended mode the `NBD_CMD_FLAG_PAYLOAD_LEN` indicates whether the header
+                // length is a payload length or an effect length
+                if flags.contains(CommandFlags::PAYLOAD_LEN) {
+                    length as u32
+                } else {
+                    0
+                }
+            }
+        };
+
+        if payload_length > MAX_PAYLOAD_LEN {
+            return Err(Overflow)?;
+        }
+
+        let command = match req_type {
+            RequestType::Read => {
+                let dont_fragment = if transmission_mode == TransmissionMode::Simple {
+                    // simple mode does not support reply fragmentation
+                    true
+                } else {
+                    flags.contains(CommandFlags::DF)
+                };
+                Command::Read {
+                    offset,
+                    length,
+                    dont_fragment,
+                }
+            }
+            RequestType::Write => Command::Write {
+                offset,
+                length,
+                fua: flags.contains(CommandFlags::FUA),
+            },
+            RequestType::Disconnect => Command::Disconnect,
+            RequestType::Flush => Command::Flush,
+            RequestType::Trim => Command::Trim { offset, length },
+            RequestType::Cache => Command::Cache { offset, length },
+            RequestType::WriteZeroes => Command::WriteZeroes {
+                offset,
+                length,
+                fast_only: flags.contains(CommandFlags::FAST_ZERO),
+                no_hole: flags.contains(CommandFlags::NO_HOLE),
+            },
+            RequestType::BlockStatus => Command::BlockStatus,
+            RequestType::Resize => Command::Resize,
+        };
+
+        Ok(Request {
+            id,
+            command,
+            payload_length,
+        })
+    }
+}
+
 pub(super) struct TransmissionHandler {
     export_name: String,
     transmission_mode: TransmissionMode,
@@ -191,43 +442,64 @@ impl TransmissionHandler {
     ) -> Result<(), NbdError> {
         use RequestError::*;
 
-        if self.transmission_mode != TransmissionMode::Simple {
-            return Err(anyhow!("only simple mode is currently supported"))?;
-        }
-
+        let mut buf = [0u8; 32];
         loop {
-            // read the header of the next request
-            if rx.get_u32().await? != REQUEST_MAGIC {
-                // invalid header received from client
-                return Err(InvalidRequestHeader)?;
-            }
-            let flags = CommandFlags::from_bits(rx.get_u16().await?).ok_or(InvalidCommandFlags)?;
-            let req_type =
-                RequestType::try_from(rx.get_u16().await?).map_err(|_| InvalidRequestType)?;
-            let cookie = rx.get_u64().await?;
-            let offset = rx.get_u64().await?;
-            let length = rx.get_u32().await?;
+            // read the next request header
+            let buf = if self.transmission_mode == TransmissionMode::Extended {
+                // extended mode allows only extended requests
+                rx.read_exact(&mut buf).await?;
+                &buf[..]
+            } else {
+                // request has to be a regular request
+                rx.read_exact(&mut buf[..28]).await?;
+                &buf[..28]
+            };
+            let req = Request::deserialize(buf, self.transmission_mode)?;
 
-            match req_type {
-                RequestType::Read => {
-                    self.read(length, cookie, &mut tx).await?;
+            let mut payload_remaining = req.payload_length as usize;
+
+            match req.command {
+                Command::Read { offset, length, .. } => {
+                    self.read(offset, length, req.id, &mut tx).await?;
                     eprintln!("read {} bytes at offset {}", length, offset);
                 }
-                RequestType::Write => {
-                    let payload = rx.get_exact(length as usize).await?;
-                    self.write(payload, flags.contains(CommandFlags::FUA), cookie, &mut tx)
-                        .await?;
+                Command::Write {
+                    offset,
+                    length,
+                    fua,
+                } => {
+                    if req.payload_length == 0 {
+                        return Err(InvalidInput)?;
+                    }
+                    let payload = rx.get_exact(req.payload_length as usize).await?;
+                    payload_remaining = payload_remaining.saturating_sub(payload.len());
+                    self.write(payload, fua, req.id, &mut tx).await?;
                     eprintln!("wrote {} bytes at offset {}", length, offset);
                 }
-                RequestType::Flush => {
-                    self.flush(cookie, &mut tx).await?;
+                Command::Flush => {
+                    self.flush(req.id, &mut tx).await?;
                     eprintln!("flush request received");
                 }
-                RequestType::Disconnect => {
+                Command::Disconnect => {
                     eprintln!("client sent disconnect request");
                     break;
                 }
-                _ => return Err(anyhow!("request type {:?} unimplemented", req_type).into()),
+                _ => {
+                    // unsupported command
+                    self.send_error(
+                        ErrorType::NotSupported,
+                        None,
+                        Some(format!("Command {:?} is unsupported", req.command)),
+                        req.id,
+                        &mut tx,
+                    )
+                    .await?;
+                }
+            }
+
+            if payload_remaining > 0 {
+                // discard any unprocessed payload data
+                rx.skip(payload_remaining).await?;
             }
         }
 
@@ -237,16 +509,29 @@ impl TransmissionHandler {
     // stub
     async fn read(
         &self,
-        length: u32,
-        cookie: u64,
+        offset: u64,
+        length: u64,
+        req_id: RequestId,
         tx: &mut (impl AsyncWrite + Unpin),
     ) -> std::io::Result<()> {
-        let data = BytesMut::zeroed(length as usize).freeze();
-        let mut len = BytesMut::with_capacity(4);
-        len.put_u32(data.len() as u32);
-        let header = Self::reply_header_simple(0, cookie);
-        tx.write_all(header.as_ref()).await?;
+        let mut data = BytesMut::zeroed(length as usize);
+        data[..4].copy_from_slice(&0xDEADBEEF_u32.to_be_bytes());
+        data[(length as usize - 4)..].copy_from_slice(&0xFEEBDAED_u32.to_be_bytes());
+        let data = data.freeze();
+        Reply::OffsetData(offset, data.len() as u64)
+            .serialize(
+                tx,
+                self.transmission_mode,
+                req_id.cookie,
+                req_id.offset,
+                false,
+            )
+            .await?;
         tx.write_all(&data).await?;
+        if self.transmission_mode != TransmissionMode::Simple {
+            self.send_done(req_id, tx).await?;
+        }
+        tx.flush().await?;
         Ok(())
     }
 
@@ -255,60 +540,73 @@ impl TransmissionHandler {
         &self,
         _payload: Bytes,
         _fua: bool,
-        cookie: u64,
+        req_id: RequestId,
         tx: &mut (impl AsyncWrite + Unpin),
     ) -> std::io::Result<()> {
-        let header = Self::reply_header_simple(0, cookie);
-        tx.write_all(header.as_ref()).await?;
+        self.send_done(req_id, tx).await?;
+        tx.flush().await?;
         Ok(())
     }
 
     // stub
-    async fn flush(&self, cookie: u64, tx: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
-        let header = Self::reply_header_simple(0, cookie);
-        tx.write_all(header.as_ref()).await?;
-        Ok(())
-    }
-
-    fn reply_header_simple(error: u32, cookie: u64) -> Bytes {
-        let mut header = BytesMut::with_capacity(16);
-        header.put_u32(SIMPLE_REPLY_MAGIC);
-        header.put_u32(error);
-        header.put_u64(cookie);
-        header.freeze()
-    }
-
-    /*async fn _send_reply(
+    async fn flush(
         &self,
+        req_id: RequestId,
         tx: &mut (impl AsyncWrite + Unpin),
-        error: u32,
-        cookie: u64,
-        data: Option<Bytes>,
     ) -> std::io::Result<()> {
-        let data_len = data.as_ref().map(|b| b.len()).unwrap_or(0);
-        let mut resp = match self.transmission_mode {
-            TransmissionMode::Simple => {
-                let mut resp = BytesMut::with_capacity(16 + data_len);
-                resp.put_u32(SIMPLE_REPLY_MAGIC);
-                resp
-            },
-            TransmissionMode::Structured => {
-                let mut resp = BytesMut::with_capacity(20 + data_len);
-                resp.put_u32(STRUCTURED_REPLY_MAGIC);
-                resp
-            }
-        };
-        resp.put_u32(option_type);
-        resp.put_u32(resp_type);
-        resp.put_u32(data_len as u32);
-        if let Some(data) = data {
-            resp.put(data);
-        }
-        let resp = resp.freeze();
-        tx.write_all(resp.as_ref()).await?;
+        self.send_done(req_id, tx).await?;
         tx.flush().await?;
         Ok(())
-    }*/
+    }
+
+    async fn send_done(
+        &self,
+        req_id: RequestId,
+        tx: &mut (impl AsyncWrite + Unpin),
+    ) -> std::io::Result<()> {
+        Reply::None
+            .serialize(
+                tx,
+                self.transmission_mode,
+                req_id.cookie,
+                req_id.offset,
+                true,
+            )
+            .await?;
+        tx.flush().await?;
+        Ok(())
+    }
+
+    async fn send_error(
+        &self,
+        error: ErrorType,
+        offset: Option<u64>,
+        msg: Option<String>,
+        req_id: RequestId,
+        tx: &mut (impl AsyncWrite + Unpin),
+    ) -> std::io::Result<()> {
+        let reply = match offset {
+            Some(offset) => {
+                // error at specific offset
+                Reply::OffsetError(error, offset, msg)
+            }
+            None => {
+                // general error
+                Reply::Error(error, msg)
+            }
+        };
+        reply
+            .serialize(
+                tx,
+                self.transmission_mode,
+                req_id.cookie,
+                req_id.offset,
+                true,
+            )
+            .await?;
+        tx.flush().await?;
+        Ok(())
+    }
 }
 
 #[derive(Error, Debug)]
@@ -329,10 +627,22 @@ pub(super) enum RequestError {
     /// The client sent an invalid request header
     #[error("invalid request header")]
     InvalidRequestHeader,
+    /// The client did not send an extended request header when required
+    #[error("extended request header required")]
+    ExtendedRequestHeaderRequired,
+    /// The client sent an extended request header when it was not negotiated
+    #[error("extended request header not allowed")]
+    ExtendedRequestHeaderNotAllowed,
     /// The client sent invalid command flags
     #[error("invalid command flags")]
     InvalidCommandFlags,
-    /// The client sent an
-    #[error("invalid command flags")]
-    InvalidRequestType,
+    /// The client sent an unknown request type
+    #[error("unknown request type")]
+    UnknownRequestType,
+    /// The client sent a payload that exceeds MAX_PAYLOAD_LEN
+    #[error("payload > {} bytes", MAX_PAYLOAD_LEN)]
+    Overflow,
+    /// The client sent an invalid input value
+    #[error("invalid input")]
+    InvalidInput,
 }
