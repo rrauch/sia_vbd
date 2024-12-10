@@ -1,29 +1,105 @@
+use crate::nbd::handshake::Handshaker;
+use crate::nbd::{handler::Handler, Export};
+use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
-use futures::AsyncReadExt;
+use futures::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use std::cmp::min;
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-mod nbd;
+pub mod nbd;
 
-pub async fn run(addr: &str) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    println!("Listening on {}", listener.local_addr()?);
-    loop {
-        let (socket, addr) = listener.accept().await?;
-        println!("New connection from {}", addr);
+pub struct Runner {
+    addr: String,
+    handshaker: Arc<Handshaker>,
+}
 
-        tokio::spawn(async move {
-            let (rx, tx) = socket.into_split();
-            let rx = rx.compat();
-            //let tx = FramedWrite::new(tx, BytesCodec::new());
-            let tx = tx.compat_write();
+pub struct Builder {
+    addr: String,
+    exports: HashMap<String, Export>,
+    default_export: Option<String>,
+    structured_replies_disabled: bool,
+    extended_headers_disabled: bool,
+}
 
-            if let Err(error) = nbd::new_connection(rx, tx, addr.clone()).await {
-                eprintln!("error {:?}, client address {}", error, addr);
-            }
-            println!("connection closed for {}", addr);
-        });
+impl Builder {
+    pub fn new<S: ToString>(addr: S) -> Self {
+        Self {
+            addr: addr.to_string(),
+            exports: HashMap::default(),
+            default_export: None,
+            structured_replies_disabled: false,
+            extended_headers_disabled: false,
+        }
+    }
+
+    pub fn with_export<S: ToString, H: Handler + Send + Sync + 'static>(
+        mut self,
+        name: S,
+        handler: H,
+        force_read_only: bool,
+    ) -> Self {
+        let name = name.to_string();
+        let export = Export::new(name.clone(), handler, force_read_only);
+        self.exports.insert(name, export);
+        self
+    }
+
+    pub fn with_default_export<S: ToString>(mut self, name: S) -> Self {
+        self.default_export = Some(name.to_string());
+        self
+    }
+
+    pub fn disable_structured_replies(mut self) -> Self {
+        self.structured_replies_disabled = true;
+        self.extended_headers_disabled = true;
+        self
+    }
+
+    pub fn disable_extended_headers(mut self) -> Self {
+        self.extended_headers_disabled = true;
+        self
+    }
+
+    pub fn build(self) -> Runner {
+        let handshaker = Handshaker::new(
+            self.exports,
+            self.default_export,
+            self.structured_replies_disabled,
+            self.extended_headers_disabled,
+        );
+        Runner {
+            addr: self.addr,
+            handshaker: Arc::new(handshaker),
+        }
+    }
+}
+
+impl Runner {
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let listener = TcpListener::bind(&self.addr).await?;
+        println!("Listening on {}", listener.local_addr()?);
+        loop {
+            let (socket, addr) = listener.accept().await?;
+            println!("New connection from {}", addr);
+            let handshaker = self.handshaker.clone();
+            tokio::spawn(async move {
+                let (rx, tx) = socket.into_split();
+                let rx = rx.compat();
+                let tx = tx.compat_write();
+
+                if let Err(error) = nbd::new_connection(&handshaker, rx, tx, addr.clone()).await {
+                    eprintln!("error {:?}, client address {}", error, addr);
+                }
+                println!("connection closed for {}", addr);
+            });
+        }
     }
 }
 
@@ -37,7 +113,6 @@ pub(crate) trait AsyncReadBytesExt: AsyncReadExt + Unpin {
 
     /// Skips exactly `n` bytes from the reader
     async fn skip(&mut self, n: usize) -> std::io::Result<()> {
-        //todo: find option that does not need allocating
         let mut remaining = n;
         let mut buffer = [0u8; 8192];
         while remaining > 0 {
@@ -54,10 +129,108 @@ pub(crate) trait AsyncReadBytesExt: AsyncReadExt + Unpin {
         Ok(())
     }
 }
-// Blanket implementation for all types that implement AsyncReadExt
 impl<T: AsyncReadExt + ?Sized + Unpin> AsyncReadBytesExt for T {}
 
-/*pub(crate) trait AsyncWriteBytesExt: AsyncWriteExt + Unpin {
+pub(crate) trait AsyncWriteBytesExt: AsyncWriteExt + Unpin {
+    /// Write exactly `n` bytes of zeroes to the writer
+    async fn write_zeroes(&mut self, n: usize) -> std::io::Result<()> {
+        let mut remaining = n;
+        let zeroes = [0u8; 8192];
+        while remaining > 0 {
+            let to_write = min(remaining, zeroes.len());
+            let bytes_written = self.write(&zeroes[..to_write]).await?;
+            if bytes_written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Reached EOF",
+                ));
+            }
+            remaining -= bytes_written;
+        }
+        Ok(())
+    }
 }
-// Blanket implementation for all types that implement AsyncReadExt
-impl<T: AsyncWriteExt + ?Sized + Unpin> AsyncWriteBytesExt for T {}*/
+impl<T: AsyncWriteExt + ?Sized + Unpin> AsyncWriteBytesExt for T {}
+
+#[derive(Debug)]
+pub(crate) struct LimitedReader<R> {
+    inner: Option<R>,
+    remaining: usize,
+    return_tx: Option<oneshot::Sender<(R, usize)>>,
+}
+
+impl<R> LimitedReader<R> {
+    pub(crate) fn new(inner: R, limit: usize, return_tx: oneshot::Sender<(R, usize)>) -> Self
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        Self {
+            inner: Some(inner),
+            remaining: limit,
+            return_tx: Some(return_tx),
+        }
+    }
+
+    fn return_inner(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            if let Some(return_tx) = self.return_tx.take() {
+                let _ = return_tx.send((inner, self.remaining));
+            }
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send> AsyncRead for LimitedReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+
+        if this.remaining == 0 {
+            // finished already
+            this.return_inner();
+            return Poll::Ready(Ok(0));
+        }
+
+        let inner = match this.inner.as_mut() {
+            Some(inner) => inner,
+            None => {
+                return Poll::Ready(Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    anyhow!("inner reader was None"),
+                )));
+            }
+        };
+
+        let max_read = min(buf.len(), this.remaining);
+        let pinned_inner = Pin::new(inner);
+
+        match pinned_inner.poll_read(cx, &mut buf[..max_read]) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(0)) => {
+                // eof
+                this.return_inner();
+                Poll::Ready(Ok(0))
+            }
+            Poll::Ready(Ok(bytes_read)) => {
+                this.remaining -= bytes_read;
+                if this.remaining == 0 {
+                    this.return_inner();
+                }
+                Poll::Ready(Ok(bytes_read))
+            }
+            Poll::Ready(Err(err)) => {
+                this.return_inner();
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+}
+
+impl<R> Drop for LimitedReader<R> {
+    fn drop(&mut self) {
+        self.return_inner();
+    }
+}

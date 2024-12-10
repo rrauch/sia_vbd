@@ -7,6 +7,7 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use once_cell::sync::Lazy;
 use std::cmp::PartialEq;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use thiserror::Error;
 
@@ -306,228 +307,266 @@ bitflags! {
     }
 }
 
-pub(super) async fn process<RX: AsyncRead + Unpin, TX: AsyncWrite + Unpin>(
-    rx: &mut RX,
-    tx: &mut TX,
-    addr: &SocketAddr,
-) -> Result<Option<TransmissionHandler>, NbdError> {
-    use RequestError::*;
-
-    // Send the initial magic header & handshake flags
-    tx.write_all(INITIAL_SERVER_MESSAGE.as_ref()).await?;
-    tx.flush().await?;
-
-    // Read the flags the client has responded with
-    let mut buf = [0u8; 4];
-    rx.read_exact(&mut buf).await?;
-    let client_hs_flags = ClientFlags::from_bits(buf.as_slice().get_u32())
-        .ok_or(HandshakeError::InvalidClientHandshake)?;
-
-    // Server & Client Handshake flags have to match before we can proceed
-    if client_hs_flags != ClientFlags::FIXED_NEWSTYLE | ClientFlags::NO_ZEROES {
-        return Err(HandshakeError::HandshakeFailed)?;
-    }
-
-    // Handshake looks good, proceed to option negotiation
-    let mut transmission_mode = TransmissionMode::Simple;
-    let mut abort = false;
-
-    let mut buf = [0u8; 16];
-    loop {
-        // read the next request header
-        rx.read_exact(&mut buf).await?;
-        let mut buf = &buf[..];
-
-        let magic = buf.get_u64();
-        if magic != I_HAVE_OPT {
-            return Err(InvalidOptionHeader)?;
-        }
-
-        let option_type = buf.get_u32();
-        let option_len = buf.get_u32() as usize;
-        if option_len > MAX_DATA_LEN {
-            return Err(InvalidOption(OptionError::from(DataError::Overflow)))?;
-        }
-
-        let mut option_data = None;
-        if option_len > 0 {
-            option_data = Some(rx.get_exact(option_len).await?);
-        }
-
-        let option_type = OptionRequestType::try_from(option_type)
-            .map_err(|_| InvalidOption(OptionError::UnsupportedOption(option_type)))?;
-
-        let option_request = match OptionRequest::deserialize(option_type, option_data) {
-            Ok(req) => req,
-            Err(OptionError::UnsupportedOption(option_type)) => {
-                // this server does not support the option the client has requested
-                send_error(tx, option_type, ErrorType::UNSUP, None).await?;
-                // don't disconnect, read the next request instead
-                continue;
-            }
-            Err(e) => {
-                // option could not be read, disconnect
-                return Err(NbdError::InvalidRequest(e.into()));
-            }
-        };
-
-        match option_request {
-            OptionRequest::ExportName(name) => {
-                if let Some(export) = find_export(name) {
-                    // export ok, inform client and proceed to transmission phase
-                    tx.write_all(to_export_payload(&export, transmission_mode).as_ref())
-                        .await?;
-                    return Ok(Some(to_transmission_handler(
-                        export,
-                        transmission_mode,
-                        addr,
-                    )));
-                }
-                // export is unavailable, but client does not support error handling
-                // do not respond to the client, end conversation immediately
-                return Ok(None);
-            }
-            OptionRequest::Abort => {
-                // client requested to end the session
-                abort = true;
-            }
-            OptionRequest::Info(ref name, ref info_types)
-            | OptionRequest::Go(ref name, ref info_types) => {
-                if let Some(export) = find_export(name.as_ref()) {
-                    for info_type in info_types {
-                        match info_type {
-                            InfoType::Name => {
-                                let name_bytes = export.name.as_bytes();
-                                let mut payload = BytesMut::with_capacity(name_bytes.len() + 2);
-                                payload.put_u16(InfoType::Name.into());
-                                payload.put(name_bytes);
-                                send_info(
-                                    tx,
-                                    option_request.as_req_type().into(),
-                                    payload.freeze(),
-                                )
-                                .await?;
-                            }
-                            InfoType::Description => {
-                                if let Some(desc_bytes) =
-                                    export.description.as_ref().map(|s| s.as_bytes())
-                                {
-                                    let mut payload = BytesMut::with_capacity(desc_bytes.len() + 2);
-                                    payload.put_u16(InfoType::Description.into());
-                                    payload.put(desc_bytes);
-                                    send_info(
-                                        tx,
-                                        option_request.as_req_type().into(),
-                                        payload.freeze(),
-                                    )
-                                    .await?;
-                                }
-                            }
-                            InfoType::BlockSize => {
-                                if let Some((min, preferred)) = export.block_size {
-                                    let mut payload = BytesMut::with_capacity(14);
-                                    payload.put_u16(InfoType::BlockSize.into());
-                                    payload.put_u32(min);
-                                    payload.put_u32(preferred);
-                                    payload.put_u32(MAX_PAYLOAD_LEN);
-                                    send_info(
-                                        tx,
-                                        option_request.as_req_type().into(),
-                                        payload.freeze(),
-                                    )
-                                    .await?;
-                                }
-                            }
-                            InfoType::Export => {
-                                // ignore, will always be sent anyway
-                            }
-                        }
-                    }
-                    // always send export info, even if not explicitly requested
-                    let mut info_export_payload = BytesMut::with_capacity(12);
-                    info_export_payload.put_u16(InfoType::Export.into());
-                    info_export_payload.put(to_export_payload(&export, transmission_mode));
-                    let info_export_payload = info_export_payload.freeze();
-                    send_info(tx, option_request.as_req_type().into(), info_export_payload).await?;
-
-                    if option_request.as_req_type() == OptionRequestType::Go {
-                        // send Ack and move to transmission phase
-                        send_ack(tx, OptionRequestType::Go.into()).await?;
-                        return Ok(Some(to_transmission_handler(
-                            export,
-                            transmission_mode,
-                            addr,
-                        )));
-                    }
-                }
-                // the requested export does not exist or access has been denied
-                send_error(
-                    tx,
-                    option_request.as_req_type().into(),
-                    ErrorType::UNKNOWN,
-                    "requested export is unknown or unavailable".to_string(),
-                )
-                .await?;
-                continue;
-            }
-            OptionRequest::StructuredReply => {
-                transmission_mode = TransmissionMode::Structured;
-            }
-            OptionRequest::ExtendedHeaders => {
-                transmission_mode = TransmissionMode::Extended;
-            }
-            OptionRequest::List => {
-                for export in list_exports() {
-                    send_server(tx, option_request.as_req_type().into(), export).await?;
-                }
-            }
-            _ => {
-                // no other options are supported right now
-                send_error(
-                    tx,
-                    option_request.as_req_type().into(),
-                    ErrorType::UNSUP,
-                    None,
-                )
-                .await?;
-                continue;
-            }
-        }
-        send_ack(tx, option_request.as_req_type()).await?;
-        if abort {
-            return Ok(None);
-        }
-    }
+pub(crate) struct Handshaker {
+    exports: HashMap<String, Export>,
+    default_export: Option<String>,
+    structured_replies_disabled: bool,
+    extended_headers_disabled: bool,
 }
 
-fn to_transmission_handler(
-    export: Export,
-    transmission_mode: TransmissionMode,
-    addr: &SocketAddr,
-) -> TransmissionHandler {
-    TransmissionHandler::new(export.name, transmission_mode, addr.clone())
+impl Handshaker {
+    pub fn new<I: IntoIterator<Item = (String, Export)>>(
+        exports: I,
+        default_export: Option<String>,
+        structured_replies_disabled: bool,
+        extended_headers_disabled: bool,
+    ) -> Self {
+        Self {
+            exports: exports.into_iter().collect(),
+            default_export,
+            structured_replies_disabled,
+            extended_headers_disabled: if structured_replies_disabled {
+                // automatically disable extended headers if structured replies are disabled
+                true
+            } else {
+                extended_headers_disabled
+            },
+        }
+    }
+
+    pub(super) async fn process<RX: AsyncRead + Unpin, TX: AsyncWrite + Unpin>(
+        &self,
+        rx: &mut RX,
+        tx: &mut TX,
+        addr: &SocketAddr,
+    ) -> Result<Option<TransmissionHandler>, NbdError> {
+        use RequestError::*;
+
+        // Send the initial magic header & handshake flags
+        tx.write_all(INITIAL_SERVER_MESSAGE.as_ref()).await?;
+        tx.flush().await?;
+
+        // Read the flags the client has responded with
+        let mut buf = [0u8; 4];
+        rx.read_exact(&mut buf).await?;
+        let client_hs_flags = ClientFlags::from_bits(buf.as_slice().get_u32())
+            .ok_or(HandshakeError::InvalidClientHandshake)?;
+
+        // Server & Client Handshake flags have to match before we can proceed
+        if client_hs_flags != ClientFlags::FIXED_NEWSTYLE | ClientFlags::NO_ZEROES {
+            return Err(HandshakeError::HandshakeFailed)?;
+        }
+
+        // Handshake looks good, proceed to option negotiation
+        let mut transmission_mode = TransmissionMode::Simple;
+        let mut abort = false;
+
+        let mut buf = [0u8; 16];
+        loop {
+            // read the next request header
+            rx.read_exact(&mut buf).await?;
+            let mut buf = &buf[..];
+
+            let magic = buf.get_u64();
+            if magic != I_HAVE_OPT {
+                return Err(InvalidOptionHeader)?;
+            }
+
+            let option_type = buf.get_u32();
+            let option_len = buf.get_u32() as usize;
+            if option_len > MAX_DATA_LEN {
+                return Err(InvalidOption(OptionError::from(DataError::Overflow)))?;
+            }
+
+            let mut option_data = None;
+            if option_len > 0 {
+                option_data = Some(rx.get_exact(option_len).await?);
+            }
+
+            let option_type = OptionRequestType::try_from(option_type)
+                .map_err(|_| InvalidOption(OptionError::UnsupportedOption(option_type)))?;
+
+            let option_request = match OptionRequest::deserialize(option_type, option_data) {
+                Ok(req) => req,
+                Err(OptionError::UnsupportedOption(option_type)) => {
+                    // this server does not support the option the client has requested
+                    send_error(tx, option_type, ErrorType::UNSUP, None).await?;
+                    // don't disconnect, read the next request instead
+                    continue;
+                }
+                Err(e) => {
+                    // option could not be read, disconnect
+                    return Err(NbdError::InvalidRequest(e.into()));
+                }
+            };
+
+            match option_request {
+                OptionRequest::ExportName(name) => {
+                    if let Some(export) = self.find_export(name) {
+                        // export ok, inform client and proceed to transmission phase
+                        tx.write_all(to_export_payload(&export, transmission_mode).as_ref())
+                            .await?;
+                        return Ok(Some(TransmissionHandler::new(
+                            export,
+                            transmission_mode,
+                            addr.clone(),
+                        )));
+                    }
+                    // export is unavailable, but client does not support error handling
+                    // do not respond to the client, end conversation immediately
+                    return Ok(None);
+                }
+                OptionRequest::Abort => {
+                    // client requested to end the session
+                    abort = true;
+                }
+                OptionRequest::Info(ref name, ref info_types)
+                | OptionRequest::Go(ref name, ref info_types) => {
+                    if let Some(export) = self.find_export(name.as_ref()) {
+                        for info_type in info_types {
+                            match info_type {
+                                InfoType::Name => {
+                                    let name_bytes = export.name.as_bytes();
+                                    let mut payload = BytesMut::with_capacity(name_bytes.len() + 2);
+                                    payload.put_u16(InfoType::Name.into());
+                                    payload.put(name_bytes);
+                                    send_info(
+                                        tx,
+                                        option_request.as_req_type().into(),
+                                        payload.freeze(),
+                                    )
+                                    .await?;
+                                }
+                                InfoType::Description => {
+                                    let options = export.options();
+                                    if let Some(desc_bytes) =
+                                        options.description.as_ref().map(|s| s.as_bytes())
+                                    {
+                                        let mut payload =
+                                            BytesMut::with_capacity(desc_bytes.len() + 2);
+                                        payload.put_u16(InfoType::Description.into());
+                                        payload.put(desc_bytes);
+                                        send_info(
+                                            tx,
+                                            option_request.as_req_type().into(),
+                                            payload.freeze(),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                InfoType::BlockSize => {
+                                    let options = export.options();
+                                    if let Some((min, preferred)) = options.block_size {
+                                        let mut payload = BytesMut::with_capacity(14);
+                                        payload.put_u16(InfoType::BlockSize.into());
+                                        payload.put_u32(min);
+                                        payload.put_u32(preferred);
+                                        payload.put_u32(MAX_PAYLOAD_LEN);
+                                        send_info(
+                                            tx,
+                                            option_request.as_req_type().into(),
+                                            payload.freeze(),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                InfoType::Export => {
+                                    // ignore, will always be sent anyway
+                                }
+                            }
+                        }
+                        // always send export info, even if not explicitly requested
+                        let mut info_export_payload = BytesMut::with_capacity(12);
+                        info_export_payload.put_u16(InfoType::Export.into());
+                        info_export_payload.put(to_export_payload(&export, transmission_mode));
+                        let info_export_payload = info_export_payload.freeze();
+                        send_info(tx, option_request.as_req_type().into(), info_export_payload)
+                            .await?;
+
+                        if option_request.as_req_type() == OptionRequestType::Go {
+                            // send Ack and move to transmission phase
+                            send_ack(tx, OptionRequestType::Go.into()).await?;
+                            return Ok(Some(TransmissionHandler::new(
+                                export,
+                                transmission_mode,
+                                addr.clone(),
+                            )));
+                        }
+                    }
+                    // the requested export does not exist or access has been denied
+                    send_error(
+                        tx,
+                        option_request.as_req_type().into(),
+                        ErrorType::UNKNOWN,
+                        "requested export is unknown or unavailable".to_string(),
+                    )
+                    .await?;
+                    continue;
+                }
+                OptionRequest::StructuredReply if !self.structured_replies_disabled => {
+                    transmission_mode = TransmissionMode::Structured;
+                }
+                OptionRequest::ExtendedHeaders if !self.extended_headers_disabled => {
+                    transmission_mode = TransmissionMode::Extended;
+                }
+                OptionRequest::List => {
+                    for export_name in self.exports.keys() {
+                        send_server(tx, option_request.as_req_type().into(), export_name.clone())
+                            .await?;
+                    }
+                }
+                _ => {
+                    // no other options are supported right now
+                    send_error(
+                        tx,
+                        option_request.as_req_type().into(),
+                        ErrorType::UNSUP,
+                        None,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+            send_ack(tx, option_request.as_req_type()).await?;
+            if abort {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn find_export<S: AsRef<str>>(&self, name: Option<S>) -> Option<Export> {
+        let name = match name.as_ref() {
+            Some(name) => name.as_ref(),
+            None => match self.default_export.as_ref() {
+                Some(name) => name.as_str(),
+                None => return None,
+            },
+        };
+        self.exports.get(name).map(|exp| exp.clone())
+    }
 }
 
 fn to_export_payload(export: &Export, transmission_mode: TransmissionMode) -> Bytes {
     let mut flags = TransmissionFlags::HAS_FLAGS;
-    if export.read_only {
+    if export.read_only() {
         flags |= TransmissionFlags::READ_ONLY;
     } else {
         flags |= TransmissionFlags::SEND_FLUSH;
         flags |= TransmissionFlags::SEND_FUA;
     };
-    if export.rotational {
+    let options = export.options();
+    if options.rotational {
         flags |= TransmissionFlags::ROTATIONAL;
     }
-    if export.trim {
+    if options.trim {
         flags |= TransmissionFlags::SEND_TRIM;
     }
-    if export.resizable && transmission_mode == TransmissionMode::Extended {
+    if options.resizable && transmission_mode == TransmissionMode::Extended {
         flags |= TransmissionFlags::SEND_RESIZE;
     }
 
     flags |= TransmissionFlags::SEND_WRITE_ZEROES;
-    if export.fast_zeroes {
+    if options.fast_zeroes {
         flags |= TransmissionFlags::SEND_FAST_ZERO;
     }
 
@@ -539,7 +578,7 @@ fn to_export_payload(export: &Export, transmission_mode: TransmissionMode) -> By
     flags |= TransmissionFlags::SEND_CACHE;
 
     let mut export_payload = BytesMut::with_capacity(10);
-    export_payload.put_u64(export.size);
+    export_payload.put_u64(options.size);
     export_payload.put_u16(flags.bits());
     export_payload.freeze()
 }
@@ -617,32 +656,6 @@ async fn _send_reply<TX: AsyncWrite + Unpin>(
     tx.write_all(resp.as_ref()).await?;
     tx.flush().await?;
     Ok(())
-}
-
-fn find_export<S: AsRef<str>>(name: Option<S>) -> Option<Export> {
-    //todo: stub
-    if let Some(name) = name {
-        let name = name.as_ref();
-        if name == "sia_vbd" {
-            return Some(Export {
-                name: name.to_string(),
-                description: Some("Sia Virtual Block Device".to_string()),
-                read_only: false,
-                trim: true,
-                rotational: false,
-                size: 1024 * 1024 * 1024 * 10, // 10 GiB
-                resizable: false,
-                fast_zeroes: true,
-                block_size: Some((1024, 1024 * 16)),
-            });
-        }
-    }
-    None
-}
-
-fn list_exports() -> Vec<String> {
-    //todo: stub
-    ["sia_vbd".to_string()].into_iter().collect()
 }
 
 #[derive(Error, Debug)]

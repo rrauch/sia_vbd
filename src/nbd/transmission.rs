@@ -1,12 +1,15 @@
-use crate::nbd::{TransmissionMode, MAX_PAYLOAD_LEN};
-use crate::AsyncReadBytesExt;
+use crate::nbd::handler::RequestContext;
+use crate::nbd::{Export, TransmissionMode, MAX_PAYLOAD_LEN};
+use crate::{AsyncReadBytesExt, LimitedReader};
+use anyhow::anyhow;
 use bitflags::bitflags;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut};
 use compact_bytes::CompactBytes;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::net::SocketAddr;
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 const REQUEST_MAGIC: u32 = 0x25609513;
 const EXTENDED_REQUEST_MAGIC: u32 = 0x21e41c71;
@@ -300,7 +303,9 @@ enum Command {
         fast_only: bool,
     },
     BlockStatus,
-    Resize,
+    Resize {
+        length: u64,
+    },
 }
 
 struct Request {
@@ -405,7 +410,7 @@ impl Request {
                 no_hole: flags.contains(CommandFlags::NO_HOLE),
             },
             RequestType::BlockStatus => Command::BlockStatus,
-            RequestType::Resize => Command::Resize,
+            RequestType::Resize => Command::Resize { length },
         };
 
         Ok(Request {
@@ -417,25 +422,28 @@ impl Request {
 }
 
 pub(super) struct TransmissionHandler {
-    export_name: String,
+    export: Export,
     transmission_mode: TransmissionMode,
     client_addr: SocketAddr,
 }
 
 impl TransmissionHandler {
     pub(super) fn new(
-        export_name: String,
+        export: Export,
         transmission_mode: TransmissionMode,
         client_addr: SocketAddr,
     ) -> Self {
         Self {
-            export_name,
+            export,
             transmission_mode,
             client_addr,
         }
     }
 
-    pub(super) async fn process<RX: AsyncRead + Unpin, TX: AsyncWrite + Unpin>(
+    pub(super) async fn process<
+        RX: AsyncRead + Unpin + Send + 'static,
+        TX: AsyncWrite + Unpin + Send + 'static,
+    >(
         &self,
         mut rx: RX,
         mut tx: TX,
@@ -455,30 +463,89 @@ impl TransmissionHandler {
                 &buf[..28]
             };
             let req = Request::deserialize(buf, self.transmission_mode)?;
-
+            let ctx = RequestContext::new(req.id.cookie, self.client_addr);
             let mut payload_remaining = req.payload_length as usize;
+
+            let handler = &self.export.handler;
+            let read_only = self.export.read_only();
+            let info = self.export.options();
 
             match req.command {
                 Command::Read { offset, length, .. } => {
-                    self.read(offset, length, req.id, &mut tx).await?;
-                    eprintln!("read {} bytes at offset {}", length, offset);
+                    Reply::OffsetData(offset, length)
+                        .serialize(
+                            &mut tx,
+                            self.transmission_mode,
+                            req.id.cookie,
+                            req.id.offset,
+                            false,
+                        )
+                        .await?;
+
+                    handler.read(offset, length, &mut tx, &ctx).await?;
+
+                    if self.transmission_mode != TransmissionMode::Simple {
+                        self.send_done(req.id, &mut tx).await?;
+                    }
+                    tx.flush().await?;
                 }
                 Command::Write {
                     offset,
                     length,
                     fua,
-                } => {
+                } if !read_only => {
                     if req.payload_length == 0 {
                         return Err(InvalidInput)?;
                     }
-                    let payload = rx.get_exact(req.payload_length as usize).await?;
-                    payload_remaining = payload_remaining.saturating_sub(payload.len());
-                    self.write(payload, fua, req.id, &mut tx).await?;
-                    eprintln!("wrote {} bytes at offset {}", length, offset);
+                    let (reader_tx, reader_rx) = oneshot::channel();
+                    let mut payload =
+                        LimitedReader::new(rx, req.payload_length as usize, reader_tx);
+                    let handler = handler.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            handler.write(offset, length, fua, &mut payload, &ctx).await
+                        {
+                            // todo
+                            eprintln!("error: {:?}", err);
+                        }
+                    });
+
+                    let remaining;
+                    (rx, remaining) = reader_rx
+                        .await
+                        .map_err(|_| anyhow!("input reader was not returned"))?;
+                    payload_remaining = remaining;
+                    self.send_done(req.id, &mut tx).await?;
+                    tx.flush().await?;
                 }
-                Command::Flush => {
-                    self.flush(req.id, &mut tx).await?;
-                    eprintln!("flush request received");
+                Command::WriteZeroes {
+                    offset,
+                    length,
+                    fast_only,
+                    no_hole,
+                } if !read_only && ((fast_only && info.fast_zeroes) || (!fast_only)) => {
+                    handler.write_zeroes(offset, length, no_hole, &ctx).await?;
+                    self.send_done(req.id, &mut tx).await?;
+                    tx.flush().await?;
+                }
+                Command::Flush if !read_only => {
+                    handler.flush(&ctx).await?;
+                    self.send_done(req.id, &mut tx).await?;
+                    tx.flush().await?;
+                }
+                Command::Resize { length } if info.resizable && !read_only => {
+                    handler.resize(length, &ctx).await?;
+                    // update the exports info
+                    self.export.update_options(handler.options());
+
+                    self.send_done(req.id, &mut tx).await?;
+                    tx.flush().await?;
+                }
+                Command::Trim { offset, length } if info.trim && !read_only => {
+                    handler.trim(offset, length, &ctx).await?;
+                    self.send_done(req.id, &mut tx).await?;
+                    tx.flush().await?;
                 }
                 Command::Disconnect => {
                     eprintln!("client sent disconnect request");
@@ -500,62 +567,13 @@ impl TransmissionHandler {
             if payload_remaining > 0 {
                 // discard any unprocessed payload data
                 rx.skip(payload_remaining).await?;
+                eprintln!(
+                    "warning: {} bytes of unread payload were discarded",
+                    payload_remaining
+                );
             }
         }
 
-        Ok(())
-    }
-
-    // stub
-    async fn read(
-        &self,
-        offset: u64,
-        length: u64,
-        req_id: RequestId,
-        tx: &mut (impl AsyncWrite + Unpin),
-    ) -> std::io::Result<()> {
-        let mut data = BytesMut::zeroed(length as usize);
-        data[..4].copy_from_slice(&0xDEADBEEF_u32.to_be_bytes());
-        data[(length as usize - 4)..].copy_from_slice(&0xFEEBDAED_u32.to_be_bytes());
-        let data = data.freeze();
-        Reply::OffsetData(offset, data.len() as u64)
-            .serialize(
-                tx,
-                self.transmission_mode,
-                req_id.cookie,
-                req_id.offset,
-                false,
-            )
-            .await?;
-        tx.write_all(&data).await?;
-        if self.transmission_mode != TransmissionMode::Simple {
-            self.send_done(req_id, tx).await?;
-        }
-        tx.flush().await?;
-        Ok(())
-    }
-
-    // stub
-    async fn write(
-        &self,
-        _payload: Bytes,
-        _fua: bool,
-        req_id: RequestId,
-        tx: &mut (impl AsyncWrite + Unpin),
-    ) -> std::io::Result<()> {
-        self.send_done(req_id, tx).await?;
-        tx.flush().await?;
-        Ok(())
-    }
-
-    // stub
-    async fn flush(
-        &self,
-        req_id: RequestId,
-        tx: &mut (impl AsyncWrite + Unpin),
-    ) -> std::io::Result<()> {
-        self.send_done(req_id, tx).await?;
-        tx.flush().await?;
         Ok(())
     }
 

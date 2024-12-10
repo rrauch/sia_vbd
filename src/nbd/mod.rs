@@ -1,22 +1,14 @@
-mod handshake;
+pub mod handler;
+pub(crate) mod handshake;
 mod transmission;
 
+use crate::nbd::handler::{Handler, Options};
+use crate::nbd::handshake::Handshaker;
 use futures::{AsyncRead, AsyncWrite};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 const MAX_PAYLOAD_LEN: u32 = 32 * 1024 * 1024; // 32 MiB
-
-/*pub(crate) async fn new_connection<RX: AsyncRead + Unpin, TX: Sink<Bytes> + Unpin>(
-    mut rx: RX,
-    mut tx: TX,
-    addr: SocketAddr,
-) -> std::io::Result<()>
-where
-    std::io::Error: From<<TX as Sink<Bytes>>::Error>,
-{
-    handshake::process(&mut rx, &mut tx, &addr).await?;
-    todo!()
-}*/
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TransmissionMode {
@@ -25,12 +17,16 @@ enum TransmissionMode {
     Extended, // extended is a superset of structured
 }
 
-pub(crate) async fn new_connection<RX: AsyncRead + Unpin, TX: AsyncWrite + Unpin>(
+pub(crate) async fn new_connection<
+    RX: AsyncRead + Unpin + Send + 'static,
+    TX: AsyncWrite + Unpin + Send + 'static,
+>(
+    handshaker: &Handshaker,
     mut rx: RX,
     mut tx: TX,
     addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    if let Some(handler) = handshake::process(&mut rx, &mut tx, &addr).await? {
+    if let Some(handler) = handshaker.process(&mut rx, &mut tx, &addr).await? {
         handler.process(rx, tx).await?;
     } else {
         // handshake ended without intent to proceed to transmission
@@ -39,25 +35,45 @@ pub(crate) async fn new_connection<RX: AsyncRead + Unpin, TX: AsyncWrite + Unpin
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct Export {
-    /// Internal Identifier of the export
+#[derive(Clone)]
+pub(crate) struct Export {
     name: String,
-    /// Human readable description
-    description: Option<String>,
-    /// Size in bytes
-    size: u64,
-    /// Block Device is read-only
-    read_only: bool,
-    /// Block Device has characteristics of rotational media
-    rotational: bool,
-    /// `trim` is supported
-    trim: bool,
-    /// Fast zeroing is supported
-    fast_zeroes: bool,
-    /// Block Device can be resized
-    resizable: bool,
+    forced_read_only: bool,
+    handler: Arc<dyn Handler + Send + Sync + 'static>,
+    options: Arc<Mutex<Arc<Options>>>,
+}
 
-    /// Block size preferences
-    block_size: Option<(u32, u32)>,
+impl Export {
+    pub fn new<T: Handler + Send + Sync + 'static>(
+        name: String,
+        handler: T,
+        forced_read_only: bool,
+    ) -> Self {
+        let handler = Arc::new(handler);
+        let options = Arc::new(Mutex::new(Arc::new(handler.options())));
+
+        Self {
+            name,
+            forced_read_only,
+            handler,
+            options,
+        }
+    }
+
+    pub fn read_only(&self) -> bool {
+        if self.forced_read_only {
+            true
+        } else {
+            self.options.lock().unwrap().read_only
+        }
+    }
+
+    pub fn options(&self) -> Arc<Options> {
+        self.options.lock().unwrap().clone()
+    }
+
+    pub fn update_options(&self, new_options: Options) {
+        let mut lock = self.options.lock().unwrap();
+        *lock = Arc::new(new_options);
+    }
 }
