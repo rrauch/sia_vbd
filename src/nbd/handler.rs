@@ -1,6 +1,7 @@
-use crate::{AsyncReadBytesExt, AsyncWriteBytesExt, ClientEndpoint};
+use crate::nbd::handler::Data::Zeroes;
+use crate::{AsyncReadBytesExt, ClientEndpoint};
 use async_trait::async_trait;
-use futures::{AsyncRead, AsyncWrite};
+use futures::{AsyncRead, AsyncWrite, Sink, SinkExt};
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -46,6 +47,35 @@ pub struct Options {
 }
 
 #[async_trait]
+pub trait DataWriter: Send + Sync {
+    async fn write(
+        self: Box<Self>,
+        out: &mut (dyn AsyncWrite + Send + Unpin),
+    ) -> std::io::Result<()>;
+}
+
+pub enum Data {
+    Content(Box<dyn DataWriter>),
+    Zeroes,
+}
+
+pub struct ReadChunk {
+    pub(super) offset: u64,
+    pub(super) length: u64,
+    pub(super) result: std::io::Result<Data>,
+}
+
+impl ReadChunk {
+    pub fn new(offset: u64, length: u64, result: std::io::Result<Data>) -> Self {
+        Self {
+            offset,
+            length,
+            result,
+        }
+    }
+}
+
+#[async_trait]
 #[allow(unused_variables)]
 pub trait Handler {
     fn options(&self) -> Options;
@@ -54,9 +84,9 @@ pub trait Handler {
         &self,
         offset: u64,
         length: u64,
-        out: &mut (dyn AsyncWrite + Send + Unpin),
+        queue: &mut (dyn Sink<ReadChunk, Error = ()> + Send + Unpin),
         ctx: &RequestContext,
-    ) -> std::io::Result<()>;
+    );
 
     async fn write(
         &self,
@@ -102,6 +132,13 @@ impl DummyHandler {
     }
 }
 
+/*struct DummyWriter {}
+impl DataWriter for DummyWriter {
+    async fn write<T: AsyncWrite + Send + Unpin>(self, out: &mut T) -> std::io::Result<()> {
+        todo!()
+    }
+}*/
+
 #[async_trait]
 impl Handler for DummyHandler {
     fn options(&self) -> Options {
@@ -122,12 +159,13 @@ impl Handler for DummyHandler {
         &self,
         offset: u64,
         length: u64,
-        out: &mut (dyn AsyncWrite + Send + Unpin),
+        queue: &mut (dyn Sink<ReadChunk, Error = ()> + Send + Unpin),
         _ctx: &RequestContext,
-    ) -> std::io::Result<()> {
-        out.write_zeroes(length as usize).await?;
-        eprintln!("read {} bytes at offset {}", length, offset);
-        Ok(())
+    ) {
+        queue
+            .send(ReadChunk::new(offset, length, Ok(Zeroes)))
+            .await
+            .expect("queue closed prematurely");
     }
 
     async fn write(
