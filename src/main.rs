@@ -3,7 +3,8 @@ use sia_vbd::Builder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let runner = Builder::new("0.0.0.0:5112")
+    let runner = Builder::tcp("0.0.0.0", 5112)
+    //let runner = Builder::unix("/tmp/sia_vbd.sock")
         .with_export(
             "sia_vbd",
             DummyHandler::new(

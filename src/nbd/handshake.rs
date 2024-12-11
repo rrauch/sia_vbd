@@ -1,6 +1,6 @@
 use super::{Export, TransmissionMode, MAX_PAYLOAD_LEN};
 use crate::nbd::transmission::TransmissionHandler;
-use crate::AsyncReadBytesExt;
+use crate::{AsyncReadBytesExt, ClientEndpoint};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -8,7 +8,6 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 use once_cell::sync::Lazy;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use thiserror::Error;
 
 const NBD_MAGIC: u64 = 0x4e42444d41474943; // NBDMAGIC;
@@ -338,7 +337,7 @@ impl Handshaker {
         &self,
         rx: &mut RX,
         tx: &mut TX,
-        addr: &SocketAddr,
+        client_endpoint: &ClientEndpoint,
     ) -> Result<Option<TransmissionHandler>, NbdError> {
         use RequestError::*;
 
@@ -409,7 +408,7 @@ impl Handshaker {
                         return Ok(Some(TransmissionHandler::new(
                             export,
                             transmission_mode,
-                            addr.clone(),
+                            client_endpoint.clone(),
                         )));
                     }
                     // export is unavailable, but client does not support error handling
@@ -489,7 +488,7 @@ impl Handshaker {
                             return Ok(Some(TransmissionHandler::new(
                                 export,
                                 transmission_mode,
-                                addr.clone(),
+                                client_endpoint.clone(),
                             )));
                         }
                     }

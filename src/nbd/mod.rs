@@ -4,8 +4,8 @@ mod transmission;
 
 use crate::nbd::handler::{Handler, Options};
 use crate::nbd::handshake::Handshaker;
+use crate::ClientEndpoint;
 use futures::{AsyncRead, AsyncWrite};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 const MAX_PAYLOAD_LEN: u32 = 32 * 1024 * 1024; // 32 MiB
@@ -24,9 +24,12 @@ pub(crate) async fn new_connection<
     handshaker: &Handshaker,
     mut rx: RX,
     mut tx: TX,
-    addr: SocketAddr,
+    client_endpoint: ClientEndpoint,
 ) -> anyhow::Result<()> {
-    if let Some(handler) = handshaker.process(&mut rx, &mut tx, &addr).await? {
+    if let Some(handler) = handshaker
+        .process(&mut rx, &mut tx, &client_endpoint)
+        .await?
+    {
         handler.process(rx, tx).await?;
     } else {
         // handshake ended without intent to proceed to transmission

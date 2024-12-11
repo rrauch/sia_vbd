@@ -1,3 +1,6 @@
+use crate::connection::tcp::TcpListener;
+use crate::connection::unix::UnixListener;
+use crate::connection::{Connection, Listener};
 use crate::nbd::handshake::Handshaker;
 use crate::nbd::{handler::Handler, Export};
 use anyhow::anyhow;
@@ -5,23 +8,31 @@ use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use std::cmp::min;
 use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter};
 use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+mod connection;
 pub mod nbd;
 
 pub struct Runner {
-    addr: String,
+    listen_endpoint: ListenEndpoint,
     handshaker: Arc<Handshaker>,
 }
 
+enum ListenEndpoint {
+    Tcp(String),
+    Unix(PathBuf),
+}
+
 pub struct Builder {
-    addr: String,
+    listen_endpoint: ListenEndpoint,
     exports: HashMap<String, Export>,
     default_export: Option<String>,
     structured_replies_disabled: bool,
@@ -29,9 +40,19 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub fn new<S: ToString>(addr: S) -> Self {
+    pub fn tcp<S: ToString>(host: S, port: u16) -> Self {
         Self {
-            addr: addr.to_string(),
+            listen_endpoint: ListenEndpoint::Tcp(format!("{}:{}", host.to_string(), port)),
+            exports: HashMap::default(),
+            default_export: None,
+            structured_replies_disabled: false,
+            extended_headers_disabled: false,
+        }
+    }
+
+    pub fn unix<P: AsRef<Path>>(socket_path: P) -> Self {
+        Self {
+            listen_endpoint: ListenEndpoint::Unix(socket_path.as_ref().to_path_buf()),
             exports: HashMap::default(),
             default_export: None,
             structured_replies_disabled: false,
@@ -75,29 +96,87 @@ impl Builder {
             self.extended_headers_disabled,
         );
         Runner {
-            addr: self.addr,
+            listen_endpoint: self.listen_endpoint,
             handshaker: Arc::new(handshaker),
         }
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ClientEndpoint {
+    Tcp(SocketAddr),
+    Unix(UnixAddr),
+}
+
+impl Display for ClientEndpoint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            Self::Tcp(addr) => Display::fmt(addr, f),
+            Self::Unix(addr) => Display::fmt(addr, f),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct UnixAddr(std::os::unix::net::SocketAddr);
+
+impl Deref for UnixAddr {
+    type Target = std::os::unix::net::SocketAddr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<UnixAddr> for std::os::unix::net::SocketAddr {
+    fn from(value: UnixAddr) -> Self {
+        value.0
+    }
+}
+
+impl Display for UnixAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Debug for UnixAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl Runner {
     pub async fn run(&self) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(&self.addr).await?;
-        println!("Listening on {}", listener.local_addr()?);
-        loop {
-            let (socket, addr) = listener.accept().await?;
-            println!("New connection from {}", addr);
-            let handshaker = self.handshaker.clone();
-            tokio::spawn(async move {
-                let (rx, tx) = socket.into_split();
-                let rx = rx.compat();
-                let tx = tx.compat_write();
+        match &self.listen_endpoint {
+            ListenEndpoint::Tcp(addr) => {
+                self._run(TcpListener::bind(addr.to_string()).await?)
+                    .await?
+            }
+            ListenEndpoint::Unix(path) => {
+                self._run(UnixListener::bind(path.to_path_buf()).await?)
+                    .await?
+            }
+        };
+        Ok(())
+    }
 
-                if let Err(error) = nbd::new_connection(&handshaker, rx, tx, addr.clone()).await {
-                    eprintln!("error {:?}, client address {}", error, addr);
+    async fn _run<T: Listener>(&self, listener: T) -> anyhow::Result<()> {
+        println!("Listening on {}", listener.addr());
+        loop {
+            let conn = listener.accept().await?;
+            println!("New connection from {}", conn.client_endpoint());
+
+            let handshaker = self.handshaker.clone();
+            let client_endpoint = conn.client_endpoint().clone();
+            let (rx, tx) = conn.into_split();
+
+            tokio::spawn(async move {
+                if let Err(error) =
+                    nbd::new_connection(&handshaker, rx, tx, client_endpoint.clone()).await
+                {
+                    eprintln!("error {:?}, client endpoint {}", error, client_endpoint);
                 }
-                println!("connection closed for {}", addr);
+                println!("connection closed for {}", client_endpoint);
             });
         }
     }

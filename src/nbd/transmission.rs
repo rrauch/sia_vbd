@@ -1,13 +1,12 @@
 use crate::nbd::handler::RequestContext;
 use crate::nbd::{Export, TransmissionMode, MAX_PAYLOAD_LEN};
-use crate::{AsyncReadBytesExt, LimitedReader};
+use crate::{AsyncReadBytesExt, ClientEndpoint, LimitedReader};
 use anyhow::anyhow;
 use bitflags::bitflags;
 use bytes::{Buf, BufMut};
 use compact_bytes::CompactBytes;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -424,19 +423,19 @@ impl Request {
 pub(super) struct TransmissionHandler {
     export: Export,
     transmission_mode: TransmissionMode,
-    client_addr: SocketAddr,
+    client_endpoint: ClientEndpoint,
 }
 
 impl TransmissionHandler {
     pub(super) fn new(
         export: Export,
         transmission_mode: TransmissionMode,
-        client_addr: SocketAddr,
+        client_endpoint: ClientEndpoint,
     ) -> Self {
         Self {
             export,
             transmission_mode,
-            client_addr,
+            client_endpoint,
         }
     }
 
@@ -463,7 +462,7 @@ impl TransmissionHandler {
                 &buf[..28]
             };
             let req = Request::deserialize(buf, self.transmission_mode)?;
-            let ctx = RequestContext::new(req.id.cookie, self.client_addr);
+            let ctx = RequestContext::new(req.id.cookie, self.client_endpoint.clone());
             let mut payload_remaining = req.payload_length as usize;
 
             let handler = &self.export.handler;

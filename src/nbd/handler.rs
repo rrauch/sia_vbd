@@ -1,19 +1,18 @@
-use crate::{AsyncReadBytesExt, AsyncWriteBytesExt};
+use crate::{AsyncReadBytesExt, AsyncWriteBytesExt, ClientEndpoint};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite};
-use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     cookie: u64,
-    client_addr: SocketAddr,
+    client_endpoint: ClientEndpoint,
 }
 
 impl RequestContext {
-    pub(super) fn new(cookie: u64, client_addr: SocketAddr) -> Self {
+    pub(super) fn new(cookie: u64, client_endpoint: ClientEndpoint) -> Self {
         Self {
             cookie,
-            client_addr,
+            client_endpoint,
         }
     }
 
@@ -21,8 +20,8 @@ impl RequestContext {
         self.cookie
     }
 
-    pub fn client_addr(&self) -> SocketAddr {
-        self.client_addr
+    pub fn client_endpoint(&self) -> &ClientEndpoint {
+        &self.client_endpoint
     }
 }
 
@@ -106,7 +105,7 @@ impl DummyHandler {
 #[async_trait]
 impl Handler for DummyHandler {
     fn options(&self) -> Options {
-        println!("info");
+        eprintln!("options requested");
         Options {
             description: self.description.clone(),
             size: self.size,
