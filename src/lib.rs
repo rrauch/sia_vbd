@@ -1,17 +1,16 @@
 use crate::connection::tcp::TcpListener;
-use crate::connection::unix::UnixListener;
 use crate::connection::{Connection, Listener};
 use crate::nbd::handshake::Handshaker;
-use crate::nbd::{handler::Handler, Export};
+use crate::nbd::{block_device::BlockDevice, Export};
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use once_cell::sync::Lazy;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,6 +20,8 @@ use tokio::sync::oneshot;
 mod connection;
 pub mod nbd;
 
+static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
+
 pub struct Runner {
     listen_endpoint: ListenEndpoint,
     handshaker: Arc<Handshaker>,
@@ -28,6 +29,7 @@ pub struct Runner {
 
 enum ListenEndpoint {
     Tcp(String),
+    #[cfg(unix)]
     Unix(PathBuf),
 }
 
@@ -50,6 +52,7 @@ impl Builder {
         }
     }
 
+    #[cfg(unix)]
     pub fn unix<P: AsRef<Path>>(socket_path: P) -> Self {
         Self {
             listen_endpoint: ListenEndpoint::Unix(socket_path.as_ref().to_path_buf()),
@@ -60,21 +63,25 @@ impl Builder {
         }
     }
 
-    pub fn with_export<S: ToString, H: Handler + Send + Sync + 'static>(
+    pub fn with_export<S: ToString, H: BlockDevice + Send + Sync + 'static>(
         mut self,
         name: S,
-        handler: H,
+        block_device: H,
         force_read_only: bool,
-    ) -> Self {
+    ) -> Result<Self, anyhow::Error> {
         let name = name.to_string();
-        let export = Export::new(name.clone(), handler, force_read_only);
+        let export = Export::new(name.clone(), block_device, force_read_only)?;
         self.exports.insert(name, export);
-        self
+        Ok(self)
     }
 
-    pub fn with_default_export<S: ToString>(mut self, name: S) -> Self {
+    pub fn with_default_export<S: ToString>(mut self, name: S) -> Result<Self, anyhow::Error> {
+        let name = name.to_string();
+        if !self.exports.contains_key(&name) {
+            anyhow::bail!("unknown export: {}", name);
+        }
         self.default_export = Some(name.to_string());
-        self
+        Ok(self)
     }
 
     pub fn disable_structured_replies(mut self) -> Self {
@@ -105,43 +112,17 @@ impl Builder {
 #[derive(Debug, Clone)]
 pub enum ClientEndpoint {
     Tcp(SocketAddr),
-    Unix(UnixAddr),
+    #[cfg(unix)]
+    Unix(unix::UnixAddr),
 }
 
 impl Display for ClientEndpoint {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self {
             Self::Tcp(addr) => Display::fmt(addr, f),
+            #[cfg(unix)]
             Self::Unix(addr) => Display::fmt(addr, f),
         }
-    }
-}
-
-#[derive(Clone)]
-pub struct UnixAddr(std::os::unix::net::SocketAddr);
-
-impl Deref for UnixAddr {
-    type Target = std::os::unix::net::SocketAddr;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<UnixAddr> for std::os::unix::net::SocketAddr {
-    fn from(value: UnixAddr) -> Self {
-        value.0
-    }
-}
-
-impl Display for UnixAddr {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl Debug for UnixAddr {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
     }
 }
 
@@ -152,8 +133,9 @@ impl Runner {
                 self._run(TcpListener::bind(addr.to_string()).await?)
                     .await?
             }
+            #[cfg(unix)]
             ListenEndpoint::Unix(path) => {
-                self._run(UnixListener::bind(path.to_path_buf()).await?)
+                self._run(connection::unix::UnixListener::bind(path.to_path_buf()).await?)
                     .await?
             }
         };
@@ -193,7 +175,8 @@ pub(crate) trait AsyncReadBytesExt: AsyncReadExt + Unpin {
     /// Skips exactly `n` bytes from the reader
     async fn skip(&mut self, n: usize) -> std::io::Result<()> {
         let mut remaining = n;
-        let mut buffer = [0u8; 8192];
+        let buffer_len = min(n, 1024 * 256);
+        let mut buffer = BytesMut::zeroed(buffer_len);
         while remaining > 0 {
             let to_read = min(remaining, buffer.len());
             let bytes_read = self.read(&mut buffer[..to_read]).await?;
@@ -214,7 +197,7 @@ pub(crate) trait AsyncWriteBytesExt: AsyncWriteExt + Unpin {
     /// Write exactly `n` bytes of zeroes to the writer
     async fn write_zeroes(&mut self, n: usize) -> std::io::Result<()> {
         let mut remaining = n;
-        let zeroes = [0u8; 8192];
+        let zeroes = ZEROES.as_ref();
         while remaining > 0 {
             let to_write = min(remaining, zeroes.len());
             let bytes_written = self.write(&zeroes[..to_write]).await?;
@@ -311,5 +294,53 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for LimitedReader<R> {
 impl<R> Drop for LimitedReader<R> {
     fn drop(&mut self) {
         self.return_inner();
+    }
+}
+
+fn is_power_of_two(n: u32) -> bool {
+    n != 0 && (n & (n - 1)) == 0
+}
+
+/// Returns the highest power of two that fits into `n`
+fn highest_power_of_two(n: u32) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        1 << (31 - n.leading_zeros())
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use std::fmt::{Debug, Display, Formatter};
+    use std::ops::Deref;
+    use std::os::unix::net::SocketAddr;
+
+    #[derive(Clone)]
+    pub struct UnixAddr(pub(crate) SocketAddr);
+
+    impl Deref for UnixAddr {
+        type Target = SocketAddr;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl From<UnixAddr> for std::os::unix::net::SocketAddr {
+        fn from(value: UnixAddr) -> Self {
+            value.0
+        }
+    }
+
+    impl Display for UnixAddr {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    impl Debug for UnixAddr {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
     }
 }

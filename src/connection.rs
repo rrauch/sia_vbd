@@ -85,9 +85,11 @@ pub(super) mod tcp {
     }
 }
 
+#[cfg(unix)]
 pub(super) mod unix {
     use crate::connection::{Connection, Listener};
-    use crate::{ClientEndpoint, UnixAddr};
+    use crate::unix::UnixAddr;
+    use crate::ClientEndpoint;
     use async_trait::async_trait;
     use std::path::PathBuf;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};

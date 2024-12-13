@@ -1,12 +1,12 @@
 use super::{Export, TransmissionMode, MAX_PAYLOAD_LEN};
 use crate::nbd::transmission::TransmissionHandler;
-use crate::{AsyncReadBytesExt, ClientEndpoint};
+use crate::{highest_power_of_two, AsyncReadBytesExt, ClientEndpoint};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use once_cell::sync::Lazy;
-use std::cmp::PartialEq;
+use std::cmp::{max, PartialEq};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -460,7 +460,14 @@ impl Handshaker {
                                         payload.put_u16(InfoType::BlockSize.into());
                                         payload.put_u32(min);
                                         payload.put_u32(preferred);
-                                        payload.put_u32(MAX_PAYLOAD_LEN);
+
+                                        // max block size must be a multiple of min, a power of two
+                                        // and not exceed (MAX_PAYLOAD_LEN + headers)
+                                        let max_block_size = highest_power_of_two(
+                                            ((MAX_PAYLOAD_LEN - 33) / min) * min,
+                                        );
+                                        payload.put_u32(max(max_block_size, preferred));
+
                                         send_info(
                                             tx,
                                             option_request.as_req_type().into(),
