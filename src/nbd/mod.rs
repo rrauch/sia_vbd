@@ -1,6 +1,7 @@
 pub mod block_device;
 pub(crate) mod handshake;
 mod transmission;
+pub mod vbd;
 
 use crate::nbd::block_device::{BlockDevice, Options};
 use crate::nbd::handshake::Handshaker;
