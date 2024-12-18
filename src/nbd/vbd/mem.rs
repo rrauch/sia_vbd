@@ -45,7 +45,13 @@ impl BlockDevice for MemDevice {
         }
     }
 
-    async fn read(&self, offset: u64, length: u64, queue: &mut Queue, _ctx: &RequestContext) {
+    async fn read(
+        &self,
+        offset: u64,
+        length: u64,
+        queue: &mut Queue,
+        _ctx: &RequestContext,
+    ) -> Result<()> {
         let blocks = calculate_affected_blocks(
             self.block_size as u64,
             self.num_blocks as u64,
@@ -78,6 +84,8 @@ impl BlockDevice for MemDevice {
                 queue.zeroes(abs_offset, length).await.unwrap();
             }
         }
+
+        Ok(())
     }
 
     async fn write(
@@ -113,9 +121,14 @@ impl BlockDevice for MemDevice {
                 end = blocks.end_offset as usize;
             }
             data.read_exact(&mut buf[start..end]).await?;
+
             {
                 let mut lock = self.data_blocks.write().unwrap();
-                lock.insert(block as usize, buf.freeze());
+                if all_zeroes(&buf) {
+                    lock.remove(&(block as usize));
+                } else {
+                    lock.insert(block as usize, buf.freeze());
+                }
             }
         }
 
@@ -232,4 +245,31 @@ fn calculate_absolute_offset(block_size: u64, block: u64, start: u64, end: u64) 
     let offset = block * block_size + start;
     let length = end - start;
     (offset, length)
+}
+
+fn all_zeroes(buffer: &[u8]) -> bool {
+    let len = buffer.len();
+    let ptr = buffer.as_ptr();
+    let num_words = len / 8;
+    unsafe {
+        for i in 0..num_words {
+            if *(ptr.add(i * 8) as *const u64) != 0 {
+                return false;
+            }
+        }
+    }
+    buffer[num_words * 8..].iter().all(|&b| b == 0)
+
+    /*let ptr = buffer.as_ptr();
+    let end = unsafe { ptr.add(buffer.len()) };
+    let mut current = ptr;
+    unsafe {
+        while current < end {
+            if *current != 0 {
+                return false;
+            }
+            current = current.add(1);
+        }
+    }
+    true*/
 }

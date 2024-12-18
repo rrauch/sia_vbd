@@ -4,6 +4,7 @@ use sia_vbd::Builder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    //console_subscriber::init();
     let runner = Builder::tcp("0.0.0.0", 5112)
         //let runner = Builder::unix("/tmp/sia_vbd.sock")
         .with_export(
@@ -15,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
             ),*/
             //MemDevice::new(4096*32, 262144/32, Some("Virtual Memory Block Device")),
             MemDevice::new(4096, 262144, Some("Virtual Memory Block Device")),
+            //MemDevice::new(4096, 2621440, Some("Virtual Memory Block Device")),
             false,
         )?
         .build();

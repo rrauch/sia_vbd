@@ -6,9 +6,11 @@ use thiserror::Error;
 
 pub mod read_reply {
     use crate::nbd::block_device::read_reply::Payload::Zeroes;
+    use crate::nbd::transmission::fragment::Fragment;
     use async_trait::async_trait;
     use bytes::{Buf, Bytes, BytesMut};
-    use futures::{AsyncWrite, AsyncWriteExt, Sink, SinkExt};
+    use futures::{AsyncWrite, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     #[async_trait]
     pub trait PayloadWriter: Send + Sync {
@@ -80,37 +82,17 @@ pub mod read_reply {
         }
     }
 
-    pub(in crate::nbd) struct Chunk {
-        pub(in crate::nbd) offset: u64,
-        pub(in crate::nbd) length: u64,
-        pub(in crate::nbd) result: super::Result<Payload>,
-    }
-
-    impl Chunk {
-        fn new(offset: u64, length: u64, result: super::Result<Payload>) -> Self {
-            Self {
-                offset,
-                length,
-                result,
-            }
-        }
-    }
-
     pub struct Queue {
-        sink: Box<dyn Sink<Chunk, Error = super::Error> + Send + Unpin>,
+        tx: mpsc::Sender<Fragment>,
     }
 
     impl Queue {
-        pub(in crate::nbd) fn new<S: Sink<Chunk, Error = super::Error> + Send + Unpin + 'static>(
-            sink: S,
-        ) -> Self {
-            Self {
-                sink: Box::new(sink),
-            }
+        pub(in crate::nbd) fn new(tx: mpsc::Sender<Fragment>) -> Self {
+            Self { tx }
         }
 
         pub async fn zeroes(&mut self, offset: u64, length: u64) -> super::Result<()> {
-            self.ok(offset, length, Zeroes).await
+            self.send_fragment(offset, length, Zeroes).await
         }
 
         #[allow(private_bounds)]
@@ -120,20 +102,20 @@ pub mod read_reply {
             length: u64,
             data: T,
         ) -> super::Result<()> {
-            self.ok(offset, length, data.into()).await
+            self.send_fragment(offset, length, data.into()).await
         }
 
-        pub async fn error(
+        async fn send_fragment(
             &mut self,
             offset: u64,
             length: u64,
-            err: super::Error,
+            data: Payload,
         ) -> super::Result<()> {
-            self.sink.send(Chunk::new(offset, length, Err(err))).await
-        }
-
-        async fn ok(&mut self, offset: u64, length: u64, data: Payload) -> super::Result<()> {
-            self.sink.send(Chunk::new(offset, length, Ok(data))).await
+            self.tx
+                .send(Fragment::new(offset, length, data))
+                .await
+                .map_err(|_| super::Error::ReadQueueError)?;
+            Ok(())
         }
     }
 }
@@ -192,7 +174,7 @@ pub trait BlockDevice {
         length: u64,
         queue: &mut read_reply::Queue,
         _ctx: &RequestContext,
-    );
+    ) -> Result<()>;
 
     async fn write(
         &self,

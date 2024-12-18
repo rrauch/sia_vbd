@@ -1,3 +1,4 @@
+use crate::nbd::block_device::Result;
 use crate::nbd::block_device::{read_reply, BlockDevice, Options, RequestContext};
 use crate::AsyncReadBytesExt;
 use async_trait::async_trait;
@@ -41,7 +42,7 @@ impl BlockDevice for DummyBlockDevice {
         length: u64,
         queue: &mut read_reply::Queue,
         _ctx: &RequestContext,
-    ) {
+    ) -> Result<()> {
         queue
             .zeroes(offset, length)
             .await
@@ -67,6 +68,7 @@ impl BlockDevice for DummyBlockDevice {
         .error(offset, length, Error::ReadQueueError)
         .await
         .expect("queue closed prematurely");*/
+        Ok(())
     }
 
     async fn write(
@@ -76,7 +78,7 @@ impl BlockDevice for DummyBlockDevice {
         _fua: bool,
         data: &mut (dyn AsyncRead + Send + Unpin),
         _ctx: &RequestContext,
-    ) -> crate::nbd::block_device::Result<()> {
+    ) -> Result<()> {
         data.skip(length as usize).await?;
         eprintln!("wrote {} bytes at offset {}", length, offset);
         Ok(())
@@ -88,22 +90,17 @@ impl BlockDevice for DummyBlockDevice {
         length: u64,
         _no_hole: bool,
         _ctx: &RequestContext,
-    ) -> crate::nbd::block_device::Result<()> {
+    ) -> Result<()> {
         eprintln!("zeroed {} bytes at offset {}", length, offset);
         Ok(())
     }
 
-    async fn flush(&self, _ctx: &RequestContext) -> crate::nbd::block_device::Result<()> {
+    async fn flush(&self, _ctx: &RequestContext) -> Result<()> {
         eprintln!("flush called");
         Ok(())
     }
 
-    async fn trim(
-        &self,
-        offset: u64,
-        length: u64,
-        _ctx: &RequestContext,
-    ) -> crate::nbd::block_device::Result<()> {
+    async fn trim(&self, offset: u64, length: u64, _ctx: &RequestContext) -> Result<()> {
         eprintln!("trim called for offset {} and length {}", offset, length);
         Ok(())
     }

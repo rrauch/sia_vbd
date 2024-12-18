@@ -53,6 +53,9 @@ pub(super) mod tcp {
 
         async fn accept(&self) -> anyhow::Result<Self::Conn> {
             let (stream, addr) = self.inner.accept().await?;
+            stream
+                .set_nodelay(true)
+                .expect("failed to set no_delay for tcp connection");
             Ok(TcpConnection {
                 inner: stream,
                 client_endpoint: ClientEndpoint::Tcp(addr),

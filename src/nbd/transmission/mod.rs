@@ -1,6 +1,7 @@
 mod read;
 mod reply;
 mod request;
+pub(super) mod fragment;
 
 use crate::nbd::block_device::RequestContext;
 use crate::nbd::transmission::request::ReadError;

@@ -405,6 +405,7 @@ async fn write_loop<TX: AsyncWrite + Unpin + Send + 'static>(
                                 }
                             }
                         }
+                        tx.flush().await?;
                     },
                     None => {
                         // sender closed
@@ -419,6 +420,7 @@ async fn write_loop<TX: AsyncWrite + Unpin + Send + 'static>(
             }
         }
     }
+    let _ = tx.flush().await;
     Ok(tx)
 }
 
@@ -427,10 +429,6 @@ async fn write<TX: AsyncWrite + Unpin + Send + 'static>(
     transmission_mode: TransmissionMode,
     write: Write,
 ) -> std::io::Result<()> {
-    eprintln!(
-        "writing {:?} to output, transmission_mode: {:?}",
-        write, transmission_mode
-    );
     match write.command {
         WriteCommand::Done => {
             if transmission_mode == TransmissionMode::Simple && !write.is_first {
@@ -492,7 +490,7 @@ async fn write<TX: AsyncWrite + Unpin + Send + 'static>(
                         transmission_mode,
                         write.request_id.cookie,
                         write.request_id.offset,
-                        write.done,
+                        true, // this is a defragmented, single reply, so done need to be true
                     )
                     .await?;
             }
@@ -541,7 +539,6 @@ async fn send_done(
     Reply::None
         .serialize(tx, transmission_mode, req_id.cookie, req_id.offset, true)
         .await?;
-    tx.flush().await?;
     Ok(())
 }
 
@@ -566,7 +563,6 @@ async fn send_error(
     reply
         .serialize(tx, transmission_mode, req_id.cookie, req_id.offset, true)
         .await?;
-    tx.flush().await?;
     Ok(())
 }
 
