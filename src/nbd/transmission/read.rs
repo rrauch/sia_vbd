@@ -94,6 +94,13 @@ impl ReadCommandHandler {
                                     while let Some(fragment) = processor.next(FragmentPotential::Complete) {
                                         buffer.push_back(fragment);
                                     }
+
+                                    //todo: check if this is actually improves things or not
+                                    if buffer.is_empty() && dont_fragment {
+                                        while let Some(fragment) = processor.next(FragmentPotential::Incomplete) {
+                                            buffer.push_back(fragment);
+                                        }
+                                    }
                                 } else {
                                     // channel is closed
                                     done = true;
@@ -183,7 +190,7 @@ impl ReadCommandHandler {
                                 }
                             }
                         }
-                        if !processor.is_empty() {
+                        if !processor.is_empty() && !dont_fragment {
                             idle_duration = Duration::from_millis(5);
                         } else {
                             idle_duration = Duration::from_secs(60);
