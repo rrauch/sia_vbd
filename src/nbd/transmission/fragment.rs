@@ -89,7 +89,6 @@ impl Fragment {
 
 pub(in crate::nbd) struct FragmentProcessor {
     strict: bool,
-    next_offset: u64,
     processed: RangeMap<u64, ProcessedState>,
     buffer: BTreeMap<u64, (Fragment, Instant)>,
 }
@@ -116,7 +115,6 @@ impl FragmentProcessor {
             strict,
             processed,
             buffer: BTreeMap::default(),
-            next_offset: offset,
         }
     }
 
@@ -204,7 +202,17 @@ impl FragmentProcessor {
             .filter(|(offset, _)| {
                 if self.strict {
                     // in strict mode fragments have to be returned in order
-                    self.next_offset == **offset
+                    // first, determine the next offset that hasn't been processed yet
+                    if let Some(next_offset) = self
+                        .processed
+                        .iter()
+                        .find(|(_, state)| state != &&ProcessedState::Processed)
+                        .map(|(range, _)| range.start)
+                    {
+                        next_offset == **offset
+                    } else {
+                        unreachable!("no next_offset");
+                    }
                 } else {
                     true
                 }
