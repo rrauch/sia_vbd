@@ -32,7 +32,7 @@ impl BlockDevice for DummyBlockDevice {
             rotational: false,
             fast_zeroes: true,
             resizable: false,
-            block_size: Some((1024 * 4, 1024 * 256)),
+            block_size: 1024 * 256,
         }
     }
 

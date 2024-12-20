@@ -1,4 +1,4 @@
-use super::{Export, TransmissionMode, MAX_PAYLOAD_LEN};
+use super::{Export, TransmissionMode, MAX_PAYLOAD_LEN, MIN_BLOCK_SIZE};
 use crate::nbd::transmission::TransmissionHandler;
 use crate::{highest_power_of_two, AsyncReadBytesExt, ClientEndpoint};
 use bitflags::bitflags;
@@ -455,26 +455,25 @@ impl Handshaker {
                                 }
                                 InfoType::BlockSize => {
                                     let options = export.options();
-                                    if let Some((min, preferred)) = options.block_size {
-                                        let mut payload = BytesMut::with_capacity(14);
-                                        payload.put_u16(InfoType::BlockSize.into());
-                                        payload.put_u32(min);
-                                        payload.put_u32(preferred);
+                                    let min = MIN_BLOCK_SIZE;
+                                    let preferred = options.block_size;
+                                    let mut payload = BytesMut::with_capacity(14);
+                                    payload.put_u16(InfoType::BlockSize.into());
+                                    payload.put_u32(min);
+                                    payload.put_u32(preferred);
 
-                                        // max block size must be a multiple of min, a power of two
-                                        // and not exceed (MAX_PAYLOAD_LEN + headers)
-                                        let max_block_size = highest_power_of_two(
-                                            ((MAX_PAYLOAD_LEN - 33) / min) * min,
-                                        );
-                                        payload.put_u32(max(max_block_size, preferred));
+                                    // max block size must be a multiple of min, a power of two
+                                    // and not exceed (MAX_PAYLOAD_LEN + headers)
+                                    let max_block_size =
+                                        highest_power_of_two(((MAX_PAYLOAD_LEN - 33) / min) * min);
+                                    payload.put_u32(max(max_block_size, preferred));
 
-                                        send_info(
-                                            tx,
-                                            option_request.as_req_type().into(),
-                                            payload.freeze(),
-                                        )
-                                        .await?;
-                                    }
+                                    send_info(
+                                        tx,
+                                        option_request.as_req_type().into(),
+                                        payload.freeze(),
+                                    )
+                                    .await?;
                                 }
                                 InfoType::Export => {
                                     // ignore, will always be sent anyway

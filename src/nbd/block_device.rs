@@ -159,8 +159,10 @@ pub struct Options {
     pub fast_zeroes: bool,
     /// Block Device can be resized
     pub resizable: bool,
-    /// Block size preferences
-    pub block_size: Option<(u32, u32)>,
+    /// Ideal Block Size
+    ///
+    /// Must be a power of two and a multiple of [crate::nbd::MIN_BLOCK_SIZE]
+    pub block_size: u32,
 }
 
 #[async_trait]

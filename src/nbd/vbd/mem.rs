@@ -34,7 +34,7 @@ impl MemDevice {
 impl BlockDevice for MemDevice {
     fn options(&self) -> Options {
         Options {
-            block_size: Some((MIN_BLOCK_SIZE, self.block_size)),
+            block_size: self.block_size,
             size: (self.block_size as u64).saturating_mul(self.num_blocks as u64),
             read_only: false,
             resizable: false,

@@ -12,6 +12,9 @@ use thiserror::Error;
 
 const MAX_PAYLOAD_LEN: u32 = 33 * 1024 * 1024; // 33 MiB
 
+// for optimal compatibility this should not be changed
+const MIN_BLOCK_SIZE: u32 = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TransmissionMode {
     Simple,
@@ -56,25 +59,25 @@ impl Export {
     ) -> Result<Self, ExportError> {
         let block_device = Arc::new(block_device);
         let options = block_device.options();
-        if let Some((min, preferred)) = options.block_size {
-            if min > preferred {
-                return Err(BlockSizeError::MinSizeExceedsPreferred { min, preferred }.into());
-            }
-            if preferred > MAX_PAYLOAD_LEN {
-                return Err(BlockSizeError::PreferredSizeTooLarge { size: preferred }.into());
-            }
-            if preferred % min != 0 {
-                return Err(
-                    BlockSizeError::PreferredSizeNotMultipleOfMin { min, preferred }.into(),
-                );
-            }
-            if !is_power_of_two(min) {
-                return Err(BlockSizeError::NotPowerOfTwo { size: min }.into());
-            }
-            if !is_power_of_two(preferred) {
-                return Err(BlockSizeError::NotPowerOfTwo { size: preferred }.into());
-            }
+        let min = MIN_BLOCK_SIZE;
+        let preferred = options.block_size;
+
+        if min > preferred {
+            return Err(BlockSizeError::MinSizeExceedsPreferred { min, preferred }.into());
         }
+        if preferred > MAX_PAYLOAD_LEN {
+            return Err(BlockSizeError::PreferredSizeTooLarge { size: preferred }.into());
+        }
+        if preferred % min != 0 {
+            return Err(BlockSizeError::PreferredSizeNotMultipleOfMin { min, preferred }.into());
+        }
+        if !is_power_of_two(min) {
+            return Err(BlockSizeError::NotPowerOfTwo { size: min }.into());
+        }
+        if !is_power_of_two(preferred) {
+            return Err(BlockSizeError::NotPowerOfTwo { size: preferred }.into());
+        }
+
         let options = Arc::new(Mutex::new(Arc::new(options)));
 
         Ok(Self {
