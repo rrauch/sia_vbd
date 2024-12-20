@@ -490,7 +490,7 @@ async fn write<TX: AsyncWrite + Unpin + Send + 'static>(
                         transmission_mode,
                         write.request_id.cookie,
                         write.request_id.offset,
-                        true, // this is a defragmented, single reply, so done need to be true
+                        write.done || dont_fragment,
                     )
                     .await?;
             }
@@ -521,7 +521,7 @@ async fn write<TX: AsyncWrite + Unpin + Send + 'static>(
                         transmission_mode,
                         write.request_id.cookie,
                         write.request_id.offset,
-                        write.done,
+                        write.done || dont_fragment,
                     )
                     .await?;
             }
