@@ -463,9 +463,9 @@ impl Handshaker {
                                     payload.put_u32(preferred);
 
                                     // max block size must be a multiple of min, a power of two
-                                    // and not exceed (MAX_PAYLOAD_LEN + headers)
+                                    // and not exceed MAX_PAYLOAD_LEN
                                     let max_block_size =
-                                        highest_power_of_two(((MAX_PAYLOAD_LEN - 33) / min) * min);
+                                        highest_power_of_two((MAX_PAYLOAD_LEN / min) * min);
                                     payload.put_u32(max(max_block_size, preferred));
 
                                     send_info(

@@ -10,7 +10,7 @@ use futures::{AsyncRead, AsyncWrite};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-const MAX_PAYLOAD_LEN: u32 = 33 * 1024 * 1024; // 33 MiB
+const MAX_PAYLOAD_LEN: u32 = 32 * 1024 * 1024; // 32 MiB
 
 // for optimal compatibility this should not be changed
 const MIN_BLOCK_SIZE: u32 = 512;
