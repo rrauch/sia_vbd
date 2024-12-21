@@ -2,20 +2,17 @@ use crate::connection::tcp::TcpListener;
 use crate::connection::{Connection, Listener};
 use crate::nbd::handshake::Handshaker;
 use crate::nbd::{block_device::BlockDevice, Export};
-use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::oneshot;
 
 mod connection;
 pub mod nbd;
@@ -216,29 +213,23 @@ impl<T: AsyncWriteExt + ?Sized + Unpin> AsyncWriteBytesExt for T {}
 
 #[derive(Debug)]
 pub(crate) struct LimitedReader<R> {
-    inner: Option<R>,
+    inner: R,
     remaining: usize,
-    return_tx: Option<oneshot::Sender<(R, usize)>>,
 }
 
 impl<R> LimitedReader<R> {
-    pub(crate) fn new(inner: R, limit: usize, return_tx: oneshot::Sender<(R, usize)>) -> Self
+    pub(crate) fn new(inner: R, limit: usize) -> Self
     where
         R: AsyncRead + Unpin + Send,
     {
         Self {
-            inner: Some(inner),
+            inner,
             remaining: limit,
-            return_tx: Some(return_tx),
         }
     }
 
-    fn return_inner(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            if let Some(return_tx) = self.return_tx.take() {
-                let _ = return_tx.send((inner, self.remaining));
-            }
-        }
+    pub fn into_inner(self) -> (R, usize) {
+        (self.inner, self.remaining)
     }
 }
 
@@ -252,19 +243,10 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for LimitedReader<R> {
 
         if this.remaining == 0 {
             // finished already
-            this.return_inner();
             return Poll::Ready(Ok(0));
         }
 
-        let inner = match this.inner.as_mut() {
-            Some(inner) => inner,
-            None => {
-                return Poll::Ready(Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    anyhow!("inner reader was None"),
-                )));
-            }
-        };
+        let inner = &mut this.inner;
 
         let max_read = min(buf.len(), this.remaining);
         let pinned_inner = Pin::new(inner);
@@ -273,27 +255,14 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for LimitedReader<R> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(0)) => {
                 // eof
-                this.return_inner();
                 Poll::Ready(Ok(0))
             }
             Poll::Ready(Ok(bytes_read)) => {
                 this.remaining -= bytes_read;
-                if this.remaining == 0 {
-                    this.return_inner();
-                }
                 Poll::Ready(Ok(bytes_read))
             }
-            Poll::Ready(Err(err)) => {
-                this.return_inner();
-                Poll::Ready(Err(err))
-            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
-    }
-}
-
-impl<R> Drop for LimitedReader<R> {
-    fn drop(&mut self) {
-        self.return_inner();
     }
 }
 

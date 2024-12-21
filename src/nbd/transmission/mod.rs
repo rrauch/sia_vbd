@@ -1,7 +1,7 @@
+pub(super) mod fragment;
 mod read;
 mod reply;
 mod request;
-pub(super) mod fragment;
 
 use crate::nbd::block_device::RequestContext;
 use crate::nbd::transmission::request::ReadError;
@@ -12,7 +12,6 @@ use futures::{AsyncRead, AsyncWrite};
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -112,14 +111,12 @@ impl TransmissionHandler {
                     length,
                     fua,
                 } if !read_only => {
-                    let (reader_tx, reader_rx) = oneshot::channel();
-                    let mut payload =
-                        LimitedReader::new(rx, req.payload_length as usize, reader_tx);
+                    let mut payload = LimitedReader::new(rx, req.payload_length as usize);
                     let block_device = block_device.clone();
                     let req_id = req.id;
                     let writer = writer.clone();
 
-                    tokio::spawn(async move {
+                    let jh = tokio::spawn(async move {
                         match block_device
                             .write(offset, length, fua, &mut payload, &ctx)
                             .await
@@ -131,12 +128,14 @@ impl TransmissionHandler {
                                 let _ = writer.io_error(&err, req_id).await;
                             }
                         }
+                        payload
                     });
 
                     let remaining;
-                    (rx, remaining) = reader_rx
+                    (rx, remaining) = jh
                         .await
-                        .map_err(|_| anyhow!("input reader was not returned"))?;
+                        .map_err(|_| anyhow!("input reader was not returned"))?
+                        .into_inner();
                     payload_remaining = remaining;
                 }
                 Command::WriteZeroes {
