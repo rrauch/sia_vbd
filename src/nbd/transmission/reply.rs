@@ -2,7 +2,7 @@ use crate::nbd::block_device::read_reply::PayloadWriter;
 use crate::nbd::block_device::Error as BlockDeviceError;
 use crate::nbd::transmission::request::RequestId;
 use crate::nbd::TransmissionMode;
-use crate::AsyncWriteBytesExt;
+use crate::{AsyncWriteBytesExt, LimitedWriter};
 use bitflags::bitflags;
 use bytes::BufMut;
 use compact_bytes::CompactBytes;
@@ -513,7 +513,7 @@ async fn write<TX: AsyncWrite + Unpin + Send + 'static>(
                 };
 
             if (transmission_mode == TransmissionMode::Simple || dont_fragment) && !write.is_first {
-                // dont write a header in this case
+                // don't write a header in this case
             } else {
                 Reply::OffsetData(write_offset, write_length)
                     .serialize(
@@ -525,7 +525,21 @@ async fn write<TX: AsyncWrite + Unpin + Send + 'static>(
                     )
                     .await?;
             }
-            writer.write(&mut tx).await?
+            let mut limited_writer = LimitedWriter::new(tx, chunk_length as usize);
+            writer.write(&mut limited_writer).await?;
+            let (_, remaining) = limited_writer.into_inner();
+            if remaining != 0 {
+                // the writer didn't write all data it was supposed to
+                // at this point we cannot proceed and have to
+                // close the connection
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "payload writer didn't write enough data, missing {} bytes",
+                        remaining
+                    ),
+                ));
+            }
         }
     }
     Ok(())

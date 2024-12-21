@@ -3,7 +3,7 @@ use crate::connection::{Connection, Listener};
 use crate::nbd::handshake::Handshaker;
 use crate::nbd::{block_device::BlockDevice, Export};
 use bytes::{Bytes, BytesMut};
-use futures::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -253,16 +253,79 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for LimitedReader<R> {
 
         match pinned_inner.poll_read(cx, &mut buf[..max_read]) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(0)) => {
-                // eof
-                Poll::Ready(Ok(0))
-            }
             Poll::Ready(Ok(bytes_read)) => {
                 this.remaining -= bytes_read;
                 Poll::Ready(Ok(bytes_read))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LimitedWriter<W> {
+    inner: W,
+    remaining: usize,
+}
+
+impl<W> LimitedWriter<W> {
+    pub(crate) fn new(inner: W, limit: usize) -> Self
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        eprintln!("new limited writer with limit: {}", limit);
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+
+    pub fn into_inner(self) -> (W, usize) {
+        eprintln!("complete, {} remaining", self.remaining);
+        (self.inner, self.remaining)
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send> AsyncWrite for LimitedWriter<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot write beyond limit",
+            )));
+        }
+
+        let inner = &mut this.inner;
+        let pinned_inner = Pin::new(inner);
+
+        let max_write = min(buf.len(), this.remaining);
+
+        match pinned_inner.poll_write(cx, &buf[..max_write]) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(bytes_written)) => {
+                this.remaining -= bytes_written;
+                eprintln!("{} bytes written, {} remaining", bytes_written, this.remaining);
+                Poll::Ready(Ok(bytes_written))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        let pinned_inner = Pin::new(inner);
+        pinned_inner.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // don't close the inner writer, just flush it
+        self.poll_flush(cx)
     }
 }
 
