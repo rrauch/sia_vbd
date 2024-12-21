@@ -2,17 +2,20 @@ use crate::connection::tcp::TcpListener;
 use crate::connection::{Connection, Listener};
 use crate::nbd::handshake::Handshaker;
 use crate::nbd::{block_device::BlockDevice, Export};
+use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 
 mod connection;
 pub mod nbd;
@@ -213,23 +216,29 @@ impl<T: AsyncWriteExt + ?Sized + Unpin> AsyncWriteBytesExt for T {}
 
 #[derive(Debug)]
 pub(crate) struct LimitedReader<R> {
-    inner: R,
+    inner: Option<R>,
     remaining: usize,
+    return_tx: Option<oneshot::Sender<(R, usize)>>,
 }
 
 impl<R> LimitedReader<R> {
-    pub(crate) fn new(inner: R, limit: usize) -> Self
+    pub(crate) fn new(inner: R, limit: usize, return_tx: oneshot::Sender<(R, usize)>) -> Self
     where
         R: AsyncRead + Unpin + Send,
     {
         Self {
-            inner,
+            inner: Some(inner),
             remaining: limit,
+            return_tx: Some(return_tx),
         }
     }
 
-    pub fn into_inner(self) -> (R, usize) {
-        (self.inner, self.remaining)
+    fn return_inner(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            if let Some(return_tx) = self.return_tx.take() {
+                let _ = return_tx.send((inner, self.remaining));
+            }
+        }
     }
 }
 
@@ -243,22 +252,48 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for LimitedReader<R> {
 
         if this.remaining == 0 {
             // finished already
+            this.return_inner();
             return Poll::Ready(Ok(0));
         }
 
-        let inner = &mut this.inner;
+        let inner = match this.inner.as_mut() {
+            Some(inner) => inner,
+            None => {
+                return Poll::Ready(Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    anyhow!("inner reader was None"),
+                )));
+            }
+        };
 
         let max_read = min(buf.len(), this.remaining);
         let pinned_inner = Pin::new(inner);
 
         match pinned_inner.poll_read(cx, &mut buf[..max_read]) {
             Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(0)) => {
+                // eof
+                this.return_inner();
+                Poll::Ready(Ok(0))
+            }
             Poll::Ready(Ok(bytes_read)) => {
                 this.remaining -= bytes_read;
+                if this.remaining == 0 {
+                    this.return_inner();
+                }
                 Poll::Ready(Ok(bytes_read))
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                this.return_inner();
+                Poll::Ready(Err(err))
+            }
         }
+    }
+}
+
+impl<R> Drop for LimitedReader<R> {
+    fn drop(&mut self) {
+        self.return_inner();
     }
 }
 
@@ -273,7 +308,6 @@ impl<W> LimitedWriter<W> {
     where
         W: AsyncWrite + Unpin + Send,
     {
-        eprintln!("new limited writer with limit: {}", limit);
         Self {
             inner,
             remaining: limit,
@@ -281,7 +315,6 @@ impl<W> LimitedWriter<W> {
     }
 
     pub fn into_inner(self) -> (W, usize) {
-        eprintln!("complete, {} remaining", self.remaining);
         (self.inner, self.remaining)
     }
 }
@@ -309,7 +342,6 @@ impl<W: AsyncWrite + Unpin + Send> AsyncWrite for LimitedWriter<W> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(bytes_written)) => {
                 this.remaining -= bytes_written;
-                eprintln!("{} bytes written, {} remaining", bytes_written, this.remaining);
                 Poll::Ready(Ok(bytes_written))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),

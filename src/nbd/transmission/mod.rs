@@ -12,6 +12,7 @@ use futures::{AsyncRead, AsyncWrite};
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -111,12 +112,14 @@ impl TransmissionHandler {
                     length,
                     fua,
                 } if !read_only => {
-                    let mut payload = LimitedReader::new(rx, req.payload_length as usize);
+                    let (reader_tx, reader_rx) = oneshot::channel();
+                    let mut payload =
+                        LimitedReader::new(rx, req.payload_length as usize, reader_tx);
                     let block_device = block_device.clone();
                     let req_id = req.id;
                     let writer = writer.clone();
 
-                    let jh = tokio::spawn(async move {
+                    tokio::spawn(async move {
                         match block_device
                             .write(offset, length, fua, &mut payload, &ctx)
                             .await
@@ -128,14 +131,12 @@ impl TransmissionHandler {
                                 let _ = writer.io_error(&err, req_id).await;
                             }
                         }
-                        payload
                     });
 
                     let remaining;
-                    (rx, remaining) = jh
+                    (rx, remaining) = reader_rx
                         .await
-                        .map_err(|_| anyhow!("input reader was not returned"))?
-                        .into_inner();
+                        .map_err(|_| anyhow!("input reader was not returned"))?;
                     payload_remaining = remaining;
                 }
                 Command::WriteZeroes {
