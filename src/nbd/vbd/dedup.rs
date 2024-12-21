@@ -3,14 +3,12 @@ use crate::nbd::block_device::{BlockDevice, Options, RequestContext};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt};
-use itertools::Itertools;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep_until, Instant};
 
 const MIN_BLOCK_SIZE: u32 = 4096;
 
@@ -82,7 +80,7 @@ impl<T: Hasher> Block<T> {
 
 struct DataContainer<T: Hasher> {
     index: HashMap<usize, T::Hash>,
-    data_blocks: HashMap<T::Hash, Block<T>>,
+    data_blocks: HashMap<T::Hash, (Block<T>, usize)>,
     _phantom_data: PhantomData<T>,
 }
 
@@ -90,29 +88,35 @@ impl<T: Hasher> DataContainer<T> {
     fn get(&self, block_no: usize) -> Option<Block<T>> {
         self.index
             .get(&block_no)
-            .map(|hash| self.data_blocks.get(hash).map(|b| b.clone()))
+            .map(|hash| self.data_blocks.get(hash).map(|(b, _)| b.clone()))
             .flatten()
     }
 
     fn remove(&mut self, block_no: usize) {
-        self.index.remove(&block_no);
-    }
-
-    fn insert(&mut self, block_no: usize, block: Block<T>) {
-        self.index.insert(block_no, block.hash.clone());
-        if !self.data_blocks.contains_key(&block.hash) {
-            self.data_blocks.insert(block.hash.clone(), block);
+        if let Some(hash) = self.index.remove(&block_no) {
+            self.gc(hash);
         }
     }
 
-    fn gc(&mut self) {
-        let in_use = self.index.values().unique().collect::<HashSet<_>>();
-        let before = self.data_blocks.len();
-        self.data_blocks.retain(|hash, _| in_use.contains(&hash));
-        let removed = before - self.data_blocks.len();
+    fn gc(&mut self, hash: T::Hash) {
+        if let Some((_, refcount)) = self.data_blocks.get_mut(&hash) {
+            *refcount = refcount.saturating_sub(1);
+            if *refcount == 0 {
+                self.data_blocks.remove(&hash);
+            }
+        }
+    }
 
-        if removed > 0 {
-            eprintln!("gc: removed {} unused data blocks", removed);
+    fn insert(&mut self, block_no: usize, block: Block<T>) {
+        let previous = self.index.insert(block_no, block.hash.clone());
+
+        self.data_blocks
+            .entry(block.hash.clone())
+            .and_modify(|(_, refcount)| *refcount += 1)
+            .or_insert_with(|| (block, 1));
+
+        if let Some(hash) = previous {
+            self.gc(hash);
         }
     }
 }
@@ -125,7 +129,6 @@ pub struct DedupDevice<T: Hasher> {
     zero_block: Bytes,
     zero_hash: T::Hash,
     hasher: T,
-    gc_task: JoinHandle<()>,
     stats_task: JoinHandle<()>,
 }
 
@@ -134,7 +137,6 @@ impl<T: Hasher + 'static> DedupDevice<T> {
         block_size: u32,
         num_blocks: usize,
         hasher: T,
-        gc_interval: Duration,
         description: Option<impl ToString>,
     ) -> Self {
         assert!(block_size >= MIN_BLOCK_SIZE);
@@ -148,36 +150,6 @@ impl<T: Hasher + 'static> DedupDevice<T> {
             data_blocks: HashMap::default(),
             _phantom_data: PhantomData::default(),
         }));
-
-        let gc_task = {
-            let data_blocks = data_blocks.clone();
-            tokio::spawn(async move {
-                let mut next_gc = Instant::now() + gc_interval;
-
-                loop {
-                    tokio::select! {
-                        _ = sleep_until(next_gc) => {
-                            // regular gc
-                            let mut lock = data_blocks.write().unwrap();
-                            lock.gc();
-                            next_gc = Instant::now() + gc_interval;
-                        },
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                            // check if under pressure
-                            let under_pressure = {
-                                let lock = data_blocks.read().unwrap();
-                                lock.data_blocks.len() > num_blocks
-                            };
-                            if under_pressure {
-                                let mut lock = data_blocks.write().unwrap();
-                                lock.gc();
-                                next_gc = Instant::now() + gc_interval;
-                            }
-                        }
-                    }
-                }
-            })
-        };
 
         let stats_task = {
             let data_blocks = data_blocks.clone();
@@ -221,7 +193,6 @@ impl<T: Hasher + 'static> DedupDevice<T> {
             num_blocks,
             description: description.map(|s| s.to_string()),
             hasher,
-            gc_task,
             stats_task,
             data_blocks,
             zero_block,
@@ -232,7 +203,6 @@ impl<T: Hasher + 'static> DedupDevice<T> {
 
 impl<T: Hasher> Drop for DedupDevice<T> {
     fn drop(&mut self) {
-        self.gc_task.abort();
         self.stats_task.abort();
     }
 }
@@ -323,7 +293,7 @@ impl<T: Hasher> BlockDevice for DedupDevice<T> {
                     .get(&(block as usize))
                     .map(|h| lock.data_blocks.get(h))
                     .flatten()
-                    .map(|b| BytesMut::from(b.data.as_ref()))
+                    .map(|(b, _)| BytesMut::from(b.data.as_ref()))
                     .or_else(|| Some(BytesMut::from(self.zero_block.as_ref())))
                     .unwrap()
             };

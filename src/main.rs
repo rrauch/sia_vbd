@@ -26,7 +26,6 @@ async fn main() -> anyhow::Result<()> {
                 //XXH3Hasher {},
                 Blake3Hasher {},
                 //TentHasher{},
-                Duration::from_secs(60),
                 Some("Virtual Deduplicating Block Device"),
             ),
             false,
