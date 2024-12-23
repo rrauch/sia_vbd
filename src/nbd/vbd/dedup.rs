@@ -1,52 +1,16 @@
+use crate::hash::Hasher;
 use crate::nbd::block_device::read_reply::Queue;
 use crate::nbd::block_device::{BlockDevice, Options, RequestContext};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt};
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const MIN_BLOCK_SIZE: u32 = 4096;
-
-pub trait Hasher: Send + Sync {
-    type Hash: Clone + PartialEq + Eq + Hash + Send + Sync;
-
-    fn hash(&self, data: impl AsRef<[u8]>) -> Self::Hash;
-}
-
-pub struct TentHasher {}
-
-impl Hasher for TentHasher {
-    type Hash = [u8; 20];
-
-    fn hash(&self, data: impl AsRef<[u8]>) -> Self::Hash {
-        tenthash::hash(data)
-    }
-}
-
-pub struct Blake3Hasher {}
-
-impl Hasher for Blake3Hasher {
-    type Hash = blake3::Hash;
-
-    fn hash(&self, data: impl AsRef<[u8]>) -> Self::Hash {
-        blake3::hash(data.as_ref())
-    }
-}
-
-pub struct XXH3Hasher {}
-
-impl Hasher for XXH3Hasher {
-    type Hash = u128;
-
-    fn hash(&self, data: impl AsRef<[u8]>) -> Self::Hash {
-        twox_hash::XxHash3_128::oneshot(data.as_ref())
-    }
-}
 
 struct Block<T: Hasher> {
     hash: T::Hash,
