@@ -1,5 +1,5 @@
+use super::transmission::TransmissionHandler;
 use super::{Export, TransmissionMode, MAX_PAYLOAD_LEN, MIN_BLOCK_SIZE};
-use crate::nbd::transmission::TransmissionHandler;
 use crate::{highest_power_of_two, AsyncReadBytesExt, ClientEndpoint};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -306,7 +306,7 @@ bitflags! {
     }
 }
 
-pub(crate) struct Handshaker {
+pub(super) struct Handshaker {
     exports: HashMap<String, Export>,
     default_export: Option<String>,
     structured_replies_disabled: bool,
@@ -314,7 +314,7 @@ pub(crate) struct Handshaker {
 }
 
 impl Handshaker {
-    pub fn new<I: IntoIterator<Item = (String, Export)>>(
+    pub(super) fn new<I: IntoIterator<Item = (String, Export)>>(
         exports: I,
         default_export: Option<String>,
         structured_replies_disabled: bool,

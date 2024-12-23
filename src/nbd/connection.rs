@@ -4,7 +4,7 @@ use futures::{AsyncRead, AsyncWrite};
 use std::fmt::Display;
 
 #[async_trait]
-pub(super) trait Listener: Sized {
+pub(crate) trait Listener: Sized {
     type BindAddr;
     type ListenAddr: Display;
     type Conn: Connection;
@@ -17,7 +17,7 @@ pub(super) trait Listener: Sized {
 }
 
 #[async_trait]
-pub(super) trait Connection: Send {
+pub(crate) trait Connection: Send {
     type Reader: AsyncRead + Send + Unpin + 'static;
     type Writer: AsyncWrite + Send + Unpin + 'static;
 
@@ -25,8 +25,8 @@ pub(super) trait Connection: Send {
     fn into_split(self) -> (Self::Reader, Self::Writer);
 }
 
-pub(super) mod tcp {
-    use crate::connection::{Connection, Listener};
+pub(crate) mod tcp {
+    use super::{Connection, Listener};
     use crate::ClientEndpoint;
     use async_trait::async_trait;
     use std::net::SocketAddr;
@@ -89,8 +89,8 @@ pub(super) mod tcp {
 }
 
 #[cfg(unix)]
-pub(super) mod unix {
-    use crate::connection::{Connection, Listener};
+pub(crate) mod unix {
+    use super::{Connection, Listener};
     use crate::unix::UnixAddr;
     use crate::ClientEndpoint;
     use async_trait::async_trait;

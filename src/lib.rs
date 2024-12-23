@@ -1,112 +1,24 @@
-use crate::connection::tcp::TcpListener;
-use crate::connection::{Connection, Listener};
-use crate::nbd::handshake::Handshaker;
-use crate::nbd::{block_device::BlockDevice, Export};
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use std::cmp::min;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
-mod connection;
 pub mod nbd;
 
 static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
-
-pub struct Runner {
-    listen_endpoint: ListenEndpoint,
-    handshaker: Arc<Handshaker>,
-}
 
 enum ListenEndpoint {
     Tcp(String),
     #[cfg(unix)]
     Unix(PathBuf),
-}
-
-pub struct Builder {
-    listen_endpoint: ListenEndpoint,
-    exports: HashMap<String, Export>,
-    default_export: Option<String>,
-    structured_replies_disabled: bool,
-    extended_headers_disabled: bool,
-}
-
-impl Builder {
-    pub fn tcp<S: ToString>(host: S, port: u16) -> Self {
-        Self {
-            listen_endpoint: ListenEndpoint::Tcp(format!("{}:{}", host.to_string(), port)),
-            exports: HashMap::default(),
-            default_export: None,
-            structured_replies_disabled: false,
-            extended_headers_disabled: false,
-        }
-    }
-
-    #[cfg(unix)]
-    pub fn unix<P: AsRef<Path>>(socket_path: P) -> Self {
-        Self {
-            listen_endpoint: ListenEndpoint::Unix(socket_path.as_ref().to_path_buf()),
-            exports: HashMap::default(),
-            default_export: None,
-            structured_replies_disabled: false,
-            extended_headers_disabled: false,
-        }
-    }
-
-    pub fn with_export<S: ToString, H: BlockDevice + Send + Sync + 'static>(
-        mut self,
-        name: S,
-        block_device: H,
-        force_read_only: bool,
-    ) -> Result<Self, anyhow::Error> {
-        let name = name.to_string();
-        let export = Export::new(name.clone(), block_device, force_read_only)?;
-        self.exports.insert(name, export);
-        Ok(self)
-    }
-
-    pub fn with_default_export<S: ToString>(mut self, name: S) -> Result<Self, anyhow::Error> {
-        let name = name.to_string();
-        if !self.exports.contains_key(&name) {
-            anyhow::bail!("unknown export: {}", name);
-        }
-        self.default_export = Some(name.to_string());
-        Ok(self)
-    }
-
-    pub fn disable_structured_replies(mut self) -> Self {
-        self.structured_replies_disabled = true;
-        self.extended_headers_disabled = true;
-        self
-    }
-
-    pub fn disable_extended_headers(mut self) -> Self {
-        self.extended_headers_disabled = true;
-        self
-    }
-
-    pub fn build(self) -> Runner {
-        let handshaker = Handshaker::new(
-            self.exports,
-            self.default_export,
-            self.structured_replies_disabled,
-            self.extended_headers_disabled,
-        );
-        Runner {
-            listen_endpoint: self.listen_endpoint,
-            handshaker: Arc::new(handshaker),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,44 +34,6 @@ impl Display for ClientEndpoint {
             Self::Tcp(addr) => Display::fmt(addr, f),
             #[cfg(unix)]
             Self::Unix(addr) => Display::fmt(addr, f),
-        }
-    }
-}
-
-impl Runner {
-    pub async fn run(&self) -> anyhow::Result<()> {
-        match &self.listen_endpoint {
-            ListenEndpoint::Tcp(addr) => {
-                self._run(TcpListener::bind(addr.to_string()).await?)
-                    .await?
-            }
-            #[cfg(unix)]
-            ListenEndpoint::Unix(path) => {
-                self._run(connection::unix::UnixListener::bind(path.to_path_buf()).await?)
-                    .await?
-            }
-        };
-        Ok(())
-    }
-
-    async fn _run<T: Listener>(&self, listener: T) -> anyhow::Result<()> {
-        println!("Listening on {}", listener.addr());
-        loop {
-            let conn = listener.accept().await?;
-            println!("New connection from {}", conn.client_endpoint());
-
-            let handshaker = self.handshaker.clone();
-            let client_endpoint = conn.client_endpoint().clone();
-            let (rx, tx) = conn.into_split();
-
-            tokio::spawn(async move {
-                if let Err(error) =
-                    nbd::new_connection(&handshaker, rx, tx, client_endpoint.clone()).await
-                {
-                    eprintln!("error {:?}, client endpoint {}", error, client_endpoint);
-                }
-                println!("connection closed for {}", client_endpoint);
-            });
         }
     }
 }

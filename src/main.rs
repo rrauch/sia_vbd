@@ -1,7 +1,7 @@
 use sia_vbd::nbd::vbd::dedup::{Blake3Hasher, DedupDevice, TentHasher, XXH3Hasher};
 use sia_vbd::nbd::vbd::dummy::DummyBlockDevice;
 use sia_vbd::nbd::vbd::mem::MemDevice;
-use sia_vbd::Builder;
+use sia_vbd::nbd::Builder;
 use std::time::Duration;
 
 #[tokio::main]
