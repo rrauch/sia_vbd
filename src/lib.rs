@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 pub mod hash;
 pub mod nbd;
+pub mod vbd;
 
 static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
 

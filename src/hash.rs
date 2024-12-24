@@ -1,90 +1,104 @@
-use bytes::Bytes;
-use std::hash::Hash;
+use std::fmt::{Debug, Display, Formatter};
 
-pub enum Hashable<'a> {
-    Simple(&'a [u8], bool),
+#[derive(Copy, Clone, Debug)]
+pub enum HashAlgorithm {
+    Tent,
+    Blake3,
+    XXH3,
 }
 
-impl<'a> Iterator for Hashable<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl HashAlgorithm {
+    /// Performs a one-shot hash of the input data.
+    pub(crate) fn hash(&self, input: impl AsRef<[u8]>) -> Hash {
         match self {
-            Hashable::Simple(data, sent) => {
-                if !*sent {
-                    *sent = true;
-                    Some(data)
-                } else {
-                    None
+            HashAlgorithm::Tent => Hash::Tent(tenthash::hash(input)),
+            HashAlgorithm::Blake3 => Hash::Blake3(blake3::hash(input.as_ref())),
+            HashAlgorithm::XXH3 => {
+                Hash::XXH3(twox_hash::XxHash3_128::oneshot(input.as_ref()).to_be_bytes())
+            }
+        }
+    }
+
+    /// Creates a new hasher instance for incremental hashing.
+    pub(crate) fn new(&self) -> Hasher {
+        match self {
+            HashAlgorithm::Tent => Hasher::Tent(tenthash::TentHasher::new()),
+            HashAlgorithm::Blake3 => Hasher::Blake3(blake3::Hasher::new()),
+            HashAlgorithm::XXH3 => Hasher::XXH3(twox_hash::XxHash3_128::new()),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            HashAlgorithm::Tent => "TentHash v0.4",
+            HashAlgorithm::Blake3 => "BLAKE3",
+            HashAlgorithm::XXH3 => "XXH128",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum Hasher {
+    Tent(tenthash::TentHasher),
+    Blake3(blake3::Hasher),
+    XXH3(twox_hash::XxHash3_128),
+}
+
+impl Hasher {
+    /// Updates the hasher with additional data.
+    pub fn update(&mut self, data: impl AsRef<[u8]>) {
+        match self {
+            Hasher::Tent(hasher) => hasher.update(data),
+            Hasher::Blake3(hasher) => {
+                hasher.update(data.as_ref());
+            }
+            Hasher::XXH3(hasher) => hasher.write(data.as_ref()),
+        }
+    }
+
+    /// Finalizes the hashing process and returns the hash.
+    pub fn finalize(self) -> Hash {
+        match self {
+            Hasher::Tent(hasher) => Hash::Tent(hasher.finalize()),
+            Hasher::Blake3(hasher) => Hash::Blake3(hasher.finalize()),
+            Hasher::XXH3(hasher) => Hash::XXH3(hasher.finish_128().to_be_bytes()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum Hash {
+    Tent([u8; 20]),
+    Blake3(blake3::Hash),
+    XXH3([u8; 16]),
+}
+
+impl Display for Hash {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Hash::Tent(bytes) => {
+                for &byte in bytes {
+                    write!(f, "{:0>2x}", byte)?;
                 }
+                Ok(())
+            }
+            Hash::Blake3(hash) => Display::fmt(hash, f),
+            Hash::XXH3(bytes) => {
+                for &byte in bytes {
+                    write!(f, "{:0>2x}", byte)?;
+                }
+                Ok(())
             }
         }
     }
 }
 
-pub trait AsHashable {
-    #[must_use]
-    fn as_hashable(&self) -> Hashable;
-}
-
-impl AsHashable for &[u8] {
-    fn as_hashable(&self) -> Hashable {
-        Hashable::Simple(self, false)
-    }
-}
-
-impl AsHashable for &Vec<u8> {
-    fn as_hashable(&self) -> Hashable {
-        Hashable::Simple(self.as_slice(), false)
-    }
-}
-
-impl AsHashable for &Bytes {
-    fn as_hashable(&self) -> Hashable {
-        Hashable::Simple(self.as_ref(), false)
-    }
-}
-
-pub trait Hasher: Send + Sync {
-    type Hash: Clone + PartialEq + Eq + Hash + Send + Sync;
-
-    fn hash(&self, input: impl AsHashable) -> Self::Hash;
-}
-
-pub struct TentHasher {}
-
-impl Hasher for TentHasher {
-    type Hash = [u8; 20];
-
-    fn hash(&self, input: impl AsHashable) -> Self::Hash {
-        let mut hasher = tenthash::TentHasher::new();
-        input.as_hashable().for_each(|i| hasher.update(i.as_ref()));
-        hasher.finalize()
-    }
-}
-
-pub struct Blake3Hasher {}
-
-impl Hasher for Blake3Hasher {
-    type Hash = blake3::Hash;
-
-    fn hash(&self, input: impl AsHashable) -> Self::Hash {
-        let mut hasher = blake3::Hasher::new();
-        input.as_hashable().for_each(|d| {
-            hasher.update(d.as_ref());
-        });
-        hasher.finalize()
-    }
-}
-
-pub struct XXH3Hasher {}
-
-impl Hasher for XXH3Hasher {
-    type Hash = u128;
-
-    fn hash(&self, input: impl AsHashable) -> Self::Hash {
-        let mut hasher = twox_hash::XxHash3_128::new();
-        input.as_hashable().for_each(|d| hasher.write(d.as_ref()));
-        hasher.finish_128()
+impl AsRef<[u8]> for Hash {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Hash::Tent(bytes) => bytes.as_slice(),
+            Hash::Blake3(hash) => hash.as_bytes().as_slice(),
+            Hash::XXH3(bytes) => bytes.as_slice(),
+        }
     }
 }

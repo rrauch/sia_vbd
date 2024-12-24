@@ -1,40 +1,25 @@
-use crate::hash::Hasher;
+use crate::hash::{Hash, HashAlgorithm};
 use crate::nbd::block_device::read_reply::Queue;
 use crate::nbd::block_device::{BlockDevice, Options, RequestContext};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt};
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const MIN_BLOCK_SIZE: u32 = 4096;
 
-struct Block<T: Hasher> {
-    hash: T::Hash,
+#[derive(Clone)]
+struct Block {
+    hash: Hash,
     data: Bytes,
-    _phantom_data: PhantomData<T>,
 }
 
-impl<T: Hasher> Clone for Block<T> {
-    fn clone(&self) -> Self {
-        Self {
-            hash: self.hash.clone(),
-            data: self.data.clone(),
-            _phantom_data: self._phantom_data.clone(),
-        }
-    }
-}
-
-impl<T: Hasher> Block<T> {
-    fn new(hash: T::Hash, data: Bytes) -> Self {
-        Self {
-            hash,
-            data,
-            _phantom_data: PhantomData::default(),
-        }
+impl Block {
+    fn new(hash: Hash, data: Bytes) -> Self {
+        Self { hash, data }
     }
 
     fn len(&self) -> usize {
@@ -42,14 +27,13 @@ impl<T: Hasher> Block<T> {
     }
 }
 
-struct DataContainer<T: Hasher> {
-    index: HashMap<usize, T::Hash>,
-    data_blocks: HashMap<T::Hash, (Block<T>, usize)>,
-    _phantom_data: PhantomData<T>,
+struct DataContainer {
+    index: HashMap<usize, Hash>,
+    data_blocks: HashMap<Hash, (Block, usize)>,
 }
 
-impl<T: Hasher> DataContainer<T> {
-    fn get(&self, block_no: usize) -> Option<Block<T>> {
+impl DataContainer {
+    fn get(&self, block_no: usize) -> Option<Block> {
         self.index
             .get(&block_no)
             .map(|hash| self.data_blocks.get(hash).map(|(b, _)| b.clone()))
@@ -58,20 +42,20 @@ impl<T: Hasher> DataContainer<T> {
 
     fn remove(&mut self, block_no: usize) {
         if let Some(hash) = self.index.remove(&block_no) {
-            self.gc(hash);
+            self.gc(&hash);
         }
     }
 
-    fn gc(&mut self, hash: T::Hash) {
-        if let Some((_, refcount)) = self.data_blocks.get_mut(&hash) {
+    fn gc(&mut self, hash: &Hash) {
+        if let Some((_, refcount)) = self.data_blocks.get_mut(hash) {
             *refcount = refcount.saturating_sub(1);
             if *refcount == 0 {
-                self.data_blocks.remove(&hash);
+                self.data_blocks.remove(hash);
             }
         }
     }
 
-    fn insert(&mut self, block_no: usize, block: Block<T>) {
+    fn insert(&mut self, block_no: usize, block: Block) {
         let previous = self.index.insert(block_no, block.hash.clone());
 
         self.data_blocks
@@ -80,27 +64,27 @@ impl<T: Hasher> DataContainer<T> {
             .or_insert_with(|| (block, 1));
 
         if let Some(hash) = previous {
-            self.gc(hash);
+            self.gc(&hash);
         }
     }
 }
 
-pub struct DedupDevice<T: Hasher> {
+pub struct DedupDevice {
     block_size: u32,
     num_blocks: usize,
     description: Option<String>,
-    data_blocks: Arc<RwLock<DataContainer<T>>>,
+    data_blocks: Arc<RwLock<DataContainer>>,
     zero_block: Bytes,
-    zero_hash: T::Hash,
-    hasher: T,
+    zero_hash: Hash,
+    hasher: HashAlgorithm,
     stats_task: JoinHandle<()>,
 }
 
-impl<T: Hasher + 'static> DedupDevice<T> {
+impl DedupDevice {
     pub fn new(
         block_size: u32,
         num_blocks: usize,
-        hasher: T,
+        hasher: HashAlgorithm,
         description: Option<impl ToString>,
     ) -> Self {
         assert!(block_size >= MIN_BLOCK_SIZE);
@@ -112,7 +96,6 @@ impl<T: Hasher + 'static> DedupDevice<T> {
         let data_blocks = Arc::new(RwLock::new(DataContainer {
             index: HashMap::with_capacity(num_blocks),
             data_blocks: HashMap::default(),
-            _phantom_data: PhantomData::default(),
         }));
 
         let stats_task = {
@@ -165,14 +148,14 @@ impl<T: Hasher + 'static> DedupDevice<T> {
     }
 }
 
-impl<T: Hasher> Drop for DedupDevice<T> {
+impl Drop for DedupDevice {
     fn drop(&mut self) {
         self.stats_task.abort();
     }
 }
 
 #[async_trait]
-impl<T: Hasher> BlockDevice for DedupDevice<T> {
+impl BlockDevice for DedupDevice {
     fn options(&self) -> Options {
         Options {
             block_size: self.block_size,
