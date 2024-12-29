@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
                 BlockSize::Bs64k,
                 HashAlgorithm::Blake3,
                 HashAlgorithm::Blake3,
+                1024 * 1024 * 100,
             )?),
             false,
         )?

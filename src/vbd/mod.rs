@@ -9,6 +9,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, RangeInclusive};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -61,12 +62,16 @@ impl<T> Deref for ContentId<T> {
 }
 
 struct Transaction {
+    max_blocks: usize,
+    last_modified: Instant,
     blocks: HashMap<(usize, usize), Option<Bytes>>,
 }
 
 impl Transaction {
-    pub fn new() -> Self {
+    pub fn new(max_blocks: usize) -> Self {
         Self {
+            max_blocks,
+            last_modified: Instant::now(),
             blocks: HashMap::default(),
         }
     }
@@ -79,10 +84,16 @@ impl Transaction {
 
     pub fn put(&mut self, cluster_no: usize, block_no: usize, data: Bytes) {
         self.blocks.insert((cluster_no, block_no), Some(data));
+        self.last_modified = Instant::now();
     }
 
     pub fn delete(&mut self, cluster_no: usize, block_no: usize) {
         self.blocks.insert((cluster_no, block_no), None);
+        self.last_modified = Instant::now();
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.blocks.len() >= self.max_blocks
     }
 }
 
@@ -103,6 +114,7 @@ pub struct Structure {
     blocks: HashMap<BlockId, Block>,
     hash: HashAlgorithm,
     pending_tx: Option<Transaction>,
+    tx_max_blocks: usize,
 }
 
 impl Structure {
@@ -114,6 +126,7 @@ impl Structure {
         block_size: BlockSize,
         block_hash: HashAlgorithm,
         hash: HashAlgorithm,
+        max_buffer_size: usize,
     ) -> Result<Self, anyhow::Error> {
         assert!(num_clusters > 0);
 
@@ -157,6 +170,7 @@ impl Structure {
             blocks,
             hash,
             pending_tx: None,
+            tx_max_blocks: (max_buffer_size / *block_size) + 1,
         };
         structure.refresh_content_id();
 
@@ -246,9 +260,7 @@ impl Structure {
 
     pub fn put(&mut self, block_no: usize, data: Bytes) -> Result<(), BlockError> {
         let (cluster_no, relative_block_no) = self.calc_cluster_block(block_no)?;
-        if self.pending_tx.is_none() {
-            self.pending_tx = Some(Transaction::new());
-        }
+        self.prepare_tx()?;
         if all_zeroes(data.as_ref()) {
             // use delete instead
             self.delete(block_no..=block_no)?;
@@ -262,15 +274,31 @@ impl Structure {
     pub fn delete(&mut self, blocks: RangeInclusive<usize>) -> Result<(), BlockError> {
         let clusters = self.calc_clusters_blocks(blocks)?;
 
-        if self.pending_tx.is_none() {
-            self.pending_tx = Some(Transaction::new());
-        }
+        self.prepare_tx()?;
 
         let tx = self.pending_tx.as_mut().unwrap();
         for (cluster_no, blocks) in clusters {
             for block_no in blocks {
                 tx.delete(cluster_no, block_no);
             }
+        }
+
+        Ok(())
+    }
+
+    fn prepare_tx(&mut self) -> Result<(), BlockError> {
+        if self
+            .pending_tx
+            .as_ref()
+            .map(|tx| tx.is_full())
+            .unwrap_or(false)
+        {
+            // the current tx is full, commit now
+            self.commit()?;
+        }
+
+        if self.pending_tx.is_none() {
+            self.pending_tx = Some(Transaction::new(self.tx_max_blocks));
         }
 
         Ok(())
@@ -573,6 +601,7 @@ pub fn foo() {
         BlockSize::Bs64k,
         HashAlgorithm::XXH3,
         HashAlgorithm::Blake3,
+        1024 * 1024 * 100,
     )
     .unwrap();
 
