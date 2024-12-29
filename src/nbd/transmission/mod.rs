@@ -73,6 +73,25 @@ impl TransmissionHandler {
         TX: AsyncWrite + Unpin + Send + 'static,
     >(
         &self,
+        rx: RX,
+        tx: TX,
+    ) -> Result<(), NbdError> {
+        self.export.increase_connection_count();
+        let res = self._process(rx, tx).await;
+        if self.export.decrease_connection_count() == 0 && !self.export.read_only() {
+            // this is the end of the last connection
+            // issue final flush
+            let ctx = RequestContext::new(69234560174454211, self.client_endpoint.clone());
+            let _ = self.export.block_device.flush(&ctx).await;
+        }
+        res
+    }
+
+    async fn _process<
+        RX: AsyncRead + Unpin + Send + 'static,
+        TX: AsyncWrite + Unpin + Send + 'static,
+    >(
+        &self,
         mut rx: RX,
         tx: TX,
     ) -> Result<(), NbdError> {

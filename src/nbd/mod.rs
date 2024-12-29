@@ -54,6 +54,7 @@ struct Export {
     forced_read_only: bool,
     block_device: Arc<dyn BlockDevice + Send + Sync + 'static>,
     options: Arc<Mutex<Arc<Options>>>,
+    connection_count: Arc<Mutex<usize>>,
 }
 
 impl Export {
@@ -90,6 +91,7 @@ impl Export {
             forced_read_only,
             block_device,
             options,
+            connection_count: Arc::new(Mutex::new(0)),
         })
     }
 
@@ -108,6 +110,18 @@ impl Export {
     pub fn update_options(&self, new_options: Options) {
         let mut lock = self.options.lock().unwrap();
         *lock = Arc::new(new_options);
+    }
+
+    pub fn increase_connection_count(&self) -> usize {
+        let mut lock = self.connection_count.lock().unwrap();
+        *lock += 1;
+        *lock
+    }
+
+    pub fn decrease_connection_count(&self) -> usize {
+        let mut lock = self.connection_count.lock().unwrap();
+        *lock = lock.saturating_sub(1);
+        *lock
     }
 }
 
