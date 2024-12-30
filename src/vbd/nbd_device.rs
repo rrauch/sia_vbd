@@ -1,28 +1,34 @@
 use crate::nbd::block_device::read_reply::Queue;
 use crate::nbd::block_device::{BlockDevice, Error, Options, RequestContext};
-use crate::vbd::{BlockError, Structure};
+use crate::vbd::{BlockError, State};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt};
 use std::io::ErrorKind;
+use std::ops::Range;
 use std::sync::RwLock;
 
 pub struct NbdDevice {
-    structure: RwLock<Structure>,
+    state: RwLock<State>,
     block_size: u64,
     num_blocks: u64,
     zero_block: Bytes,
+    block_calc: BlockCalc,
 }
 
 impl NbdDevice {
-    pub fn new(structure: Structure) -> Self {
-        let block_size = *structure.block_size as u64;
-        let num_blocks = *structure.cluster_size * structure.clusters.len();
+    pub fn new(state: State) -> Self {
+        let block_size = *state.block_size as u64;
+        let num_blocks = *state.cluster_size * state.clusters.len();
         Self {
-            structure: RwLock::new(structure),
+            state: RwLock::new(state),
             block_size,
             num_blocks: num_blocks as u64,
             zero_block: BytesMut::zeroed(block_size as usize).freeze(),
+            block_calc: BlockCalc {
+                block_size,
+                num_blocks: num_blocks as u64,
+            },
         }
     }
 }
@@ -30,17 +36,17 @@ impl NbdDevice {
 #[async_trait]
 impl BlockDevice for NbdDevice {
     fn options(&self) -> Options {
-        let structure = self.structure.read().unwrap();
+        let state = self.state.read().unwrap();
 
         Options {
             block_size: self.block_size as u32,
-            description: Some(format!("sia_vbd {}", structure.uuid)),
+            description: Some(format!("sia_vbd {}", state.uuid)),
             fast_zeroes: true,
             read_only: false,
             resizable: false,
             rotational: false,
             trim: true,
-            size: structure.total_size() as u64,
+            size: state.total_size() as u64,
         }
     }
 
@@ -51,32 +57,22 @@ impl BlockDevice for NbdDevice {
         queue: &mut Queue,
         _ctx: &RequestContext,
     ) -> crate::nbd::block_device::Result<()> {
-        let blocks = calculate_affected_blocks(
-            self.block_size as u64,
-            self.num_blocks as u64,
-            offset,
-            length,
-        );
+        let blocks = self.block_calc.blocks(offset, length);
 
-        for block in blocks.start_block..blocks.end_block + 1 {
-            let mut start = 0;
-            let mut end = self.block_size as u64;
-            if block == blocks.start_block {
-                start = blocks.start_offset;
-            }
-            if block == blocks.end_block {
-                end = blocks.end_offset;
-            }
+        for block in blocks.into_iter() {
+            let abs_offset = self
+                .block_calc
+                .absolute_offset(block.block_no, block.range.start);
 
-            let (abs_offset, length) =
-                calculate_absolute_offset(self.block_size as u64, block, start, end);
+            let length = block.range.end - block.range.start;
+            assert!(length > 0 && length <= self.block_size);
 
             let bytes = {
-                let lock = self.structure.read().unwrap();
+                let lock = self.state.read().unwrap();
 
-                lock.get(block as usize)?.map(|b| {
-                    if start != 0 || end != b.len() as u64 {
-                        b.slice(start as usize..end as usize)
+                lock.get(block.block_no as usize)?.map(|b| {
+                    if block.partial {
+                        b.slice((block.range.start as usize)..(block.range.end as usize))
                     } else {
                         b
                     }
@@ -84,9 +80,9 @@ impl BlockDevice for NbdDevice {
             };
 
             if let Some(bytes) = bytes {
-                queue.data(abs_offset, length, bytes).await.unwrap();
+                queue.data(abs_offset, length, bytes).await?;
             } else {
-                queue.zeroes(abs_offset, length).await.unwrap();
+                queue.zeroes(abs_offset, length).await?;
             }
         }
 
@@ -101,41 +97,39 @@ impl BlockDevice for NbdDevice {
         data: &mut (dyn AsyncRead + Send + Unpin),
         _ctx: &RequestContext,
     ) -> crate::nbd::block_device::Result<()> {
-        let blocks = calculate_affected_blocks(self.block_size, self.num_blocks, offset, length);
+        let blocks = self.block_calc.blocks(offset, length);
         let mut data_written = false;
 
-        for block in blocks.start_block..blocks.end_block + 1 {
-            let mut start = 0 as usize;
-            let mut end = self.block_size as usize;
-            if block == blocks.start_block {
-                start = blocks.start_offset as usize;
-            }
-            if block == blocks.end_block {
-                end = blocks.end_offset as usize;
-            }
+        if let Some((_last_block, _)) = &blocks.last_if_partial {
+            //todo: prepare last block
+        }
 
-            let mut buf = if start == 0 && end >= self.block_size as usize {
+        for block in blocks.into_iter() {
+            let mut buf = if !block.partial {
                 // this is a full block
                 None
             } else {
                 // partial block, get from backend first
-                let lock = self.structure.read().unwrap();
-                lock.get(block as usize)?.map(|b| BytesMut::from(b))
+                let lock = self.state.read().unwrap();
+                lock.get(block.block_no as usize)?
+                    .map(|b| BytesMut::from(b))
             }
             .unwrap_or(BytesMut::zeroed(self.block_size as usize));
 
+            let range = (block.range.start as usize)..(block.range.end as usize);
+
             // write data into buffer
-            data.read_exact(&mut buf[start..end]).await?;
+            data.read_exact(&mut buf[range]).await?;
 
             let bytes = buf.freeze();
 
-            let mut lock = self.structure.write().unwrap();
-            lock.put(block as usize, bytes)?;
+            let mut lock = self.state.write().unwrap();
+            lock.put(block.block_no as usize, bytes)?;
             data_written = true;
         }
 
         if data_written && fua {
-            let mut lock = self.structure.write().unwrap();
+            let mut lock = self.state.write().unwrap();
             lock.flush()?;
         }
 
@@ -149,55 +143,38 @@ impl BlockDevice for NbdDevice {
         _no_hole: bool,
         _ctx: &RequestContext,
     ) -> crate::nbd::block_device::Result<()> {
-        let blocks = calculate_affected_blocks(self.block_size, self.num_blocks, offset, length);
+        let mut blocks = self.block_calc.blocks(offset, length);
 
-        let mut full_blocks = blocks.start_block as usize..blocks.end_block as usize;
-        let mut partial = vec![];
+        if !blocks.full.is_empty() {
+            // full blocks can be deleted
+            let mut lock = self.state.write().unwrap();
+            lock.delete((blocks.full.start as usize)..(blocks.full.end as usize))?;
 
-        if blocks.start_offset != 0 {
-            full_blocks.start += 1;
-            let end = if blocks.start_block != blocks.end_block {
-                self.block_size
-            } else {
-                blocks.end_offset
-            };
-            partial.push((
-                blocks.start_block as usize,
-                blocks.start_offset as usize,
-                end as usize,
-            ));
+            // clear full range
+            blocks.full = 0..0;
         }
 
-        if !full_blocks.is_empty() {
-            if blocks.end_offset != self.block_size {
-                full_blocks.end -= 1;
-                partial.push((blocks.end_block as usize, 0, blocks.end_offset as usize));
+        for block in blocks.into_iter() {
+            let mut buf = {
+                let lock = self.state.read().unwrap();
+                lock.get(block.block_no as usize)?
+                    .map(|b| BytesMut::from(b))
             }
+            .unwrap_or(BytesMut::zeroed(self.block_size as usize));
+
+            let range = (block.range.start as usize)..(block.range.end as usize);
+            let to_zero = &mut buf[range];
+            to_zero.copy_from_slice(&self.zero_block.as_ref()[..to_zero.len()]);
+            let mut lock = self.state.write().unwrap();
+            lock.put(block.block_no as usize, buf.freeze())?;
         }
 
-        let mut partial_blocks = vec![];
+        Ok(())
+    }
 
-        for (block, start, end) in partial {
-            if let Some(mut buf) = {
-                let lock = self.structure.read().unwrap();
-                lock.get(block as usize)?.map(|b| BytesMut::from(b))
-            } {
-                let to_zero = &mut buf[start..end];
-                to_zero.copy_from_slice(&self.zero_block.as_ref()[..to_zero.len()]);
-                partial_blocks.push((block, buf.freeze()));
-            }
-        }
-
-        if !partial_blocks.is_empty() || !full_blocks.is_empty() {
-            let mut lock = self.structure.write().unwrap();
-            for (block, bytes) in partial_blocks {
-                lock.put(block, bytes)?;
-            }
-            if !full_blocks.is_empty() {
-                lock.delete(full_blocks.start..=full_blocks.end - 1)?;
-            }
-        }
-
+    async fn flush(&self, _ctx: &RequestContext) -> crate::nbd::block_device::Result<()> {
+        let mut state = self.state.write().unwrap();
+        state.flush()?;
         Ok(())
     }
 
@@ -208,12 +185,6 @@ impl BlockDevice for NbdDevice {
         ctx: &RequestContext,
     ) -> crate::nbd::block_device::Result<()> {
         self.write_zeroes(offset, length, true, ctx).await
-    }
-
-    async fn flush(&self, _ctx: &RequestContext) -> crate::nbd::block_device::Result<()> {
-        let mut structure = self.structure.write().unwrap();
-        structure.flush()?;
-        Ok(())
     }
 }
 
@@ -243,58 +214,179 @@ impl From<BlockError> for Error {
     }
 }
 
-struct AffectedBlocks {
-    start_block: u64,
-    start_offset: u64,
-    end_block: u64,
-    end_offset: u64,
-}
-
-fn calculate_affected_blocks(
+struct BlockCalc {
     block_size: u64,
     num_blocks: u64,
-    offset: u64,
-    length: u64,
-) -> AffectedBlocks {
-    // Calculate the starting block
-    let start_block = offset / block_size;
+}
 
-    // Calculate the starting offset within the start block
-    let start_offset = offset % block_size;
+impl BlockCalc {
+    fn blocks(&self, offset: u64, length: u64) -> AffectedBlocks {
+        // Calculate the starting block
+        let start_block = offset / self.block_size;
 
-    // Calculate the absolute end position
-    let end_absolute = offset + length;
+        // Calculate the starting offset within the start block
+        let start_offset = offset % self.block_size;
 
-    // Calculate the ending block
-    let mut end_block = end_absolute / block_size;
+        // Calculate the absolute end position
+        let end_absolute = offset + length;
 
-    // Calculate the ending offset within the end block
-    let mut end_offset = end_absolute % block_size;
+        // Calculate the ending block
+        let mut end_block = end_absolute / self.block_size;
 
-    // Adjust if end_offset is exactly at a block boundary
-    if end_offset == 0 && end_block > 0 {
-        end_block -= 1;
-        end_offset = block_size;
+        // Calculate the ending offset within the end block
+        let mut end_offset = end_absolute % self.block_size;
+
+        // Adjust if end_offset is exactly at a block boundary
+        if end_offset == 0 && end_block > 0 {
+            end_block -= 1;
+            end_offset = self.block_size;
+        }
+
+        // Ensure end_block does not exceed the total number of blocks
+        if end_block >= self.num_blocks {
+            end_block = self.num_blocks - 1;
+            end_offset = self.block_size;
+        }
+
+        AffectedBlocks::new(
+            self.block_size,
+            start_block,
+            start_offset,
+            end_block,
+            end_offset,
+        )
     }
 
-    // Ensure end_block does not exceed the total number of blocks
-    if end_block >= num_blocks {
-        end_block = num_blocks - 1;
-        end_offset = block_size;
-    }
-
-    AffectedBlocks {
-        start_block,
-        start_offset,
-        end_block,
-        end_offset,
+    fn absolute_offset(&self, block: u64, block_offset: u64) -> u64 {
+        assert!(block_offset < self.block_size);
+        block * self.block_size + block_offset
     }
 }
 
-fn calculate_absolute_offset(block_size: u64, block: u64, start: u64, end: u64) -> (u64, u64) {
-    assert!(start <= end);
-    assert!(end <= block_size);
-    let offset = block * block_size + start;
-    let length = end - start;
-    (offset, length)
+struct AffectedBlocks {
+    block_size: u64,
+    first_if_partial: Option<(u64, Range<u64>)>,
+    full: Range<u64>,
+    last_if_partial: Option<(u64, Range<u64>)>,
+}
+
+struct AffectedBlock {
+    block_no: u64,
+    range: Range<u64>,
+    partial: bool,
+}
+
+impl AffectedBlock {
+    fn new_full(block_no: u64, block_size: u64) -> Self {
+        Self {
+            block_no,
+            range: 0..block_size,
+            partial: false,
+        }
+    }
+
+    fn new_partial(block_no: u64, range: Range<u64>) -> Self {
+        Self {
+            block_no,
+            range,
+            partial: true,
+        }
+    }
+}
+
+struct BlockIterator {
+    idx: u64,
+    block_size: u64,
+    blocks: AffectedBlocks,
+}
+
+impl Iterator for BlockIterator {
+    type Item = AffectedBlock;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut item = None;
+
+        if self.blocks.full.contains(&self.idx) {
+            item = Some(AffectedBlock::new_full(self.idx, self.block_size));
+        }
+
+        if item.is_none() {
+            match self.blocks.first_if_partial.take() {
+                Some((block_no, range)) if block_no == self.idx => {
+                    item = Some(AffectedBlock::new_partial(block_no, range));
+                    self.idx = block_no;
+                }
+                _ => {}
+            }
+        }
+
+        if item.is_none() {
+            match self.blocks.last_if_partial.take() {
+                Some((block_no, range)) if block_no == self.idx => {
+                    item = Some(AffectedBlock::new_partial(block_no, range));
+                    self.idx = block_no;
+                }
+                _ => {}
+            }
+        }
+
+        self.idx += 1;
+        item
+    }
+}
+
+impl AffectedBlocks {
+    fn new(
+        block_size: u64,
+        start_block: u64,
+        start_offset: u64,
+        end_block: u64,
+        end_offset: u64,
+    ) -> Self {
+        let mut full = start_block..end_block + 1;
+
+        let mut first_if_partial = None;
+        if start_offset != 0 {
+            first_if_partial = Some((start_block, start_offset..block_size));
+            full.start += 1;
+        }
+
+        let mut last_if_partial = None;
+        if end_offset != block_size {
+            if end_block == start_block {
+                // single, partial block detected
+                let start_offset = match first_if_partial {
+                    Some((_, range)) => range.start,
+                    _ => {
+                        full.start += 1;
+                        0
+                    }
+                };
+                first_if_partial = Some((end_block, start_offset..end_offset));
+            } else {
+                last_if_partial = Some((end_block, 0..end_offset));
+                full.end -= 1;
+            }
+        }
+
+        Self {
+            block_size,
+            first_if_partial,
+            full,
+            last_if_partial,
+        }
+    }
+
+    fn into_iter(self) -> BlockIterator {
+        let idx = match self.first_if_partial.as_ref() {
+            Some((block_no, _)) => *block_no,
+            None => self.full.start,
+        };
+
+        BlockIterator {
+            idx,
+            block_size: self.block_size,
+            blocks: self,
+        }
+    }
 }

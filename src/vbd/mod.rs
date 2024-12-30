@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hasher;
 use std::marker::PhantomData;
-use std::ops::{Deref, RangeInclusive};
+use std::ops::{Deref, Range};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -97,11 +97,11 @@ impl Transaction {
     }
 }
 
-type StructureId = ContentId<Structure>;
+type StateId = ContentId<State>;
 
-pub struct Structure {
+pub struct State {
     uuid: Uuid,
-    content_id: Option<StructureId>,
+    content_id: Option<StateId>,
     cluster_size: ClusterSize,
     zero_cluster: Arc<Cluster>,
     zero_cluster_id: ClusterId,
@@ -117,7 +117,7 @@ pub struct Structure {
     tx_max_blocks: usize,
 }
 
-impl Structure {
+impl State {
     pub fn new(
         uuid: Uuid,
         cluster_size: ClusterSize,
@@ -143,19 +143,17 @@ impl Structure {
             .into_iter()
             .collect();
 
-        let zero_cluster = Arc::new(Cluster::new(
-            uuid,
-            block_size,
-            (0..*cluster_size).map(|_| zero_block_id.clone()).collect(),
-            cluster_hash,
-        ));
+        let zero_cluster = Arc::new(
+            ClusterMut::new_empty(uuid, block_size, cluster_size, cluster_hash, zero_block_id)
+                .finalize(),
+        );
         let zero_cluster_id = zero_cluster.content_id().clone();
         let clusters = (0..num_clusters).map(|_| zero_cluster_id.clone()).collect();
         let cluster_map = [(zero_cluster_id.clone(), zero_cluster.clone())]
             .into_iter()
             .collect();
 
-        let mut structure = Self {
+        let mut state = Self {
             uuid,
             content_id: None,
             cluster_size,
@@ -172,19 +170,19 @@ impl Structure {
             pending_tx: None,
             tx_max_blocks: (max_buffer_size / *block_size) + 1,
         };
-        structure.refresh_content_id();
+        state.refresh_content_id();
 
-        Ok(structure)
+        Ok(state)
     }
 
     fn calc_cluster_block(&self, block_no: usize) -> Result<(usize, usize), BlockError> {
-        match self.calc_clusters_blocks(block_no..=block_no)? {
+        match self.calc_clusters_blocks(block_no..(block_no + 1))? {
             vec if vec.len() == 1 => {
-                let (cluster_no, vec) = vec.into_iter().next().unwrap();
-                if vec.len() != 1 {
+                let (cluster_no, range) = vec.into_iter().next().unwrap();
+                if range.len() != 1 {
                     panic!("calc_clusters_blocks needs to return exactly 1 block")
                 }
-                Ok((cluster_no, vec.into_iter().next().unwrap()))
+                Ok((cluster_no, range.start))
             }
             _ => panic!("calc_clusters_blocks needs to return exactly 1 match"),
         }
@@ -192,10 +190,10 @@ impl Structure {
 
     fn calc_clusters_blocks(
         &self,
-        blocks: RangeInclusive<usize>,
-    ) -> Result<Vec<(usize, Vec<usize>)>, BlockError> {
+        blocks: Range<usize>,
+    ) -> Result<Vec<(usize, Range<usize>)>, BlockError> {
         let cluster_size = *self.cluster_size;
-        let mut clustered_blocks: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut clustered_blocks: Vec<(usize, Range<usize>)> = Vec::new();
 
         for block_no in blocks {
             let cluster_no = block_no / cluster_size;
@@ -207,12 +205,12 @@ impl Structure {
 
             if let Some(last) = clustered_blocks.last_mut() {
                 if last.0 == cluster_no {
-                    last.1.push(relative_block_no);
+                    last.1.end = relative_block_no + 1;
                     continue;
                 }
             }
 
-            clustered_blocks.push((cluster_no, vec![relative_block_no]));
+            clustered_blocks.push((cluster_no, relative_block_no..(relative_block_no + 1)));
         }
 
         Ok(clustered_blocks)
@@ -263,7 +261,7 @@ impl Structure {
         self.prepare_tx()?;
         if all_zeroes(data.as_ref()) {
             // use delete instead
-            self.delete(block_no..=block_no)?;
+            self.delete(block_no..(block_no + 1))?;
         } else {
             let tx = self.pending_tx.as_mut().unwrap();
             tx.put(cluster_no, relative_block_no, data);
@@ -271,7 +269,7 @@ impl Structure {
         Ok(())
     }
 
-    pub fn delete(&mut self, blocks: RangeInclusive<usize>) -> Result<(), BlockError> {
+    pub fn delete(&mut self, blocks: Range<usize>) -> Result<(), BlockError> {
         let clusters = self.calc_clusters_blocks(blocks)?;
 
         self.prepare_tx()?;
@@ -318,14 +316,20 @@ impl Structure {
 
             for (cluster_no, changed_blocks) in clusters {
                 let cluster_id = &self.clusters[cluster_no];
-                let mut c = self
+                let c = self
                     .cluster_map
                     .get(cluster_id)
                     .ok_or_else(|| BlockError::ClusterNoFound {
                         cluster_id: cluster_id.clone(),
                     })
                     .map(|c| c.clone())?;
-                let cluster = Arc::make_mut(&mut c);
+
+                let mut cluster_mut = ClusterMut::from_cluster(
+                    Arc::try_unwrap(c).unwrap_or_else(|c| c.as_ref().clone()),
+                    self.uuid,
+                    self.block_size,
+                    self.cluster_hash,
+                );
 
                 for (block_no, data) in changed_blocks {
                     let block = match data {
@@ -341,14 +345,14 @@ impl Structure {
                     let block_id = block.content_id().clone();
                     // only insert if not yet present
                     self.blocks.entry(block_id.clone()).or_insert_with(|| block);
-                    cluster.blocks[block_no] = block_id;
+                    cluster_mut.blocks[block_no] = block_id;
                 }
-                cluster.refresh_content_id();
-                let cluster_id = cluster.content_id().clone();
+                let new_cluster = cluster_mut.finalize();
+                let cluster_id = new_cluster.content_id().clone();
                 // only insert if not yet present
                 self.cluster_map
                     .entry(cluster_id.clone())
-                    .or_insert_with(|| c);
+                    .or_insert_with(|| Arc::new(new_cluster));
                 self.clusters[cluster_no] = cluster_id;
             }
             let prev = self.content_id().clone();
@@ -367,7 +371,7 @@ impl Structure {
         Ok(())
     }
 
-    pub fn content_id(&self) -> &StructureId {
+    pub fn content_id(&self) -> &StateId {
         self.content_id.as_ref().unwrap()
     }
 
@@ -375,9 +379,9 @@ impl Structure {
         self.content_id = Some(self.calc_content_id());
     }
 
-    fn calc_content_id(&self) -> StructureId {
+    fn calc_content_id(&self) -> StateId {
         let mut hasher = self.hash.new();
-        hasher.update("--sia_vbd structure hash v1 start--\n".as_bytes());
+        hasher.update("--sia_vbd state hash v1 start--\n".as_bytes());
         hasher.update("uuid: ".as_bytes());
         hasher.update(self.uuid.as_bytes());
         hasher.update("\nblock_size: ".as_bytes());
@@ -395,7 +399,7 @@ impl Structure {
             hasher.update(c.as_ref());
             hasher.update("\n--cluster entry end--".as_bytes());
         });
-        hasher.update("\n--sia_vbd structure hash v1 end--".as_bytes());
+        hasher.update("\n--sia_vbd state hash v1 end--".as_bytes());
         hasher.finalize().into()
     }
 
@@ -437,38 +441,41 @@ impl Block {
 }
 
 #[derive(Clone)]
-struct Cluster {
+struct ClusterMut {
     uuid: Uuid,
     block_size: BlockSize,
     blocks: Vec<BlockId>,
     hash_algorithm: HashAlgorithm,
-    content_id: Option<ClusterId>,
 }
 
-impl Cluster {
-    pub fn new(
+impl ClusterMut {
+    pub fn new_empty(
         uuid: Uuid,
         block_size: BlockSize,
-        blocks: Vec<BlockId>,
+        cluster_size: ClusterSize,
         hash_algorithm: HashAlgorithm,
+        zero_block_id: BlockId,
     ) -> Self {
-        let mut cluster = Self {
+        Self {
             uuid,
             block_size,
-            blocks,
+            blocks: (0..*cluster_size).map(|_| zero_block_id.clone()).collect(),
             hash_algorithm,
-            content_id: None,
-        };
-        cluster.refresh_content_id();
-        cluster
+        }
     }
 
-    fn refresh_content_id(&mut self) {
-        self.content_id = Some(self.calc_content_id());
-    }
-
-    pub fn content_id(&self) -> &ClusterId {
-        self.content_id.as_ref().unwrap()
+    pub fn from_cluster(
+        cluster: Cluster,
+        uuid: Uuid,
+        block_size: BlockSize,
+        hash_algorithm: HashAlgorithm,
+    ) -> Self {
+        Self {
+            uuid,
+            block_size,
+            blocks: cluster.blocks,
+            hash_algorithm,
+        }
     }
 
     fn calc_content_id(&self) -> ClusterId {
@@ -493,6 +500,32 @@ impl Cluster {
         });
         hasher.update("\n--sia_vbd cluster hash v1 end--".as_bytes());
         hasher.finalize().into()
+    }
+
+    pub fn finalize(self) -> Cluster {
+        self.into()
+    }
+}
+
+impl From<ClusterMut> for Cluster {
+    fn from(value: ClusterMut) -> Self {
+        let content_id = value.calc_content_id();
+        Cluster {
+            content_id,
+            blocks: value.blocks,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Cluster {
+    content_id: ClusterId,
+    blocks: Vec<BlockId>,
+}
+
+impl Cluster {
+    pub fn content_id(&self) -> &ClusterId {
+        &self.content_id
     }
 }
 
@@ -593,7 +626,7 @@ pub fn foo() {
     //let uuid = Uuid::now_v7();
     let uuid = Uuid::from_str("019408c6-9ad0-7e31-b272-042c3d01c68c").unwrap();
 
-    let mut structure = Structure::new(
+    let mut state = State::new(
         uuid,
         ClusterSize::Cs256,
         16 * 1024,
@@ -605,9 +638,9 @@ pub fn foo() {
     )
     .unwrap();
 
-    println!("uuid: {}", structure.uuid);
-    println!("content_id: {}", structure.content_id());
-    println!("block_size: {}", structure.block_size());
+    println!("uuid: {}", state.uuid);
+    println!("content_id: {}", state.content_id());
+    println!("block_size: {}", state.block_size());
     println!("---");
 
     let mut bytes = BytesMut::zeroed(*BlockSize::Bs64k);
@@ -617,34 +650,28 @@ pub fn foo() {
     bytes[3] = 0xFF;
     let bytes = bytes.freeze();
 
-    structure.put(0, bytes.clone()).unwrap();
-    println!("content_id: {}", structure.content_id());
+    state.put(0, bytes.clone()).unwrap();
+    println!("content_id: {}", state.content_id());
 
-    structure.put(1009, bytes.clone()).unwrap();
-    println!("content_id: {}", structure.content_id());
+    state.put(1009, bytes.clone()).unwrap();
+    println!("content_id: {}", state.content_id());
 
-    let b1 = structure.get(0).unwrap();
-    let b2 = structure.get(1).unwrap();
-    let b3 = structure.get(1009).unwrap();
-    let b4 = structure.get(333).unwrap();
-    let b5 = structure.get(5555).unwrap();
+    let b1 = state.get(0).unwrap();
+    let b2 = state.get(1).unwrap();
+    let b3 = state.get(1009).unwrap();
+    let b4 = state.get(333).unwrap();
+    let b5 = state.get(5555).unwrap();
 
-    structure.flush().unwrap();
-    println!("content_id: {}", structure.content_id());
+    state.flush().unwrap();
+    println!("content_id: {}", state.content_id());
 
-    structure.put(888, bytes.clone()).unwrap();
-    structure.flush().unwrap();
-    println!("content_id: {}", structure.content_id());
+    state.put(888, bytes.clone()).unwrap();
+    state.flush().unwrap();
+    println!("content_id: {}", state.content_id());
 
-    structure.delete(800..=899).unwrap();
-    structure.flush().unwrap();
-    println!("content_id: {}", structure.content_id());
+    state.delete(800..900).unwrap();
+    state.flush().unwrap();
+    println!("content_id: {}", state.content_id());
 
     println!("");
-
-    /*let mut i = 0;
-    structure.clusters.iter().for_each(|c| {
-        i += 1;
-        println!("    {}:{}", i, c.content_id())
-    });*/
 }

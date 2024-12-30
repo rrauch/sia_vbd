@@ -5,7 +5,7 @@ use sia_vbd::nbd::vbd::dummy::DummyBlockDevice;
 use sia_vbd::nbd::vbd::mem::MemDevice;
 use sia_vbd::nbd::Builder;
 use sia_vbd::vbd::nbd_device::NbdDevice;
-use sia_vbd::vbd::{BlockSize, ClusterSize, Structure};
+use sia_vbd::vbd::{BlockSize, ClusterSize, State};
 use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
                 HashAlgorithm::Blake3,
                 Some("Virtual Deduplicating Block Device"),
             ),*/
-            NbdDevice::new(Structure::new(
+            NbdDevice::new(State::new(
                 Uuid::from_str("019408c6-9ad0-7e31-b272-042c3d01c68c")?,
                 ClusterSize::Cs256,
                 64,
