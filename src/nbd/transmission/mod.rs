@@ -107,10 +107,19 @@ impl TransmissionHandler {
             self.export.block_device.clone(),
             self.client_endpoint.clone(),
             writer.clone(),
+            ct.clone(),
         );
 
         loop {
-            let req = request_reader.read_next(&mut rx).await?;
+            let req = tokio::select! {
+                req = request_reader.read_next(&mut rx) => {
+                    req?
+                },
+                _ = ct.cancelled() => {
+                    eprintln!("connection cancelled");
+                    break;
+                }
+            };
             let ctx = RequestContext::new(req.id.cookie, self.client_endpoint.clone());
             let mut payload_remaining = req.payload_length as usize;
 

@@ -14,7 +14,7 @@ use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 
 pub(super) struct ReadCommandHandler {
     transmission_mode: TransmissionMode,
@@ -22,7 +22,6 @@ pub(super) struct ReadCommandHandler {
     client_endpoint: ClientEndpoint,
     writer: Arc<Writer>,
     cancellation_token: CancellationToken,
-    _drop_guard: DropGuard,
 }
 
 impl ReadCommandHandler {
@@ -31,16 +30,14 @@ impl ReadCommandHandler {
         block_device: Arc<dyn BlockDevice + Send + Sync + 'static>,
         client_endpoint: ClientEndpoint,
         writer: Arc<Writer>,
+        cancellation_token: CancellationToken,
     ) -> Self {
-        let ct = CancellationToken::new();
-        let drop_guard = ct.clone().drop_guard();
         Self {
             transmission_mode,
             block_device,
             client_endpoint,
             writer,
-            cancellation_token: ct,
-            _drop_guard: drop_guard,
+            cancellation_token,
         }
     }
 
@@ -216,11 +213,15 @@ impl ReadCommandHandler {
                 }
             }
 
+            drop(read_q);
+            let sender_task_res = sender_task.await;
+
             let mut data_sent = { *data_sent.lock().unwrap() };
             let mut error_sent = false;
 
             let mut shutdown = false;
             if let Some(err) = err {
+                eprintln!("error in block device: {}", err);
                 if data_sent {
                     shutdown = true;
                 } else {
@@ -230,9 +231,10 @@ impl ReadCommandHandler {
                 }
             }
 
-            match sender_task.await {
+            match sender_task_res {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
+                    eprintln!("error in sender task: {}", err);
                     if !error_sent {
                         if data_sent {
                             // some data has already been sent
