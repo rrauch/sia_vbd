@@ -1,6 +1,6 @@
 use crate::nbd::block_device::read_reply::Queue;
 use crate::nbd::block_device::{BlockDevice, Error, Options, RequestContext};
-use crate::vbd::{BlockError, State};
+use crate::vbd::{BlockError, VirtualBlockDevice};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt};
@@ -9,25 +9,23 @@ use std::ops::Range;
 use std::sync::RwLock;
 
 pub struct NbdDevice {
-    state: RwLock<State>,
+    vbd: RwLock<VirtualBlockDevice>,
     block_size: u64,
-    num_blocks: u64,
     zero_block: Bytes,
     block_calc: BlockCalc,
 }
 
 impl NbdDevice {
-    pub fn new(state: State) -> Self {
-        let block_size = *state.block_size as u64;
-        let num_blocks = *state.cluster_size * state.clusters.len();
+    pub fn new(vbd: VirtualBlockDevice) -> Self {
+        let block_size = vbd.block_size() as u64;
+        let num_blocks = vbd.blocks() as u64;
         Self {
-            state: RwLock::new(state),
+            vbd: RwLock::new(vbd),
             block_size,
-            num_blocks: num_blocks as u64,
             zero_block: BytesMut::zeroed(block_size as usize).freeze(),
             block_calc: BlockCalc {
                 block_size,
-                num_blocks: num_blocks as u64,
+                num_blocks,
             },
         }
     }
@@ -36,17 +34,17 @@ impl NbdDevice {
 #[async_trait]
 impl BlockDevice for NbdDevice {
     fn options(&self) -> Options {
-        let state = self.state.read().unwrap();
+        let vbd = self.vbd.read().unwrap();
 
         Options {
-            block_size: self.block_size as u32,
-            description: Some(format!("sia_vbd {}", state.uuid)),
+            block_size: vbd.block_size() as u32,
+            description: Some(format!("sia_vbd {}", vbd.uuid())),
             fast_zeroes: true,
             read_only: false,
             resizable: false,
             rotational: false,
             trim: true,
-            size: state.total_size() as u64,
+            size: vbd.total_size() as u64,
         }
     }
 
@@ -68,7 +66,7 @@ impl BlockDevice for NbdDevice {
             assert!(length > 0 && length <= self.block_size);
 
             let bytes = {
-                let lock = self.state.read().unwrap();
+                let lock = self.vbd.read().unwrap();
 
                 lock.get(block.block_no as usize)?.map(|b| {
                     if block.partial {
@@ -110,7 +108,7 @@ impl BlockDevice for NbdDevice {
                 None
             } else {
                 // partial block, get from backend first
-                let lock = self.state.read().unwrap();
+                let lock = self.vbd.read().unwrap();
                 lock.get(block.block_no as usize)?
                     .map(|b| BytesMut::from(b))
             }
@@ -123,13 +121,13 @@ impl BlockDevice for NbdDevice {
 
             let bytes = buf.freeze();
 
-            let mut lock = self.state.write().unwrap();
+            let mut lock = self.vbd.write().unwrap();
             lock.put(block.block_no as usize, bytes)?;
             data_written = true;
         }
 
         if data_written && fua {
-            let mut lock = self.state.write().unwrap();
+            let mut lock = self.vbd.write().unwrap();
             lock.flush()?;
         }
 
@@ -147,7 +145,7 @@ impl BlockDevice for NbdDevice {
 
         if !blocks.full.is_empty() {
             // full blocks can be deleted
-            let mut lock = self.state.write().unwrap();
+            let mut lock = self.vbd.write().unwrap();
             lock.delete((blocks.full.start as usize)..(blocks.full.end as usize))?;
 
             // clear full range
@@ -156,7 +154,7 @@ impl BlockDevice for NbdDevice {
 
         for block in blocks.into_iter() {
             let mut buf = {
-                let lock = self.state.read().unwrap();
+                let lock = self.vbd.read().unwrap();
                 lock.get(block.block_no as usize)?
                     .map(|b| BytesMut::from(b))
             }
@@ -165,7 +163,7 @@ impl BlockDevice for NbdDevice {
             let range = (block.range.start as usize)..(block.range.end as usize);
             let to_zero = &mut buf[range];
             to_zero.copy_from_slice(&self.zero_block.as_ref()[..to_zero.len()]);
-            let mut lock = self.state.write().unwrap();
+            let mut lock = self.vbd.write().unwrap();
             lock.put(block.block_no as usize, buf.freeze())?;
         }
 
@@ -173,7 +171,7 @@ impl BlockDevice for NbdDevice {
     }
 
     async fn flush(&self, _ctx: &RequestContext) -> crate::nbd::block_device::Result<()> {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.vbd.write().unwrap();
         state.flush()?;
         Ok(())
     }

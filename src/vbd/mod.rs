@@ -7,7 +7,6 @@ use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::ops::{Deref, Range};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -62,6 +61,8 @@ impl<T> Deref for ContentId<T> {
 }
 
 struct Transaction {
+    id: Uuid,
+    created: Instant,
     max_blocks: usize,
     last_modified: Instant,
     blocks: HashMap<(usize, usize), Option<Bytes>>,
@@ -70,6 +71,8 @@ struct Transaction {
 impl Transaction {
     pub fn new(max_blocks: usize) -> Self {
         Self {
+            id: Uuid::now_v7(),
+            created: Instant::now(),
             max_blocks,
             last_modified: Instant::now(),
             blocks: HashMap::default(),
@@ -97,35 +100,202 @@ impl Transaction {
     }
 }
 
-type StateId = ContentId<State>;
+pub type Commit = ContentId<State>;
 
-pub struct State {
+pub struct VirtualBlockDevice {
+    state: State,
+}
+
+enum State {
+    Committed(Committed),
+    Uncommitted(Uncommitted),
+    Poisoned,
+}
+
+struct Shared {
     uuid: Uuid,
-    content_id: Option<StateId>,
     cluster_size: ClusterSize,
-    zero_cluster: Arc<Cluster>,
-    zero_cluster_id: ClusterId,
-    cluster_map: HashMap<ClusterId, Arc<Cluster>>,
-    clusters: Vec<ClusterId>,
-    cluster_hash: HashAlgorithm,
     block_size: BlockSize,
-    block_hash: HashAlgorithm,
+    content_hash: HashAlgorithm,
+    meta_hash: HashAlgorithm,
+    clusters: Vec<ClusterId>,
+    cluster_map: HashMap<ClusterId, Arc<Cluster>>,
+    zero_cluster_id: ClusterId,
     zero_block: Block,
     blocks: HashMap<BlockId, Block>,
-    hash: HashAlgorithm,
-    pending_tx: Option<Transaction>,
     tx_max_blocks: usize,
 }
 
-impl State {
+impl Shared {
+    fn calc_commit(&self) -> Commit {
+        let mut hasher = self.meta_hash.new();
+        hasher.update("--sia_vbd commit hash v1 start--\n".as_bytes());
+        hasher.update("uuid: ".as_bytes());
+        hasher.update(self.uuid.as_bytes());
+        hasher.update("\nblock_size: ".as_bytes());
+        hasher.update(self.block_size.to_be_bytes());
+        hasher.update("\ncluster_size: ".as_bytes());
+        hasher.update(self.cluster_size.to_be_bytes());
+        hasher.update("number_of_clusters: ".as_bytes());
+        hasher.update(self.clusters.len().to_be_bytes());
+        hasher.update("\ncontent: ".as_bytes());
+        self.clusters.iter().enumerate().for_each(|(i, c)| {
+            hasher.update("\n--cluster entry start--\n".as_bytes());
+            hasher.update("cluster no: ".as_bytes());
+            hasher.update(i.to_be_bytes());
+            hasher.update("\n cluster hash: ".as_bytes());
+            hasher.update(c.as_ref());
+            hasher.update("\n--cluster entry end--".as_bytes());
+        });
+        hasher.update("\n--sia_vbd commit hash v1 end--".as_bytes());
+        hasher.finalize().into()
+    }
+}
+
+struct Committed {
+    commit: Commit,
+    shared: Shared,
+}
+
+struct Uncommitted {
+    previous_commit: Commit,
+    shared: Shared,
+    tx: Transaction,
+}
+
+impl Committed {
+    fn begin(self) -> Uncommitted {
+        Uncommitted {
+            previous_commit: self.commit,
+            tx: Transaction::new(self.shared.tx_max_blocks),
+            shared: self.shared,
+        }
+    }
+}
+
+impl Uncommitted {
+    fn try_commit(mut self) -> Result<Committed, (Committed, BlockError)> {
+        let mut clustered_changes = HashMap::<usize, Vec<(usize, Option<Bytes>)>>::new();
+        self.tx
+            .blocks
+            .into_iter()
+            .for_each(|((cluster_no, block_no), data)| {
+                clustered_changes
+                    .entry(cluster_no)
+                    .or_default()
+                    .push((block_no, data))
+            });
+
+        let mut clusters = Vec::with_capacity(clustered_changes.len());
+
+        for (cluster_no, changed_blocks) in clustered_changes {
+            let cluster_id = &self.shared.clusters[cluster_no];
+            let c = match self
+                .shared
+                .cluster_map
+                .get(cluster_id)
+                .ok_or_else(|| BlockError::ClusterNoFound {
+                    cluster_id: cluster_id.clone(),
+                })
+                .map(|c| c.clone())
+            {
+                Ok(cluster) => cluster,
+                Err(err) => {
+                    return Err((
+                        Committed {
+                            commit: self.previous_commit,
+                            shared: self.shared,
+                        },
+                        err,
+                    ))
+                }
+            };
+
+            let mut cluster_mut = ClusterMut::from_cluster(
+                Arc::try_unwrap(c).unwrap_or_else(|c| c.as_ref().clone()),
+                self.shared.uuid,
+                self.shared.block_size,
+                self.shared.meta_hash,
+            );
+
+            for (block_no, data) in changed_blocks {
+                let res = match data {
+                    Some(data) => Block::new(
+                        self.shared.uuid,
+                        self.shared.block_size,
+                        self.shared.content_hash,
+                        data,
+                    ),
+                    None => {
+                        // the block was deleted
+                        // return the zero block
+                        Ok(self.shared.zero_block.clone())
+                    }
+                };
+                let block = match res {
+                    Ok(block) => block,
+                    Err(err) => {
+                        return Err((
+                            Committed {
+                                commit: self.previous_commit,
+                                shared: self.shared,
+                            },
+                            err,
+                        ))
+                    }
+                };
+
+                let block_id = block.content_id().clone();
+                // only insert if not yet present
+                self.shared
+                    .blocks
+                    .entry(block_id.clone())
+                    .or_insert_with(|| block);
+                cluster_mut.blocks[block_no] = block_id;
+            }
+            clusters.push((cluster_no, cluster_mut.finalize()));
+        }
+
+        for (cluster_no, new_cluster) in clusters {
+            let cluster_id = new_cluster.content_id().clone();
+            // only insert if not yet present
+            self.shared
+                .cluster_map
+                .entry(cluster_id.clone())
+                .or_insert_with(|| Arc::new(new_cluster));
+            self.shared.clusters[cluster_no] = cluster_id;
+        }
+
+        let age = Instant::now() - self.tx.created;
+        eprintln!("committed tx {} ({} ms)", self.tx.id, age.as_millis());
+
+        let new_commit = self.shared.calc_commit();
+        if &new_commit != &self.previous_commit {
+            eprintln!("commit: {} -> {}", &self.previous_commit, &new_commit);
+        }
+
+        Ok(Committed {
+            commit: new_commit,
+            shared: self.shared,
+        })
+    }
+
+    fn rollback(self) -> Committed {
+        Committed {
+            commit: self.previous_commit,
+            shared: self.shared,
+        }
+    }
+}
+
+impl VirtualBlockDevice {
     pub fn new(
         uuid: Uuid,
         cluster_size: ClusterSize,
         num_clusters: usize,
-        cluster_hash: HashAlgorithm,
         block_size: BlockSize,
-        block_hash: HashAlgorithm,
-        hash: HashAlgorithm,
+        content_hash: HashAlgorithm,
+        meta_hash: HashAlgorithm,
         max_buffer_size: usize,
     ) -> Result<Self, anyhow::Error> {
         assert!(num_clusters > 0);
@@ -133,7 +303,7 @@ impl State {
         let zero_block = Block::new(
             uuid,
             block_size,
-            block_hash,
+            content_hash,
             BytesMut::zeroed(*block_size).freeze(),
         )?;
 
@@ -144,7 +314,7 @@ impl State {
             .collect();
 
         let zero_cluster = Arc::new(
-            ClusterMut::new_empty(uuid, block_size, cluster_size, cluster_hash, zero_block_id)
+            ClusterMut::new_empty(uuid, block_size, cluster_size, meta_hash, zero_block_id)
                 .finalize(),
         );
         let zero_cluster_id = zero_cluster.content_id().clone();
@@ -153,26 +323,36 @@ impl State {
             .into_iter()
             .collect();
 
-        let mut state = Self {
+        let shared = Shared {
             uuid,
-            content_id: None,
             cluster_size,
-            zero_cluster,
-            zero_cluster_id,
-            cluster_map,
-            clusters,
-            cluster_hash,
             block_size,
-            block_hash,
+            content_hash,
+            meta_hash,
+            clusters,
+            cluster_map,
+            zero_cluster_id,
             zero_block,
             blocks,
-            hash,
-            pending_tx: None,
             tx_max_blocks: (max_buffer_size / *block_size) + 1,
         };
-        state.refresh_content_id();
 
-        Ok(state)
+        let commit = shared.calc_commit();
+
+        eprintln!("vbd uuid: {}", uuid);
+        eprintln!("commit: {}", &commit);
+
+        Ok(Self {
+            state: State::Committed(Committed { commit, shared }),
+        })
+    }
+
+    fn shared(&self) -> &Shared {
+        match &self.state {
+            State::Committed(s) => &s.shared,
+            State::Uncommitted(s) => &s.shared,
+            State::Poisoned => unreachable!("poisoned state"),
+        }
     }
 
     fn calc_cluster_block(&self, block_no: usize) -> Result<(usize, usize), BlockError> {
@@ -192,14 +372,14 @@ impl State {
         &self,
         blocks: Range<usize>,
     ) -> Result<Vec<(usize, Range<usize>)>, BlockError> {
-        let cluster_size = *self.cluster_size;
+        let cluster_size = *self.shared().cluster_size;
         let mut clustered_blocks: Vec<(usize, Range<usize>)> = Vec::new();
 
         for block_no in blocks {
             let cluster_no = block_no / cluster_size;
             let relative_block_no = block_no % cluster_size;
 
-            if cluster_no >= self.clusters.len() || relative_block_no >= cluster_size {
+            if cluster_no >= self.shared().clusters.len() || relative_block_no >= cluster_size {
                 return Err(BlockError::OutOfRange { block_no });
             }
 
@@ -218,22 +398,24 @@ impl State {
 
     pub fn get(&self, block_no: usize) -> Result<Option<Bytes>, BlockError> {
         let (cluster_no, relative_block_no) = self.calc_cluster_block(block_no)?;
+
         // check pending transaction first
-        if let Some(tx) = &self.pending_tx {
-            if let Some(data) = tx.get(cluster_no, relative_block_no) {
+        if let State::Uncommitted(state) = &self.state {
+            if let Some(data) = state.tx.get(cluster_no, relative_block_no) {
                 // return the pending data
                 return Ok(data);
             }
         }
 
-        let cluster_id = self.clusters[cluster_no].clone();
+        let cluster_id = self.shared().clusters[cluster_no].clone();
 
-        if cluster_id == self.zero_cluster_id {
+        if cluster_id == self.shared().zero_cluster_id {
             // the whole cluster is empty
             return Ok(None);
         }
 
         let block_id = self
+            .shared()
             .cluster_map
             .get(&cluster_id)
             .ok_or_else(|| BlockError::ClusterNoFound { cluster_id })?
@@ -241,13 +423,14 @@ impl State {
             .get(relative_block_no)
             .expect("block_no in range");
 
-        if block_id == self.zero_block.content_id() {
+        if block_id == self.shared().zero_block.content_id() {
             // this is an empty block
             return Ok(None);
         }
 
         Ok(Some(
-            self.blocks
+            self.shared()
+                .blocks
                 .get(block_id)
                 .ok_or_else(|| BlockError::BlockNotFound {
                     block_id: block_id.clone(),
@@ -258,12 +441,11 @@ impl State {
 
     pub fn put(&mut self, block_no: usize, data: Bytes) -> Result<(), BlockError> {
         let (cluster_no, relative_block_no) = self.calc_cluster_block(block_no)?;
-        self.prepare_tx()?;
         if all_zeroes(data.as_ref()) {
             // use delete instead
             self.delete(block_no..(block_no + 1))?;
         } else {
-            let tx = self.pending_tx.as_mut().unwrap();
+            let tx = self.prepare_tx()?;
             tx.put(cluster_no, relative_block_no, data);
         }
         Ok(())
@@ -271,95 +453,49 @@ impl State {
 
     pub fn delete(&mut self, blocks: Range<usize>) -> Result<(), BlockError> {
         let clusters = self.calc_clusters_blocks(blocks)?;
+        let tx = self.prepare_tx()?;
 
-        self.prepare_tx()?;
-
-        let tx = self.pending_tx.as_mut().unwrap();
         for (cluster_no, blocks) in clusters {
             for block_no in blocks {
                 tx.delete(cluster_no, block_no);
             }
         }
-
         Ok(())
     }
 
-    fn prepare_tx(&mut self) -> Result<(), BlockError> {
-        if self
-            .pending_tx
-            .as_ref()
-            .map(|tx| tx.is_full())
-            .unwrap_or(false)
-        {
-            // the current tx is full, commit now
-            self.commit()?;
+    fn prepare_tx(&mut self) -> Result<&mut Transaction, BlockError> {
+        if let State::Uncommitted(state) = &self.state {
+            if state.tx.is_full() {
+                self.commit()?;
+            }
         }
 
-        if self.pending_tx.is_none() {
-            self.pending_tx = Some(Transaction::new(self.tx_max_blocks));
+        if let State::Committed(_) = &self.state {
+            match std::mem::replace(&mut self.state, State::Poisoned) {
+                State::Committed(state) => {
+                    self.state = State::Uncommitted(state.begin());
+                }
+                _ => unreachable!(),
+            }
         }
 
-        Ok(())
+        Ok(match &mut self.state {
+            State::Uncommitted(state) => &mut state.tx,
+            _ => unreachable!(),
+        })
     }
 
     fn commit(&mut self) -> Result<(), BlockError> {
-        if let Some(tx) = self.pending_tx.take() {
-            let mut clusters = HashMap::<usize, Vec<(usize, Option<Bytes>)>>::new();
-            tx.blocks
-                .into_iter()
-                .for_each(|((cluster_no, block_no), data)| {
-                    clusters
-                        .entry(cluster_no)
-                        .or_default()
-                        .push((block_no, data))
-                });
-
-            for (cluster_no, changed_blocks) in clusters {
-                let cluster_id = &self.clusters[cluster_no];
-                let c = self
-                    .cluster_map
-                    .get(cluster_id)
-                    .ok_or_else(|| BlockError::ClusterNoFound {
-                        cluster_id: cluster_id.clone(),
-                    })
-                    .map(|c| c.clone())?;
-
-                let mut cluster_mut = ClusterMut::from_cluster(
-                    Arc::try_unwrap(c).unwrap_or_else(|c| c.as_ref().clone()),
-                    self.uuid,
-                    self.block_size,
-                    self.cluster_hash,
-                );
-
-                for (block_no, data) in changed_blocks {
-                    let block = match data {
-                        Some(data) => {
-                            Block::new(self.uuid, self.block_size, self.block_hash, data)?
-                        }
-                        None => {
-                            // the block was deleted
-                            // return the zero block
-                            self.zero_block.clone()
-                        }
-                    };
-                    let block_id = block.content_id().clone();
-                    // only insert if not yet present
-                    self.blocks.entry(block_id.clone()).or_insert_with(|| block);
-                    cluster_mut.blocks[block_no] = block_id;
-                }
-                let new_cluster = cluster_mut.finalize();
-                let cluster_id = new_cluster.content_id().clone();
-                // only insert if not yet present
-                self.cluster_map
-                    .entry(cluster_id.clone())
-                    .or_insert_with(|| Arc::new(new_cluster));
-                self.clusters[cluster_no] = cluster_id;
-            }
-            let prev = self.content_id().clone();
-            self.refresh_content_id();
-            let current = self.content_id();
-            if current != &prev {
-                eprintln!("content_id: {} -> {}", prev, current);
+        if let State::Uncommitted(_) = self.state {
+            match std::mem::replace(&mut self.state, State::Poisoned) {
+                State::Uncommitted(state) => match state.try_commit() {
+                    Ok(committed) => self.state = State::Committed(committed),
+                    Err((prev_commit, err)) => {
+                        self.state = State::Committed(prev_commit);
+                        return Err(err);
+                    }
+                },
+                _ => unreachable!(),
             }
         }
         Ok(())
@@ -371,44 +507,41 @@ impl State {
         Ok(())
     }
 
-    pub fn content_id(&self) -> &StateId {
-        self.content_id.as_ref().unwrap()
+    pub fn uuid(&self) -> Uuid {
+        self.shared().uuid
     }
 
-    fn refresh_content_id(&mut self) {
-        self.content_id = Some(self.calc_content_id());
+    pub fn last_commit(&self) -> &Commit {
+        match &self.state {
+            State::Committed(c) => &c.commit,
+            State::Uncommitted(u) => &u.previous_commit,
+            _ => unreachable!("poisoned state"),
+        }
     }
 
-    fn calc_content_id(&self) -> StateId {
-        let mut hasher = self.hash.new();
-        hasher.update("--sia_vbd state hash v1 start--\n".as_bytes());
-        hasher.update("uuid: ".as_bytes());
-        hasher.update(self.uuid.as_bytes());
-        hasher.update("\nblock_size: ".as_bytes());
-        hasher.update(self.block_size.to_be_bytes());
-        hasher.update("\ncluster_size: ".as_bytes());
-        hasher.update(self.cluster_size.to_be_bytes());
-        hasher.update("number_of_clusters: ".as_bytes());
-        hasher.update(self.clusters.len().to_be_bytes());
-        hasher.update("\ncontent: ".as_bytes());
-        self.clusters.iter().enumerate().for_each(|(i, c)| {
-            hasher.update("\n--cluster entry start--\n".as_bytes());
-            hasher.update("cluster no: ".as_bytes());
-            hasher.update(i.to_be_bytes());
-            hasher.update("\n cluster hash: ".as_bytes());
-            hasher.update(c.as_ref());
-            hasher.update("\n--cluster entry end--".as_bytes());
-        });
-        hasher.update("\n--sia_vbd state hash v1 end--".as_bytes());
-        hasher.finalize().into()
+    pub fn is_dirty(&self) -> bool {
+        match &self.state {
+            State::Committed(_) => false,
+            State::Uncommitted(_) => true,
+            _ => unreachable!("poisoned state"),
+        }
     }
 
     pub fn block_size(&self) -> usize {
-        *self.block_size
+        *self.shared().block_size
+    }
+
+    pub fn blocks(&self) -> usize {
+        let shared = self.shared();
+        *shared.cluster_size * shared.clusters.len()
+    }
+
+    pub fn cluster_size(&self) -> usize {
+        *self.shared().cluster_size
     }
 
     pub fn total_size(&self) -> usize {
-        *self.block_size * *self.cluster_size * self.clusters.len()
+        self.blocks() * *self.shared().block_size
     }
 }
 
@@ -421,7 +554,7 @@ pub(crate) struct Block {
 }
 
 impl Block {
-    pub fn new(
+    fn new(
         uuid: Uuid,
         block_size: BlockSize,
         hash: HashAlgorithm,
@@ -431,12 +564,8 @@ impl Block {
         Ok(Self { content_id, data })
     }
 
-    pub fn content_id(&self) -> &BlockId {
+    fn content_id(&self) -> &BlockId {
         &self.content_id
-    }
-
-    pub fn data(&self) -> &Bytes {
-        &self.data
     }
 }
 
@@ -620,58 +749,4 @@ enum BlockError {
     BlockNotFound { block_id: BlockId },
     #[error("cluster with id {cluster_id} not found")]
     ClusterNoFound { cluster_id: ClusterId },
-}
-
-pub fn foo() {
-    //let uuid = Uuid::now_v7();
-    let uuid = Uuid::from_str("019408c6-9ad0-7e31-b272-042c3d01c68c").unwrap();
-
-    let mut state = State::new(
-        uuid,
-        ClusterSize::Cs256,
-        16 * 1024,
-        HashAlgorithm::Blake3,
-        BlockSize::Bs64k,
-        HashAlgorithm::XXH3,
-        HashAlgorithm::Blake3,
-        1024 * 1024 * 100,
-    )
-    .unwrap();
-
-    println!("uuid: {}", state.uuid);
-    println!("content_id: {}", state.content_id());
-    println!("block_size: {}", state.block_size());
-    println!("---");
-
-    let mut bytes = BytesMut::zeroed(*BlockSize::Bs64k);
-    bytes[0] = 0xFF;
-    bytes[1] = 0xFF;
-    bytes[2] = 0xFF;
-    bytes[3] = 0xFF;
-    let bytes = bytes.freeze();
-
-    state.put(0, bytes.clone()).unwrap();
-    println!("content_id: {}", state.content_id());
-
-    state.put(1009, bytes.clone()).unwrap();
-    println!("content_id: {}", state.content_id());
-
-    let b1 = state.get(0).unwrap();
-    let b2 = state.get(1).unwrap();
-    let b3 = state.get(1009).unwrap();
-    let b4 = state.get(333).unwrap();
-    let b5 = state.get(5555).unwrap();
-
-    state.flush().unwrap();
-    println!("content_id: {}", state.content_id());
-
-    state.put(888, bytes.clone()).unwrap();
-    state.flush().unwrap();
-    println!("content_id: {}", state.content_id());
-
-    state.delete(800..900).unwrap();
-    state.flush().unwrap();
-    println!("content_id: {}", state.content_id());
-
-    println!("");
 }
