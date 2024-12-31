@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display, Formatter};
+use std::str::FromStr;
 
 #[derive(Copy, Clone, Debug)]
 pub enum HashAlgorithm {
@@ -33,6 +34,19 @@ impl HashAlgorithm {
             HashAlgorithm::Tent => "TentHash v0.4",
             HashAlgorithm::Blake3 => "BLAKE3",
             HashAlgorithm::XXH3 => "XXH128",
+        }
+    }
+}
+
+impl FromStr for HashAlgorithm {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "blake3" => Ok(HashAlgorithm::Blake3),
+            "xxh128" => Ok(HashAlgorithm::XXH3),
+            "tent0_4" => Ok(HashAlgorithm::Tent),
+            _ => Err(format!("'{}' is not a known hash algorithm", s)),
         }
     }
 }

@@ -7,6 +7,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::ops::{Deref, Range};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -673,8 +674,20 @@ impl Deref for ClusterSize {
     }
 }
 
+impl FromStr for ClusterSize {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "256" => Ok(ClusterSize::Cs256),
+            _ => Err(format!("'{}' not a valid or supported cluster size.", s)),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum BlockSize {
+    Bs16k,
     Bs64k,
     Bs256k,
 }
@@ -684,8 +697,22 @@ impl Deref for BlockSize {
 
     fn deref(&self) -> &Self::Target {
         match self {
+            BlockSize::Bs16k => &(16 * 1024),
             BlockSize::Bs64k => &(64 * 1024),
             BlockSize::Bs256k => &(256 * 1024),
+        }
+    }
+}
+
+impl FromStr for BlockSize {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "16" => Ok(BlockSize::Bs16k),
+            "64" => Ok(BlockSize::Bs64k),
+            "256" => Ok(BlockSize::Bs256k),
+            _ => Err(format!("'{}' not a valid or supported block size.", s)),
         }
     }
 }
