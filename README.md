@@ -23,8 +23,8 @@ the block device will grow indefinitely.
 
 That being said, this release of `sia_vbd` provides a fully functional and performant deduplicating & branching block device.
 
-A modern, fully-featued `NBD` server has been implemented and tested against Linux's built-in client as well as 
-agains [nbdublk](https://libguestfs.org/nbdublk.1.html) - a modern userland `nbd` client backed 
+A modern, fully-featured `NBD` server has been implemented and tested against Linux's built-in client as well as 
+against [nbdublk](https://libguestfs.org/nbdublk.1.html) - a modern userland `nbd` client backed 
 by [ublk](https://docs.kernel.org/block/ublk.html) & [nbdkit](https://www.libguestfs.org/nbdkit.1.html).
 
 `ext4` and `xfs` have been used during testing and both work well.
