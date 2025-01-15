@@ -22,7 +22,7 @@ impl DummyBlockDevice {
 
 #[async_trait]
 impl BlockDevice for DummyBlockDevice {
-    fn options(&self) -> Options {
+    async fn options(&self) -> Options {
         eprintln!("options requested");
         Options {
             description: self.description.clone(),

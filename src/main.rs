@@ -5,6 +5,7 @@ use sia_vbd::hash::HashAlgorithm;
 use sia_vbd::nbd::Builder;
 use sia_vbd::vbd::nbd_device::NbdDevice;
 use sia_vbd::vbd::{BlockSize, ClusterSize, VirtualBlockDevice};
+use std::path::PathBuf;
 use url::Url;
 use uuid::Uuid;
 
@@ -50,6 +51,13 @@ struct Arguments {
     #[arg(long, short = 'e')]
     #[clap(default_value = "sia_vbd")]
     export_name: String,
+    /// WAL directory
+    #[arg(long, short = 'w')]
+    wal_dir: PathBuf,
+    /// Maximum WAL file size
+    #[arg(long, short = 'y')]
+    #[clap(default_value = "128 MiB")]
+    max_wal_size: ByteSize,
 }
 
 #[tokio::main]
@@ -99,17 +107,23 @@ async fn main() -> anyhow::Result<()> {
     let runner = builder
         .with_export(
             arguments.export_name,
-            NbdDevice::new(VirtualBlockDevice::new(
-                Uuid::now_v7(),
-                arguments.cluster_size,
-                num_clusters,
-                arguments.block_size,
-                arguments.content_hash,
-                arguments.meta_hash,
-                arguments.max_buffer_size.as_u64() as usize,
-            )?),
+            NbdDevice::new(
+                VirtualBlockDevice::new(
+                    Uuid::now_v7().into(),
+                    arguments.cluster_size,
+                    num_clusters,
+                    arguments.block_size,
+                    arguments.content_hash,
+                    arguments.meta_hash,
+                    arguments.max_buffer_size.as_u64() as usize,
+                    arguments.wal_dir,
+                    arguments.max_wal_size.as_u64(),
+                )
+                .await?,
+            ),
             false,
-        )?
+        )
+        .await?
         .build();
     runner.run().await?;
     Ok(())

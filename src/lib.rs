@@ -1,9 +1,10 @@
 use anyhow::anyhow;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
+use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use tokio::sync::oneshot;
 
 pub mod hash;
 pub mod nbd;
+mod protos;
 pub mod vbd;
 
 static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
@@ -234,6 +236,76 @@ impl<W: AsyncWrite + Unpin + Send> AsyncWrite for LimitedWriter<W> {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // don't close the inner writer, just flush it
         self.poll_flush(cx)
+    }
+}
+
+pub trait AsyncReadExtBuffered: AsyncRead {
+    fn read_exact_buffered<'a, B: BufMut>(
+        &'a mut self,
+        buf: &'a mut B,
+        n: usize,
+    ) -> ReadExactBuffered<'a, Self, B>
+    where
+        Self: Unpin + Sized,
+    {
+        ReadExactBuffered {
+            reader: self,
+            buf,
+            remaining: n,
+        }
+    }
+}
+
+impl<T: AsyncRead + ?Sized> AsyncReadExtBuffered for T {}
+
+pub struct ReadExactBuffered<'a, R, B> {
+    reader: &'a mut R,
+    buf: &'a mut B,
+    remaining: usize,
+}
+
+impl<R: AsyncRead + Unpin, B: BufMut> Future for ReadExactBuffered<'_, R, B> {
+    type Output = std::io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        while self.remaining > 0 {
+            if self.buf.remaining_mut() < self.remaining {
+                return Poll::Ready(Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "Not enough buffer space",
+                )));
+            }
+            let remaining = self.remaining;
+            let uninit = self.buf.chunk_mut();
+            let to_read = min(uninit.len(), remaining);
+            if to_read == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "Not enough buffer space",
+                )));
+            }
+            let slice = &mut uninit[..to_read];
+            // Safety: We are writing exactly `to_read` bytes and will advance accordingly
+            let buf = unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr(), to_read) };
+            match Pin::new(&mut self.reader).poll_read(cx, unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, to_read)
+            }) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "EOF reached",
+                    )))
+                }
+                // Safety: We are advancing exactly as far as the underlying data has been written
+                Poll::Ready(Ok(n)) => unsafe {
+                    self.buf.advance_mut(n);
+                    self.remaining -= n;
+                },
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
 

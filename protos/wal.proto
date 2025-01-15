@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package wal;
+import "protos/common.proto";
+
+message FileInfo {
+  common.Uuid wal_file_id = 1;
+  common.Uuid vbd_id = 2;
+  common.Timestamp created = 3;
+  optional common.Uuid preceding_wal_file = 4;
+}
+
+message FrameHeader {
+  message TxBegin {
+    common.Uuid transaction_id = 1;
+    common.Hash preceding_content_id = 2;
+    common.Timestamp created = 4;
+  }
+
+  message TxCommit {
+    common.Uuid transaction_id = 1;
+    common.Hash content_id = 2;
+    common.Timestamp committed = 3;
+  }
+
+  message Block {
+    common.Hash content_id = 1;
+    uint32 length = 2;
+  }
+
+  message Cluster {
+    common.Hash content_id = 1;
+  }
+
+  message State {
+    common.Hash content_id = 1;
+  }
+
+  oneof type {
+    TxBegin tx_begin = 1;
+    TxCommit tx_commit = 2;
+    Block block = 3;
+    Cluster cluster = 4;
+    State state = 5;
+  }
+}
+
+message Cluster {
+  common.Hash content_id = 1;
+  repeated common.Hash block_ids = 2;
+}
+
+message State {
+  common.Hash content_id = 1;
+  repeated common.Hash cluster_ids = 2;
+}

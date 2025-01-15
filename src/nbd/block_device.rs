@@ -168,7 +168,7 @@ pub struct Options {
 #[async_trait]
 #[allow(unused_variables)]
 pub trait BlockDevice {
-    fn options(&self) -> Options;
+    async fn options(&self) -> Options;
 
     async fn read(
         &self,

@@ -214,7 +214,7 @@ impl TransmissionHandler {
                         match block_device.resize(length, &ctx).await {
                             Ok(()) => {
                                 // update the exports info
-                                export.update_options(block_device.options());
+                                export.update_options(block_device.options().await);
                                 let _ = writer.done(req_id).await;
                             }
                             Err(err) => {

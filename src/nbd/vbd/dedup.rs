@@ -156,7 +156,7 @@ impl Drop for DedupDevice {
 
 #[async_trait]
 impl BlockDevice for DedupDevice {
-    fn options(&self) -> Options {
+    async fn options(&self) -> Options {
         Options {
             block_size: self.block_size,
             size: (self.block_size as u64).saturating_mul(self.num_blocks as u64),

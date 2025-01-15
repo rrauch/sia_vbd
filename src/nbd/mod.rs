@@ -58,13 +58,13 @@ struct Export {
 }
 
 impl Export {
-    fn new<T: BlockDevice + Send + Sync + 'static>(
+    async fn new<T: BlockDevice + Send + Sync + 'static>(
         name: String,
         block_device: T,
         forced_read_only: bool,
     ) -> Result<Self, ExportError> {
         let block_device = Arc::new(block_device);
-        let options = block_device.options();
+        let options = block_device.options().await;
         let min = MIN_BLOCK_SIZE;
         let preferred = options.block_size;
 
@@ -161,14 +161,14 @@ impl Builder {
         }
     }
 
-    pub fn with_export<S: ToString, H: BlockDevice + Send + Sync + 'static>(
+    pub async fn with_export<S: ToString, H: BlockDevice + Send + Sync + 'static>(
         mut self,
         name: S,
         block_device: H,
         force_read_only: bool,
     ) -> Result<Self, anyhow::Error> {
         let name = name.to_string();
-        let export = Export::new(name.clone(), block_device, force_read_only)?;
+        let export = Export::new(name.clone(), block_device, force_read_only).await?;
         self.exports.insert(name, export);
         Ok(self)
     }

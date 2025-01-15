@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package common;
+
+message Timestamp {
+  int64 seconds = 1;
+  uint32 nanos = 2;
+}
+
+message Uuid {
+  uint64 most_significant = 1;
+  uint64 least_significant = 2;
+}
+
+message Hash {
+  enum Algorithm {
+    TENT = 0;
+    BLAKE_3 = 1;
+    XXH3 = 2;
+  }
+
+  Algorithm algo = 1;
+  bytes value = 2;
+}
