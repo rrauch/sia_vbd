@@ -87,6 +87,16 @@ pub(crate) enum Hash {
     XXH3([u8; 16]),
 }
 
+impl Hash {
+    pub fn algorithm(&self) -> HashAlgorithm {
+        match &self {
+            Hash::Tent(_) => HashAlgorithm::Tent,
+            Hash::Blake3(_) => HashAlgorithm::Blake3,
+            Hash::XXH3(_) => HashAlgorithm::XXH3,
+        }
+    }
+}
+
 impl Display for Hash {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

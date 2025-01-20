@@ -68,7 +68,7 @@ impl BlockDevice for NbdDevice {
             let bytes = {
                 let lock = self.vbd.read().await;
 
-                lock.get(block.block_no as usize)?.map(|b| {
+                lock.get(block.block_no as usize).await?.map(|b| {
                     if block.partial {
                         b.slice((block.range.start as usize)..(block.range.end as usize))
                     } else {
@@ -109,7 +109,8 @@ impl BlockDevice for NbdDevice {
             } else {
                 // partial block, get from backend first
                 let lock = self.vbd.read().await;
-                lock.get(block.block_no as usize)?
+                lock.get(block.block_no as usize)
+                    .await?
                     .map(|b| BytesMut::from(b))
             }
             .unwrap_or(BytesMut::zeroed(self.block_size as usize));
@@ -156,7 +157,8 @@ impl BlockDevice for NbdDevice {
         for block in blocks.into_iter() {
             let mut buf = {
                 let lock = self.vbd.read().await;
-                lock.get(block.block_no as usize)?
+                lock.get(block.block_no as usize)
+                    .await?
                     .map(|b| BytesMut::from(b))
             }
             .unwrap_or(BytesMut::zeroed(self.block_size as usize));

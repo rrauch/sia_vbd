@@ -12,13 +12,21 @@ message Uuid {
   uint64 least_significant = 2;
 }
 
-message Hash {
-  enum Algorithm {
-    TENT = 0;
-    BLAKE_3 = 1;
-    XXH3 = 2;
-  }
+enum HashAlgorithm {
+  TENT = 0;
+  BLAKE_3 = 1;
+  XXH3 = 2;
+}
 
-  Algorithm algo = 1;
+message Hash {
+  HashAlgorithm algo = 1;
   bytes value = 2;
+}
+
+message FixedSpecs {
+  common.Uuid vbd_id = 1;
+  uint32 cluster_size = 2;
+  uint32 block_size = 3;
+  HashAlgorithm content_hash = 4;
+  HashAlgorithm meta_hash = 5;
 }

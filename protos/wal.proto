@@ -5,7 +5,7 @@ import "protos/common.proto";
 
 message FileInfo {
   common.Uuid wal_file_id = 1;
-  common.Uuid vbd_id = 2;
+  common.FixedSpecs specs = 2;
   common.Timestamp created = 3;
   optional common.Uuid preceding_wal_file = 4;
 }

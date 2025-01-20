@@ -31,6 +31,43 @@ impl From<Uuid> for uuid::Uuid {
     }
 }
 
+impl From<&crate::vbd::FixedSpecs> for FixedSpecs {
+    fn from(value: &crate::vbd::FixedSpecs) -> Self {
+        let mut v = Self {
+            vbd_id: Some(value.vbd_id.into()),
+            block_size: *value.block_size as u32,
+            cluster_size: *value.cluster_size as u32,
+            content_hash: 0,
+            meta_hash: 0,
+        };
+        v.set_content_hash(value.content_hash.into());
+        v.set_meta_hash(value.meta_hash.into());
+        v
+    }
+}
+
+impl TryFrom<FixedSpecs> for crate::vbd::FixedSpecs {
+    type Error = anyhow::Error;
+
+    fn try_from(value: FixedSpecs) -> Result<Self, Self::Error> {
+        (&value).try_into()
+    }
+}
+
+impl TryFrom<&FixedSpecs> for crate::vbd::FixedSpecs {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &FixedSpecs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            vbd_id: value.vbd_id.ok_or(anyhow!("vbd_id missing"))?.into(),
+            block_size: (value.block_size as usize).try_into()?,
+            cluster_size: (value.cluster_size as usize).try_into()?,
+            content_hash: value.content_hash().into(),
+            meta_hash: value.meta_hash().into(),
+        })
+    }
+}
+
 impl From<&DateTime<Utc>> for Timestamp {
     fn from(value: &DateTime<Utc>) -> Self {
         Self {
@@ -68,13 +105,28 @@ impl From<&crate::hash::Hash> for Hash {
     fn from(value: &crate::hash::Hash) -> Self {
         let mut hash = Self::default();
         hash.value = Vec::from(value.as_ref());
-        let algo = match value {
-            crate::hash::Hash::Tent(_) => hash::Algorithm::Tent,
-            crate::hash::Hash::Blake3(_) => hash::Algorithm::Blake3,
-            crate::hash::Hash::XXH3(_) => hash::Algorithm::Xxh3,
-        };
-        hash.set_algo(algo);
+        hash.set_algo(value.algorithm().into());
         hash
+    }
+}
+
+impl From<crate::hash::HashAlgorithm> for HashAlgorithm {
+    fn from(value: crate::hash::HashAlgorithm) -> Self {
+        match value {
+            crate::hash::HashAlgorithm::Tent => HashAlgorithm::Tent,
+            crate::hash::HashAlgorithm::Blake3 => HashAlgorithm::Blake3,
+            crate::hash::HashAlgorithm::XXH3 => HashAlgorithm::Xxh3,
+        }
+    }
+}
+
+impl From<HashAlgorithm> for crate::hash::HashAlgorithm {
+    fn from(value: HashAlgorithm) -> Self {
+        match value {
+            HashAlgorithm::Tent => crate::hash::HashAlgorithm::Tent,
+            HashAlgorithm::Blake3 => crate::hash::HashAlgorithm::Blake3,
+            HashAlgorithm::Xxh3 => crate::hash::HashAlgorithm::XXH3,
+        }
     }
 }
 
@@ -90,7 +142,7 @@ impl TryFrom<Hash> for crate::hash::Hash {
     fn try_from(value: Hash) -> Result<Self, Self::Error> {
         let len = value.value.len();
         match value.algo() {
-            hash::Algorithm::Tent => {
+            HashAlgorithm::Tent => {
                 if len == 20 {
                     Ok(crate::hash::Hash::Tent(value.value.try_into().unwrap()))
                 } else {
@@ -100,7 +152,7 @@ impl TryFrom<Hash> for crate::hash::Hash {
                     ))
                 }
             }
-            hash::Algorithm::Blake3 => {
+            HashAlgorithm::Blake3 => {
                 if len == 32 {
                     Ok(crate::hash::Hash::Blake3(blake3::Hash::from_bytes(
                         value.value.try_into().unwrap(),
@@ -112,7 +164,7 @@ impl TryFrom<Hash> for crate::hash::Hash {
                     ))
                 }
             }
-            hash::Algorithm::Xxh3 => {
+            HashAlgorithm::Xxh3 => {
                 if len == 16 {
                     Ok(crate::hash::Hash::XXH3(value.value.try_into().unwrap()))
                 } else {

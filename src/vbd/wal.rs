@@ -1,19 +1,26 @@
 use protos::frame_header::Type as ProtoFrameType;
 use protos::FileInfo as ProtoFileInfo;
 use protos::FrameHeader as ProtoFrameHeader;
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::future::Future;
 
+use crate::vbd::wal::protos::Cluster;
 use crate::vbd::wal::ParseError::InvalidMagicNumber;
 use crate::vbd::wal::PreambleError::{
     InvalidBodyLength, InvalidHeaderLength, InvalidLength, InvalidPaddingLength,
 };
-use crate::vbd::{BlockId, ClusterId, Commit, TypedUuid, VbdId};
+use crate::vbd::{
+    BlockError, BlockId, ClusterId, ClusterMut, Commit, FixedSpecs, TypedUuid, VbdId,
+};
 use crate::{AsyncReadExtBuffered, AsyncWriteBytesExt};
+use anyhow::anyhow;
 use async_scoped::TokioScope;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Duration, Utc};
+use either::Either;
 use futures::future::BoxFuture;
-use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, Stream};
+use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, Stream, StreamExt};
 use prost::{DecodeError, Message};
 use std::io::{Error, SeekFrom};
 use std::mem;
@@ -22,6 +29,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+use tracing::instrument;
 use uuid::Uuid;
 
 const PREAMBLE_LEN: usize = 14;
@@ -52,6 +60,10 @@ impl TokioFileWal {
 
     pub fn into_inner(self) -> tokio::fs::File {
         self.file.into_inner()
+    }
+
+    pub fn as_file(&self) -> &tokio::fs::File {
+        self.file.get_ref()
     }
 }
 
@@ -102,19 +114,22 @@ pub struct WalWriter<IO> {
 }
 
 impl<IO: WalSink> WalWriter<IO> {
+    #[instrument(skip(io))]
     pub async fn new(
         mut io: IO,
         wal_id: WalId,
-        vbd_id: VbdId,
         preceding_wal_id: Option<WalId>,
         max_size: u64,
+        specs: FixedSpecs,
     ) -> Result<Self, WalError> {
         let header = FileHeader {
             wal_id,
             preceding_wal_id,
             created: Utc::now(),
-            vbd_id,
+            specs,
         };
+
+        tracing::debug!("creating new wal");
 
         let mut offset = 0usize;
         io.write_all(MAGIC_NUMBER).await?;
@@ -131,6 +146,8 @@ impl<IO: WalSink> WalWriter<IO> {
 
         io.write_all(&buf).await?;
         io.flush().await?;
+
+        tracing::info!("new wal created");
 
         Ok(Self {
             id: wal_id,
@@ -153,11 +170,13 @@ impl<IO: WalSink> WalWriter<IO> {
         Ok(self.max_size - len)
     }
 
+    #[instrument(skip(self), fields(wal_id = %self.id, preceding_commit = %preceding_commit))]
     pub async fn begin(
         self,
         preceding_commit: Commit,
         reserve_space: u64,
     ) -> Result<Tx<IO>, (WalError, Result<Self, RollbackError>)> {
+        tracing::debug!("starting new transaction");
         if let Err(err) = {
             match self.remaining().await {
                 Ok(remaining) => {
@@ -174,26 +193,74 @@ impl<IO: WalSink> WalWriter<IO> {
                 Err(e) => Err(e),
             }
         } {
+            tracing::error!(error = %err, "starting new transaction failed");
             return Err((err, Ok(self)));
         }
 
-        Ok(Tx::new(
+        let tx = Tx::new(
             Uuid::now_v7().into(),
             self.header.wal_id,
-            self.header.vbd_id,
+            self.header.specs.vbd_id,
             preceding_commit,
             Utc::now(),
             reserve_space,
             self,
         )
-        .await?)
+        .await?;
+        tracing::info!(id = %tx.id, "new transaction started");
+        Ok(tx)
+    }
+
+    pub fn io(&self) -> &IO {
+        &self.io
     }
 }
 
-pub enum TxContent {
-    Block(BlockId, Position<u64, u32>),
-    Cluster(ClusterId, Position<u64, u32>),
-    State(Commit, Position<u64, u32>),
+struct TxDetailBuilder {
+    tx_id: TxId,
+    wal_id: WalId,
+    vbd_id: VbdId,
+    preceding_commit: Commit,
+    created: DateTime<Utc>,
+    blocks: HashMap<BlockId, Position<u64, u32>>,
+    clusters: HashMap<ClusterId, Position<u64, u32>>,
+    states: HashMap<Commit, Position<u64, u32>>,
+}
+
+impl TxDetailBuilder {
+    fn new(
+        tx_id: TxId,
+        wal_id: WalId,
+        vbd_id: VbdId,
+        preceding_commit: Commit,
+        created: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            tx_id,
+            wal_id,
+            vbd_id,
+            preceding_commit,
+            created,
+            blocks: HashMap::default(),
+            clusters: HashMap::default(),
+            states: HashMap::default(),
+        }
+    }
+
+    fn build(self, commit: Commit, committed: DateTime<Utc>) -> TxDetails {
+        TxDetails {
+            tx_id: self.tx_id,
+            wal_id: self.wal_id,
+            vbd_id: self.vbd_id,
+            commit,
+            preceding_commit: self.preceding_commit,
+            created: self.created,
+            committed,
+            blocks: self.blocks,
+            clusters: self.clusters,
+            states: self.states,
+        }
+    }
 }
 
 pub struct TxDetails {
@@ -203,18 +270,21 @@ pub struct TxDetails {
     pub commit: Commit,
     pub preceding_commit: Commit,
     pub created: DateTime<Utc>,
-    pub commited: DateTime<Utc>,
-    pub position: Position<u64, u64>,
+    pub committed: DateTime<Utc>,
+    //pub position: Position<u64, u64>,
+    pub blocks: HashMap<BlockId, Position<u64, u32>>,
+    pub clusters: HashMap<ClusterId, Position<u64, u32>>,
+    pub states: HashMap<Commit, Position<u64, u32>>,
 }
 
 impl TxDetails {
     pub fn duration(&self) -> Duration {
-        self.commited - self.created
+        self.committed - self.created
     }
 
-    pub fn len(&self) -> u64 {
+    /*pub fn len(&self) -> u64 {
         self.position.length
-    }
+    }*/
 }
 
 pub struct Tx_ {}
@@ -232,16 +302,20 @@ pub struct Tx<IO: WalSink> {
     writer: Option<WalWriter<IO>>,
     buf: BytesMut,
     preceding_commit: Commit,
+    blocks: HashMap<BlockId, Position<u64, u32>>,
+    clusters: HashMap<ClusterId, Position<u64, u32>>,
+    states: HashMap<Commit, Position<u64, u32>>,
 }
 
 impl<IO: WalSink> Tx<IO> {
+    #[instrument(skip(writer))]
     async fn new(
         id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
         preceding_commit: Commit,
         created: DateTime<Utc>,
-        reserve: u64,
+        max_len: u64,
         mut writer: WalWriter<IO>,
     ) -> Result<Self, (WalError, Result<WalWriter<IO>, RollbackError>)> {
         async fn prepare_wal<IO: WalSink>(
@@ -253,8 +327,8 @@ impl<IO: WalSink> Tx<IO> {
             writer.io.seek(SeekFrom::Start(initial_len)).await?;
             Ok(initial_len)
         }
-
-        let initial_len = match prepare_wal(&mut writer, reserve).await {
+        tracing::debug!("preparing wal");
+        let initial_len = match prepare_wal(&mut writer, max_len).await {
             Ok(l) => l,
             Err(e) => {
                 return Err((e, Err(RollbackError::UnclearState)));
@@ -267,11 +341,14 @@ impl<IO: WalSink> Tx<IO> {
             vbd_id,
             created: created.clone(),
             initial_len,
-            len: initial_len + reserve,
+            len: initial_len + max_len,
             position: initial_len,
             writer: Some(writer),
             buf: BytesMut::with_capacity(VALID_HEADER_LEN.end as usize + PREAMBLE_LEN),
             preceding_commit: preceding_commit.clone(),
+            blocks: HashMap::default(),
+            clusters: HashMap::default(),
+            states: HashMap::default(),
         };
 
         if let Err(e) = this.write_tx_begin(preceding_commit, created).await {
@@ -283,7 +360,7 @@ impl<IO: WalSink> Tx<IO> {
             }
             return Err((e, Err(RollbackError::UnclearState)));
         }
-
+        tracing::debug!("new transaction started");
         Ok(this)
     }
 
@@ -301,9 +378,11 @@ impl<IO: WalSink> Tx<IO> {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(frame = %frame))]
     async fn write_frame(&mut self, frame: WriteFrame<'_>) -> Result<Position<u64, u16>, WalError> {
         let buf = &mut self.buf;
         buf.clear();
+        tracing::trace!("encoding frame");
         let header_len = encode_frame(&mut *buf, frame)? - PREAMBLE_LEN;
         let remaining = self.len - self.position;
         if remaining < buf.len() as u64 {
@@ -312,12 +391,18 @@ impl<IO: WalSink> Tx<IO> {
                 rem: remaining,
             })?;
         }
+        tracing::trace!(
+            offset = self.position,
+            encoded_length = buf.len(),
+            "writing frame"
+        );
         self.writer.as_mut().unwrap().io.write_all(&buf).await?;
         let header_pos = Position::new(self.position + PREAMBLE_LEN as u64, header_len as u16);
         self.position += buf.len() as u64;
         Ok(header_pos)
     }
 
+    #[instrument(skip_all)]
     async fn write_body(
         &mut self,
         body: impl AsRef<[u8]>,
@@ -326,7 +411,8 @@ impl<IO: WalSink> Tx<IO> {
     ) -> Result<Position<u64, u32>, WalError> {
         let body = body.as_ref();
         let total_len = body.len() as u64 + padding1 as u64 + padding2 as u64;
-        let remaining = self.len - self.position;
+        tracing::trace!(offset = self.position, length = total_len, "writing body");
+        let remaining = self.remaining();
         if total_len > remaining {
             return Err(EncodeError::WalSpaceInsufficient {
                 req: total_len,
@@ -355,73 +441,102 @@ impl<IO: WalSink> Tx<IO> {
         Ok(body_pos)
     }
 
-    pub async fn block(&mut self, block_id: BlockId, data: Option<&Bytes>) -> Result<(), WalError> {
+    pub fn remaining(&self) -> u64 {
+        self.len - self.position
+    }
+
+    #[instrument(skip_all, fields(block_id = %block_id, data_len = data.len()))]
+    pub async fn block(
+        &mut self,
+        block_id: &BlockId,
+        data: &Bytes,
+    ) -> Result<Position<u64, u32>, WalError> {
+        if let Some(pos) = self.blocks.get(block_id) {
+            return Ok(pos.clone());
+        }
+        tracing::debug!("writing BLOCK to wal");
         let block = Block {
-            content_id: block_id,
-            length: data.map(|d| d.len() as u32).unwrap_or(0),
+            content_id: block_id.clone(),
+            length: data.len() as u32,
         };
         let frame = WriteFrame::Block((block, None, None));
         self.write_frame(frame).await?;
-        if let Some(data) = data {
-            self.write_body(data, 0, 0).await?;
+        let pos = self.write_body(data, 0, 0).await?;
+        self.blocks.insert(block_id.clone(), pos.clone());
+        Ok(pos)
+    }
+
+    #[instrument(skip_all, fields(cluster_id = %cluster.content_id))]
+    pub async fn cluster(
+        &mut self,
+        cluster: &super::Cluster,
+    ) -> Result<Position<u64, u32>, WalError> {
+        if let Some(pos) = self.clusters.get(cluster.content_id()) {
+            return Ok(pos.clone());
         }
-        Ok(())
-    }
-
-    pub async fn cluster(&mut self, cluster: &super::Cluster) -> Result<(), WalError> {
+        tracing::debug!("writing CLUSTER to wal");
+        let cluster_id = cluster.content_id.clone();
         let cluster = cluster.into();
-        let frame = WriteFrame::Cluster(&cluster);
+        let frame = WriteFrame::Cluster((&cluster, &cluster_id));
         self.write_frame(frame).await?;
-        self.write_body(cluster.encode_to_vec(), 0, 0).await?;
-        Ok(())
+        let pos = self.write_body(cluster.encode_to_vec(), 0, 0).await?;
+        self.clusters.insert(cluster_id, pos.clone());
+        Ok(pos)
     }
 
+    #[instrument(skip_all, fields(content_id = %content_id))]
     pub async fn state(
         &mut self,
         content_id: &Commit,
         cluster_ids: impl Iterator<Item = &ClusterId>,
-    ) -> Result<(), WalError> {
+    ) -> Result<Position<u64, u32>, WalError> {
+        if let Some(pos) = self.states.get(content_id) {
+            return Ok(pos.clone());
+        }
+        tracing::debug!("writing STATE to wal");
+        let commit = content_id.clone();
         let state = protos::State {
             content_id: Some(content_id.into()),
             cluster_ids: cluster_ids.into_iter().map(|c| c.into()).collect(),
         };
-        let frame = WriteFrame::State(&state);
+        let frame = WriteFrame::State((&state, &commit));
         self.write_frame(frame).await?;
-        self.write_body(state.encode_to_vec(), 0, 0).await?;
-        Ok(())
+        let pos = self.write_body(state.encode_to_vec(), 0, 0).await?;
+        self.states.insert(commit, pos.clone());
+        Ok(pos)
     }
 
+    #[instrument(skip_all, fields(tx_id = %self.id, wal_id = %self.wal_id, vbd_id = %self.vbd_id, content_id = %content_id
+    ))]
     pub async fn commit(
         mut self,
-        content_id: Commit,
+        content_id: &Commit,
     ) -> Result<(WalWriter<IO>, TxDetails), (WalError, Result<WalWriter<IO>, RollbackError>)> {
-        let commited = Utc::now();
+        let committed = Utc::now();
         let frame = WriteFrame::TxCommit(TxCommit {
             transaction_id: self.id,
             content_id: content_id.clone(),
-            commited: commited.clone(),
+            committed: committed.clone(),
         });
-
+        tracing::trace!("starting commit");
         async fn write_commit<IO: WalSink>(
             tx: &mut Tx<IO>,
             frame: WriteFrame<'_>,
-            position: u64,
         ) -> Result<(), WalError> {
             tx.write_frame(frame).await?;
-            tx.writer.as_mut().unwrap().io.set_len(position).await?;
+            tx.writer.as_mut().unwrap().io.set_len(tx.position).await?;
             tx.writer.as_mut().unwrap().io.flush().await?;
             Ok(())
         }
-        let position = self.position;
-        if let Err(err) = write_commit(&mut self, frame, position).await {
+        if let Err(err) = write_commit(&mut self, frame).await {
             // error during commit, rolling back
             if let Err(re) = _rollback(&mut self.writer.as_mut().unwrap(), self.initial_len).await {
                 return Err((err, Err(re)));
             }
             return Err((err, Ok(self.writer.take().unwrap())));
         }
-        //todo
-        eprintln!("commited tx: {}", self.id);
+
+        tracing::info!("transaction committed");
 
         Ok((
             self.writer.take().unwrap(),
@@ -429,16 +544,21 @@ impl<IO: WalSink> Tx<IO> {
                 tx_id: self.id,
                 wal_id: self.wal_id,
                 vbd_id: self.vbd_id,
-                commit: content_id,
+                commit: content_id.clone(),
                 preceding_commit: self.preceding_commit.clone(),
                 created: self.created,
-                commited,
-                position: Position::new(self.initial_len, self.position - self.initial_len),
+                committed,
+                //position: Position::new(self.initial_len, self.position - self.initial_len),
+                blocks: self.blocks.drain().collect(),
+                clusters: self.clusters.drain().collect(),
+                states: self.states.drain().collect(),
             },
         ))
     }
 
+    #[instrument(skip_all, fields(tx_id = %self.id, wal_id = %self.wal_id, vbd_id = %self.vbd_id))]
     pub async fn rollback(mut self) -> Result<WalWriter<IO>, RollbackError> {
+        tracing::info!("rolling back transaction");
         match self.writer.take() {
             Some(mut wal) => {
                 _rollback(&mut wal, self.initial_len).await?;
@@ -460,10 +580,16 @@ async fn _rollback<IO: WalSink>(
 }
 
 impl<IO: WalSink> Drop for Tx<IO> {
+    #[instrument(skip_all, fields(tx_id = %self.id, wal_id = %self.wal_id, vbd_id = %self.vbd_id))]
     fn drop(&mut self) {
         if let Some(mut wal) = self.writer.take() {
+            tracing::warn!("transaction dropped, rolling back");
             TokioScope::scope_and_block(|s| {
-                s.spawn(_rollback(&mut wal, self.initial_len));
+                s.spawn(async move {
+                    if let Err(err) = _rollback(&mut wal, self.initial_len).await {
+                        tracing::error!(error = %err, "rollback failure");
+                    }
+                });
             });
         }
     }
@@ -479,6 +605,7 @@ pub struct WalReader<IO> {
 }
 
 impl<IO: WalSource> WalReader<IO> {
+    #[instrument(skip(io))]
     pub async fn new(mut io: IO) -> Result<Self, WalError> {
         let header = read_file_header(&mut io).await?;
 
@@ -489,12 +616,335 @@ impl<IO: WalSource> WalReader<IO> {
         })
     }
 
-    pub async fn frames(&mut self) -> FrameStream<&mut IO> {
-        FrameStream::new(&mut self.io, self.first_frame_offset)
+    pub fn transactions(&mut self, preceding_content_id: Option<Commit>) -> TxStream<&mut IO> {
+        TxStream::new(
+            &mut self.io,
+            self.first_frame_offset,
+            preceding_content_id,
+            self.header.wal_id.clone(),
+            &self.header.specs,
+        )
+    }
+
+    #[instrument(skip(self))]
+    async fn read(&mut self, pos: &Position<u64, u32>) -> Result<Bytes, std::io::Error> {
+        tracing::trace!(offset = pos.offset, len = pos.length, "reading from WAL");
+        self.io.seek(SeekFrom::Start(pos.offset)).await?;
+        let mut buf = BytesMut::with_capacity(pos.length as usize);
+        self.io
+            .read_exact_buffered(&mut buf, pos.length as usize)
+            .await?;
+        Ok(buf.freeze())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn block(
+        &mut self,
+        block_id: &BlockId,
+        pos: &Position<u64, u32>,
+    ) -> Result<super::Block, WalError> {
+        tracing::debug!("reading BLOCK from WAL");
+        if pos.length as usize != *self.header.specs.block_size {
+            Err(anyhow!(
+                "Incorrect block size, found [{}] but expected [{}]",
+                pos.length,
+                *self.header.specs.block_size
+            ))?;
+        }
+
+        let specs = self.header.specs.clone();
+        let block = super::Block::new(&specs, self.read(pos).await?)
+            .map_err(|e| <BlockError as Into<anyhow::Error>>::into(e))?;
+        if &block.content_id != block_id {
+            Err(anyhow!(
+                "BlockIds do not match: {} != {}",
+                block.content_id,
+                block_id
+            ))?;
+        }
+        Ok(block)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn cluster(
+        &mut self,
+        cluster_id: &ClusterId,
+        pos: &Position<u64, u32>,
+    ) -> Result<super::Cluster, WalError> {
+        tracing::debug!("reading CLUSTER from WAL");
+        let proto_cluster = Cluster::decode(self.read(pos).await?)
+            .map_err(|p| WalError::ParseError(ParseError::ProtoError(p)))?;
+
+        if proto_cluster.block_ids.len() != *self.header.specs.cluster_size {
+            Err(anyhow!(
+                "Incorrect cluster size, found [{}] but expected [{}]",
+                proto_cluster.block_ids.len(),
+                *self.header.specs.cluster_size
+            ))?;
+        }
+
+        let block_ids = proto_cluster
+            .block_ids
+            .into_iter()
+            .map(|h| <crate::protos::Hash as TryInto<BlockId>>::try_into(h))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cluster =
+            ClusterMut::from_block_ids(block_ids.into_iter(), self.header.specs.clone()).finalize();
+        if &cluster.content_id != cluster_id {
+            Err(anyhow!(
+                "ClusterIds do not match: {} != {}",
+                cluster.content_id,
+                cluster_id
+            ))?;
+        }
+        Ok(cluster)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn state(
+        &mut self,
+        commit: &Commit,
+        pos: &Position<u64, u32>,
+    ) -> Result<Vec<ClusterId>, WalError> {
+        tracing::debug!("reading STATE from WAL");
+        let state = protos::State::decode(self.read(pos).await?)
+            .map_err(|p| WalError::ParseError(ParseError::ProtoError(p)))?;
+
+        let cluster_ids = state
+            .cluster_ids
+            .into_iter()
+            .map(|h| <crate::protos::Hash as TryInto<ClusterId>>::try_into(h))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let state_commit: Commit = (&cluster_ids, &self.header.specs).into();
+
+        if &state_commit != commit {
+            Err(anyhow!(
+                "Commits do not match: {} != {}",
+                state_commit,
+                commit
+            ))?;
+        }
+
+        Ok(cluster_ids)
     }
 }
 
-pub struct FrameStream<'a, IO: WalSource> {
+impl<IO> WalReader<IO> {
+    pub fn header(&self) -> &FileHeader {
+        &self.header
+    }
+}
+
+pub struct TxStream<'a, IO: WalSource> {
+    state: TxStreamState<'a, IO>,
+    wal_id: WalId,
+    specs: &'a FixedSpecs,
+}
+
+impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
+    fn new(
+        io: IO,
+        first_frame_offset: u64,
+        preceding_cid: Option<Commit>,
+        wal_id: WalId,
+        specs: &'a FixedSpecs,
+    ) -> Self {
+        Self {
+            state: TxStreamState::New(FrameStream::new(io, first_frame_offset), preceding_cid),
+            wal_id,
+            specs,
+        }
+    }
+
+    fn next_tx_begin(
+        mut frame_stream: FrameStream<'a, IO>,
+        preceding_cid: Option<Commit>,
+        wal_id: WalId,
+        vbd_id: VbdId,
+    ) -> BoxFuture<
+        'a,
+        (
+            Result<Option<TxDetailBuilder>, WalError>,
+            FrameStream<'a, IO>,
+        ),
+    > {
+        Box::pin(async move {
+            let res = match frame_stream.next().await {
+                Some(Ok(ReadFrameItem::TxBegin(tx_begin))) => match match preceding_cid {
+                    Some(preceding_cid) => {
+                        if &preceding_cid == &tx_begin.header.preceding_content_id {
+                            Ok(tx_begin)
+                        } else {
+                            Err(WalError::IncorrectPrecedingCommit {
+                                exp: preceding_cid,
+                                found: tx_begin.header.preceding_content_id.clone(),
+                            })
+                        }
+                    }
+                    None => Ok(tx_begin),
+                } {
+                    Ok(tx_begin) => Ok(Some(TxDetailBuilder::new(
+                        tx_begin.header.transaction_id,
+                        wal_id,
+                        vbd_id,
+                        tx_begin.header.preceding_content_id,
+                        tx_begin.header.created,
+                    ))),
+                    Err(err) => Err(err),
+                },
+                Some(Ok(_)) => Err(WalError::UnexpectedFrameType {
+                    exp: "TxBegin".to_string(),
+                }),
+                Some(Err(err)) => Err(err),
+                None => Ok(None),
+            };
+            (res, frame_stream)
+        })
+    }
+    fn next_frame(
+        mut frame_stream: FrameStream<'a, IO>,
+        mut tx_builder: TxDetailBuilder,
+    ) -> BoxFuture<
+        'a,
+        (
+            Result<Either<TxDetailBuilder, TxDetails>, WalError>,
+            FrameStream<'a, IO>,
+        ),
+    > {
+        Box::pin(async move {
+            let res = match frame_stream.next().await {
+                Some(Ok(frame)) => match frame {
+                    ReadFrameItem::TxBegin(_) => Err(WalError::DanglingTxDetected {
+                        tx_id: tx_builder.tx_id,
+                    }),
+                    ReadFrameItem::TxCommit(tx_commit) => {
+                        if &tx_commit.header.transaction_id != &tx_builder.tx_id {
+                            Err(WalError::IncorrectTxId {
+                                exp: tx_builder.tx_id,
+                                found: tx_commit.header.transaction_id,
+                            })
+                        } else {
+                            Ok(Either::Right(tx_builder.build(
+                                tx_commit.header.content_id,
+                                tx_commit.header.committed,
+                            )))
+                        }
+                    }
+                    ReadFrameItem::Block(block) => {
+                        if let Some(body) = block.body {
+                            tx_builder.blocks.insert(block.header.content_id, body);
+                        }
+                        Ok(Either::Left(tx_builder))
+                    }
+                    ReadFrameItem::Cluster(cluster) => {
+                        if let Some(body) = cluster.body {
+                            tx_builder.clusters.insert(cluster.header, body);
+                        }
+                        Ok(Either::Left(tx_builder))
+                    }
+                    ReadFrameItem::State(state) => {
+                        if let Some(body) = state.body {
+                            tx_builder.states.insert(state.header, body);
+                        }
+                        Ok(Either::Left(tx_builder))
+                    }
+                },
+                Some(Err(err)) => Err(err),
+                None => Err(WalError::DanglingTxDetected {
+                    tx_id: tx_builder.tx_id,
+                }),
+            };
+            (res, frame_stream)
+        })
+    }
+}
+
+enum TxStreamState<'a, IO: WalSource> {
+    New(FrameStream<'a, IO>, Option<Commit>),
+    AwaitingNextTxBegin(
+        BoxFuture<
+            'a,
+            (
+                Result<Option<TxDetailBuilder>, WalError>,
+                FrameStream<'a, IO>,
+            ),
+        >,
+    ),
+    AwaitingNextFrame(
+        BoxFuture<
+            'a,
+            (
+                Result<Either<TxDetailBuilder, TxDetails>, WalError>,
+                FrameStream<'a, IO>,
+            ),
+        >,
+    ),
+    Done,
+}
+
+impl<'a, IO: WalSource + 'a> Stream for TxStream<'a, IO> {
+    type Item = Result<TxDetails, WalError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match mem::replace(&mut self.state, TxStreamState::Done) {
+                TxStreamState::New(frame_stream, preceding_cid) => {
+                    self.state = TxStreamState::AwaitingNextTxBegin(Self::next_tx_begin(
+                        frame_stream,
+                        preceding_cid,
+                        self.wal_id.clone(),
+                        self.specs.vbd_id.clone(),
+                    ));
+                    continue;
+                }
+                TxStreamState::AwaitingNextTxBegin(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.state = TxStreamState::AwaitingNextTxBegin(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((Ok(Some(tx_builder)), frame_stream)) => {
+                        self.state = TxStreamState::AwaitingNextFrame(Self::next_frame(
+                            frame_stream,
+                            tx_builder,
+                        ));
+                        continue;
+                    }
+                    Poll::Ready((Ok(None), _)) => return Poll::Ready(None),
+                    Poll::Ready((Err(err), _)) => return Poll::Ready(Some(Err(err))),
+                },
+                TxStreamState::AwaitingNextFrame(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        self.state = TxStreamState::AwaitingNextFrame(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((Ok(Either::Left(tx_builder)), frame_stream)) => {
+                        self.state = TxStreamState::AwaitingNextFrame(Self::next_frame(
+                            frame_stream,
+                            tx_builder,
+                        ));
+                        continue;
+                    }
+                    Poll::Ready((Ok(Either::Right(tx_details)), frame_stream)) => {
+                        self.state = TxStreamState::AwaitingNextTxBegin(Self::next_tx_begin(
+                            frame_stream,
+                            Some(tx_details.commit.clone()),
+                            self.wal_id.clone(),
+                            self.specs.vbd_id.clone(),
+                        ));
+                        return Poll::Ready(Some(Ok(tx_details)));
+                    }
+                    Poll::Ready((Err(err), _)) => return Poll::Ready(Some(Err(err))),
+                },
+                TxStreamState::Done => {
+                    panic!("polled after completion");
+                }
+            }
+        }
+    }
+}
+
+struct FrameStream<'a, IO: WalSource> {
     state: FrameStreamState<'a, IO>,
 }
 
@@ -586,12 +1036,7 @@ impl<'a, IO: WalSource + 'a> Stream for FrameStream<'a, IO> {
     }
 }
 
-impl<IO> WalReader<IO> {
-    pub fn header(&self) -> &FileHeader {
-        &self.header
-    }
-}
-
+#[derive(Clone, Debug)]
 pub struct Position<O, L> {
     pub offset: O,
     pub length: L,
@@ -606,9 +1051,10 @@ impl<O, L> Position<O, L> {
 pub struct Wal {}
 pub type WalId = TypedUuid<Wal>;
 
+#[derive(Debug)]
 pub struct FileHeader {
     pub wal_id: WalId,
-    pub vbd_id: VbdId,
+    pub specs: FixedSpecs,
     pub created: DateTime<Utc>,
     pub preceding_wal_id: Option<WalId>,
 }
@@ -632,7 +1078,9 @@ fn parse_file_preamble<B: Buf>(
     Ok((Position::new(offset, preamble.header), first_frame_offset))
 }
 
+#[instrument(skip(io))]
 async fn read_file_header<IO: WalSource>(mut io: IO) -> Result<ReadFrame<FileHeader>, WalError> {
+    tracing::trace!("reading wal header");
     let start_offset = io.stream_position().await?;
     let mut buf = BytesMut::with_capacity(VALID_HEADER_LEN.end as usize);
     io.read_exact_buffered(&mut buf, MAGIC_NUMBER.len() + PREAMBLE_LEN)
@@ -642,8 +1090,10 @@ async fn read_file_header<IO: WalSource>(mut io: IO) -> Result<ReadFrame<FileHea
     io.seek(SeekFrom::Start(header_pos.offset)).await?;
     io.read_exact_buffered(&mut buf, header_pos.length as usize)
         .await?;
+    let header = parse_file_header(buf)?;
+    tracing::debug!(header = ?header,  "wal header read");
     Ok(ReadFrame {
-        header: parse_file_header(buf)?,
+        header,
         body: None,
         next_frame_offset: next_frame_at,
     })
@@ -653,11 +1103,13 @@ fn parse_file_header<B: Buf>(buf: B) -> Result<FileHeader, ParseError> {
     Ok(ProtoFileInfo::decode(buf)?.try_into()?)
 }
 
+#[instrument(skip_all)]
 async fn read_frame<IO: WalSource, B: BufMut + Buf>(
     mut io: IO,
     mut buf: B,
 ) -> Result<ReadFrameItem, WalError> {
     let mut offset = io.stream_position().await?;
+    tracing::trace!(offset = offset, "reading frame");
     if buf.remaining_mut() < PREAMBLE_LEN {
         return Err(ParseError::BufferTooSmall {
             req: PREAMBLE_LEN,
@@ -676,6 +1128,7 @@ async fn read_frame<IO: WalSource, B: BufMut + Buf>(
         ))
     };
     let header_len = preamble.header as usize;
+    tracing::trace!(header_len = header_len, body = ?body, "preamble read");
 
     if buf.remaining_mut() < header_len {
         return Err(ParseError::BufferTooSmall {
@@ -684,20 +1137,22 @@ async fn read_frame<IO: WalSource, B: BufMut + Buf>(
         })?;
     }
     io.read_exact_buffered(&mut buf, header_len).await?;
-    Ok(parse_frame(
+    Ok(decode_frame(
         &mut buf,
         body,
         offset + preamble.content_len(),
     )?)
 }
 
-fn parse_frame<B: Buf>(
+#[instrument(skip(buf))]
+fn decode_frame<B: Buf>(
     buf: &mut B,
     body: Option<Position<u64, u32>>,
     next_frame_at: u64,
 ) -> Result<ReadFrameItem, ParseError> {
+    tracing::trace!("decoding frame");
     let proto_frame_header = ProtoFrameHeader::decode(buf)?;
-    match proto_frame_header.r#type {
+    let res = match proto_frame_header.r#type {
         Some(ProtoFrameType::TxBegin(begin)) => Ok(ReadFrameItem::TxBegin(ReadFrame {
             header: begin.try_into()?,
             body,
@@ -736,71 +1191,83 @@ fn parse_frame<B: Buf>(
             next_frame_offset: next_frame_at,
         })),
         None => Err(FrameError::FrameTypeInvalid)?,
+    };
+    match &res {
+        Ok(res) => {
+            tracing::trace!(frame = %res, "frame decoded");
+        }
+        Err(err) => tracing::error!(error = %err, "error decoding frame"),
     }
+    res
 }
 
 fn encode_frame<B: BufMut>(mut buf: B, frame: WriteFrame) -> Result<usize, EncodeError> {
-    Ok(match frame {
-        WriteFrame::TxBegin(begin) => {
-            let begin = Into::<protos::frame_header::TxBegin>::into(&begin);
-            let preamble = Preamble::header_only(begin.encoded_len() as u16);
-            let mut len = encode_preamble(&preamble, &mut buf)?;
-            begin.encode(&mut buf)?;
-            len += begin.encoded_len();
-            len
+    let (header, preamble) = {
+        match frame {
+            WriteFrame::TxBegin(begin) => {
+                let header = protos::FrameHeader {
+                    r#type: Some(protos::frame_header::Type::TxBegin((&begin).into())),
+                };
+                let preamble = Preamble::header_only(header.encoded_len() as u16);
+                (header, preamble)
+            }
+            WriteFrame::TxCommit(commit) => {
+                let header = protos::FrameHeader {
+                    r#type: Some(protos::frame_header::Type::TxCommit((&commit).into())),
+                };
+                let preamble = Preamble::header_only(header.encoded_len() as u16);
+                (header, preamble)
+            }
+            WriteFrame::Block((block, padding1, padding2)) => {
+                let header = protos::FrameHeader {
+                    r#type: Some(protos::frame_header::Type::Block((&block).into())),
+                };
+                let preamble = Preamble::full(
+                    header.encoded_len() as u16,
+                    padding1,
+                    Some(block.length),
+                    padding2,
+                );
+                (header, preamble)
+            }
+            WriteFrame::Cluster((cluster, _)) => {
+                let header = protos::FrameHeader {
+                    r#type: Some(protos::frame_header::Type::Cluster(
+                        protos::frame_header::Cluster {
+                            content_id: cluster.content_id.clone(),
+                        },
+                    )),
+                };
+                let preamble = Preamble::full(
+                    header.encoded_len() as u16,
+                    None,
+                    cluster.encoded_len() as u32,
+                    None,
+                );
+                (header, preamble)
+            }
+            WriteFrame::State((state, _)) => {
+                let header = protos::FrameHeader {
+                    r#type: Some(protos::frame_header::Type::State(
+                        protos::frame_header::State {
+                            content_id: state.content_id.clone(),
+                        },
+                    )),
+                };
+                let preamble = Preamble::full(
+                    header.encoded_len() as u16,
+                    None,
+                    state.encoded_len() as u32,
+                    None,
+                );
+                (header, preamble)
+            }
         }
-        WriteFrame::TxCommit(commit) => {
-            let commit = Into::<protos::frame_header::TxCommit>::into(&commit);
-            let preamble = Preamble::header_only(commit.encoded_len() as u16);
-            let mut len = encode_preamble(&preamble, &mut buf)?;
-            commit.encode(&mut buf)?;
-            len += commit.encoded_len();
-            len
-        }
-        WriteFrame::Block((block, padding1, padding2)) => {
-            let block = Into::<protos::frame_header::Block>::into(&block);
-            let preamble = Preamble::full(
-                block.encoded_len() as u16,
-                padding1,
-                Some(block.length),
-                padding2,
-            );
-            let mut len = encode_preamble(&preamble, &mut buf)?;
-            block.encode(&mut buf)?;
-            len += block.encoded_len();
-            len
-        }
-        WriteFrame::Cluster(cluster) => {
-            let header = protos::frame_header::Cluster {
-                content_id: cluster.content_id.clone(),
-            };
-            let preamble = Preamble::full(
-                header.encoded_len() as u16,
-                None,
-                cluster.encoded_len() as u32,
-                None,
-            );
-            let mut len = encode_preamble(&preamble, &mut buf)?;
-            cluster.encode(&mut buf)?;
-            len += cluster.encoded_len();
-            len
-        }
-        WriteFrame::State(state) => {
-            let header = protos::frame_header::State {
-                content_id: state.content_id.clone(),
-            };
-            let preamble = Preamble::full(
-                header.encoded_len() as u16,
-                None,
-                state.encoded_len() as u32,
-                None,
-            );
-            let mut len = encode_preamble(&preamble, &mut buf)?;
-            state.encode(&mut buf)?;
-            len += state.encoded_len();
-            len
-        }
-    })
+    };
+    let mut len = encode_preamble(&preamble, &mut buf)?;
+    header.encode(&mut buf)?;
+    len += header.encoded_len();
+    Ok(len)
 }
 
 pub enum ReadFrameItem {
@@ -809,6 +1276,42 @@ pub enum ReadFrameItem {
     Block(ReadFrame<Block>),
     Cluster(ReadFrame<ClusterId>),
     State(ReadFrame<Commit>),
+}
+
+impl Display for ReadFrameItem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            Self::TxBegin(frame) => {
+                write!(
+                    f,
+                    "TxBegin[id={}, preceding_content_id={}, created={}]",
+                    frame.header.transaction_id,
+                    frame.header.preceding_content_id,
+                    frame.header.created
+                )
+            }
+            Self::TxCommit(frame) => {
+                write!(
+                    f,
+                    "TxCommit[id={}, content_id={}, committed={}]",
+                    frame.header.transaction_id, frame.header.content_id, frame.header.committed
+                )
+            }
+            Self::Block(frame) => {
+                write!(
+                    f,
+                    "Block[id={}, length={}]",
+                    frame.header.content_id, frame.header.length
+                )
+            }
+            Self::Cluster(frame) => {
+                write!(f, "Cluster[content_id={}]", frame.header)
+            }
+            Self::State(frame) => {
+                write!(f, "State[content_id={}]", frame.header)
+            }
+        }
+    }
 }
 
 impl ReadFrameItem {
@@ -832,17 +1335,12 @@ pub struct TxBegin {
 pub struct TxCommit {
     transaction_id: TxId,
     content_id: Commit,
-    commited: DateTime<Utc>,
+    committed: DateTime<Utc>,
 }
 
 struct Block {
     content_id: BlockId,
     length: u32,
-}
-
-struct State {
-    content_id: Commit,
-    clusters: Vec<ClusterId>,
 }
 
 pub struct ReadFrame<T> {
@@ -855,10 +1353,41 @@ enum WriteFrame<'a> {
     TxBegin(TxBegin),
     TxCommit(TxCommit),
     Block((Block, Option<u32>, Option<u32>)),
-    Cluster(&'a protos::Cluster),
-    State(&'a protos::State),
+    Cluster((&'a protos::Cluster, &'a ClusterId)),
+    State((&'a protos::State, &'a Commit)),
 }
 
+impl<'a> Display for WriteFrame<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TxBegin(tx_begin) => {
+                write!(
+                    f,
+                    "TxBegin[id={}, preceding_content_id={}, created={}]",
+                    tx_begin.transaction_id, tx_begin.preceding_content_id, tx_begin.created
+                )
+            }
+            Self::TxCommit(tx_commit) => {
+                write!(
+                    f,
+                    "TxCommit[id={}, content_id={}, committed={}]",
+                    tx_commit.transaction_id, tx_commit.content_id, tx_commit.committed
+                )
+            }
+            Self::Block((block, _, _)) => {
+                write!(f, "Block[id={}, length={}]", block.content_id, block.length)
+            }
+            Self::Cluster((_, id)) => {
+                write!(f, "Cluster[content_id={}]", id)
+            }
+            Self::State((_, id)) => {
+                write!(f, "State[content_id={}]", id)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Preamble {
     header: u16,
     padding1: u32,
@@ -973,6 +1502,21 @@ pub enum WalError {
     /// Rolling back the last transaction failed
     #[error("io error")]
     RollbackError(#[from] RollbackError),
+    /// Unexpected frame type found
+    #[error("Frame type {exp} expected, but found different frame type")]
+    UnexpectedFrameType { exp: String },
+    /// Incorrect preceding commit found
+    #[error(
+        "Preceding commit with content id {exp} expected, but found {found} content id instead"
+    )]
+    IncorrectPrecedingCommit { exp: Commit, found: Commit },
+    /// Dangling Transaction detected
+    #[error("Dangling tx detected, tx [{tx_id}] never committed")]
+    DanglingTxDetected { tx_id: TxId },
+    #[error("TxId {exp} expected, but found {found} instead")]
+    IncorrectTxId { exp: TxId, found: TxId },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 #[derive(Error, Debug)]
@@ -1042,9 +1586,9 @@ pub enum HeaderError {
     /// File Id Missing or Invalid
     #[error("File Id Missing or Invalid")]
     FileIdInvalid,
-    /// Vbd Id Missing or Invalid
-    #[error("Vbd Id Missing or Invalid")]
-    VbdIdInvalid,
+    /// Vbd Specs Missing or Invalid
+    #[error("Vbd Specs Missing or Invalid")]
+    VbdSpecsInvalid,
     /// Created Missing or Invalid
     #[error("Creation Timestamp Missing or Invalid")]
     CreatedInvalid,
@@ -1107,7 +1651,7 @@ pub enum StateFrameError {
 }
 
 mod protos {
-    use crate::vbd::wal::HeaderError::{CreatedInvalid, FileIdInvalid, VbdIdInvalid};
+    use crate::vbd::wal::HeaderError::{CreatedInvalid, FileIdInvalid, VbdSpecsInvalid};
     use crate::vbd::wal::{BlockFrameError, FrameError, HeaderError, TxId, WalId};
     use crate::vbd::{ClusterId, Commit};
     use uuid::Uuid;
@@ -1160,7 +1704,7 @@ mod protos {
                     .ok_or(ContentIdInvalid)?
                     .try_into()
                     .map_err(|_| ContentIdInvalid)?,
-                commited: value
+                committed: value
                     .committed
                     .ok_or(TimestampInvalid)?
                     .try_into()
@@ -1174,7 +1718,7 @@ mod protos {
             let mut commit = frame_header::TxCommit::default();
             commit.transaction_id = Some(value.transaction_id.into());
             commit.content_id = Some((&value.content_id.0).into());
-            commit.committed = Some(value.commited.into());
+            commit.committed = Some(value.committed.into());
             commit
         }
     }
@@ -1184,7 +1728,11 @@ mod protos {
 
         fn try_from(value: FileInfo) -> Result<Self, Self::Error> {
             let wal_id = value.wal_file_id.map(|id| id.into()).ok_or(FileIdInvalid)?;
-            let vbd_id = value.vbd_id.map(|id| id.into()).ok_or(VbdIdInvalid)?;
+            let specs = value
+                .specs
+                .map(|s| s.try_into().ok())
+                .flatten()
+                .ok_or(VbdSpecsInvalid)?;
             let created = value
                 .created
                 .map(|c| c.try_into().map_err(|_| CreatedInvalid))
@@ -1193,7 +1741,7 @@ mod protos {
 
             Ok(Self {
                 wal_id,
-                vbd_id,
+                specs,
                 created,
                 preceding_wal_id,
             })
@@ -1204,7 +1752,7 @@ mod protos {
         fn from(value: &super::FileHeader) -> Self {
             FileInfo {
                 wal_file_id: Some(value.wal_id.into()),
-                vbd_id: Some(value.vbd_id.into()),
+                specs: Some((&value.specs).into()),
                 created: Some(value.created.into()),
                 preceding_wal_file: value.preceding_wal_id.map(|i| i.into()),
             }

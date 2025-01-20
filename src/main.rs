@@ -6,6 +6,8 @@ use sia_vbd::nbd::Builder;
 use sia_vbd::vbd::nbd_device::NbdDevice;
 use sia_vbd::vbd::{BlockSize, ClusterSize, VirtualBlockDevice};
 use std::path::PathBuf;
+use tracing::Level;
+use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
 
@@ -35,8 +37,8 @@ struct Arguments {
     meta_hash: HashAlgorithm,
     /// Maximum write buffer size.
     #[arg(long, short = 'x')]
-    #[clap(default_value = "128 MiB")]
-    max_buffer_size: ByteSize,
+    #[clap(default_value = "4 MiB")]
+    max_write_buffer: ByteSize,
     /// URL of address to listen on.
     /// For tcp, the format is 'tcp://host:port'.
     /// On unix platforms, unix domain sockets are also supported: 'unix:///path/to/socket'.
@@ -58,10 +60,24 @@ struct Arguments {
     #[arg(long, short = 'y')]
     #[clap(default_value = "128 MiB")]
     max_wal_size: ByteSize,
+    /// Maximum Transaction Size
+    /// Must be smaller than maximum WAL file size
+    #[arg(long, short = 'z')]
+    #[clap(default_value = "16 MiB")]
+    max_tx_size: ByteSize,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        //.without_time()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(Level::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+
     let arguments = Arguments::parse();
     let builder = match arguments
         .listen_address
@@ -115,9 +131,10 @@ async fn main() -> anyhow::Result<()> {
                     arguments.block_size,
                     arguments.content_hash,
                     arguments.meta_hash,
-                    arguments.max_buffer_size.as_u64() as usize,
+                    arguments.max_write_buffer.as_u64() as usize,
                     arguments.wal_dir,
                     arguments.max_wal_size.as_u64(),
+                    arguments.max_tx_size.as_u64(),
                 )
                 .await?,
             ),
