@@ -2,9 +2,7 @@ pub mod nbd_device;
 pub(crate) mod wal;
 
 use crate::hash::{Hash, HashAlgorithm};
-use crate::vbd::wal::{
-    Position, RollbackError, TokioFileWal, WalError, WalId, WalReader, WalWriter,
-};
+use crate::vbd::wal::{ReadOnly, ReadWrite, RollbackError, TokioWalFile, WalError, WalId};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use std::cmp::min;
@@ -19,14 +17,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 use uuid::Uuid;
 
 const BS16K: usize = 16 * 1024;
 const BS64K: usize = 64 * 1024;
 const BS256K: usize = 256 * 1024;
 
-pub(crate) struct ContentId<T>(Hash, PhantomData<T>);
+pub struct ContentId<T>(Hash, PhantomData<T>);
 
 impl<T> From<Hash> for ContentId<T> {
     fn from(value: Hash) -> Self {
@@ -124,8 +121,14 @@ impl<T> Deref for TypedUuid<T> {
     }
 }
 
-pub type Commit = ContentId<State>;
+pub struct State_;
+
+pub type Commit = ContentId<State_>;
 pub type VbdId = TypedUuid<VirtualBlockDevice>;
+
+type WalTx = wal::writer::Tx<TokioWalFile<ReadWrite>>;
+type WalReader = wal::reader::WalReader<TokioWalFile<ReadOnly>>;
+type WalWriter = wal::writer::WalWriter<TokioWalFile<ReadWrite>>;
 
 pub struct VirtualBlockDevice {
     config: Arc<Config>,
@@ -151,7 +154,7 @@ pub(crate) struct FixedSpecs {
     pub meta_hash: HashAlgorithm,
 }
 
-pub(crate) enum State {
+enum State {
     Committed(Committed),
     Uncommitted(Uncommitted),
     Poisoned,
@@ -213,53 +216,53 @@ impl Clusters {
 struct Committed {
     commit: Commit,
     clusters: Clusters,
-    wal: Option<(WalWriter<TokioFileWal>, PathBuf)>,
+    wal: Option<WalWriter>,
 }
 
 impl Committed {
     async fn begin(mut self, config: Arc<Config>) -> Result<Uncommitted, (BlockError, Self)> {
         async fn prepare_wal(
-            mut wal: Option<(WalWriter<TokioFileWal>, PathBuf)>,
+            mut wal: Option<WalWriter>,
             config: &Config,
-        ) -> Result<(WalWriter<TokioFileWal>, PathBuf), BlockError> {
+        ) -> Result<WalWriter, BlockError> {
             let mut previous_wal_id = None;
-            if let Some((existing_wal, wal_path)) = wal.take() {
+            if let Some(existing_wal) = wal.take() {
                 if existing_wal.remaining().await? <= config.max_tx_size {
                     previous_wal_id = Some(existing_wal.id().clone());
                 } else {
-                    wal = Some((existing_wal, wal_path));
+                    wal = Some(existing_wal);
                 }
             };
 
             if wal.is_none() {
                 // start a new wal
                 let wal_id: WalId = Uuid::now_v7().into();
-                let wal_path = config.wal_dir.join(format!("{}.wal", wal_id));
-                let wal_file = tokio::fs::File::create_new(&wal_path).await?;
-                wal = Some((
+                let file = TokioWalFile::create_new(config.wal_dir.join(format!("{}.wal", wal_id)))
+                    .await?;
+
+                wal = Some(
                     WalWriter::new(
-                        TokioFileWal::new(wal_file),
+                        file,
                         wal_id,
                         previous_wal_id,
                         config.max_wal_size,
                         config.specs.clone(),
                     )
                     .await?,
-                    wal_path,
-                ));
+                );
             }
 
             Ok(wal.expect("wal should be Some"))
         }
 
-        let (wal, wal_path) = match prepare_wal(self.wal.take(), &config).await {
+        let wal = match prepare_wal(self.wal.take(), &config).await {
             Ok(wal) => wal,
             Err(err) => {
                 return Err((err, self));
             }
         };
 
-        match Uncommitted::new(wal, wal_path, self.commit.clone(), self.clusters, config).await {
+        match Uncommitted::new(wal, self.commit.clone(), self.clusters, config).await {
             Ok(u) => Ok(u),
             Err((err, (clusters, wal))) => {
                 let wal = wal.ok();
@@ -274,18 +277,6 @@ impl Committed {
             }
         }
     }
-}
-
-struct Uncommitted {
-    previous_commit: Commit,
-    committed_clusters: Clusters,
-    config: Arc<Config>,
-    last_modified: Instant,
-    data: ModifiedData,
-    wal_tx: wal::Tx<TokioFileWal>,
-    wal_path: PathBuf,
-    wal_reader: Mutex<Option<WalReader<tokio_util::compat::Compat<tokio::fs::File>>>>,
-    wal_blocks: HashMap<BlockId, Position<u64, u32>>,
 }
 
 struct ModifiedData {
@@ -332,7 +323,7 @@ impl ModifiedData {
         &mut self,
         config: &Config,
         committed_clusters: &Clusters,
-        wal: &mut wal::Tx<TokioFileWal>,
+        wal: &mut WalTx,
         wal_blocks: &mut HashMap<BlockId, Position<u64, u32>>,
     ) -> Result<(), BlockError> {
         for ((cluster_no, block_no), data) in self.unflushed_blocks.drain() {
@@ -365,27 +356,28 @@ impl ModifiedData {
     }
 }
 
+struct Uncommitted {
+    previous_commit: Commit,
+    committed_clusters: Clusters,
+    config: Arc<Config>,
+    last_modified: Instant,
+    data: ModifiedData,
+    wal_tx: WalTx,
+    wal_reader: Mutex<Option<WalReader>>,
+    wal_blocks: HashMap<BlockId, Position<u64, u32>>,
+}
+
 impl Uncommitted {
     async fn new(
-        wal: WalWriter<TokioFileWal>,
-        wal_path: PathBuf,
+        wal: WalWriter,
         previous_commit: Commit,
         committed_clusters: Clusters,
         config: Arc<Config>,
-    ) -> Result<
-        Self,
-        (
-            BlockError,
-            (
-                Clusters,
-                Result<(WalWriter<TokioFileWal>, PathBuf), RollbackError>,
-            ),
-        ),
-    > {
+    ) -> Result<Self, (BlockError, (Clusters, Result<WalWriter, RollbackError>))> {
         let wal_tx = match wal.begin(previous_commit.clone(), config.max_tx_size).await {
             Ok(wal) => wal,
             Err((e, wal)) => {
-                return Err((e.into(), (committed_clusters, wal.map(|w| (w, wal_path)))));
+                return Err((e.into(), (committed_clusters, wal)));
             }
         };
 
@@ -400,7 +392,6 @@ impl Uncommitted {
             last_modified: Instant::now(),
             wal_tx,
             wal_blocks: HashMap::default(),
-            wal_path,
             wal_reader: Mutex::new(None),
         })
     }
@@ -420,14 +411,17 @@ impl Uncommitted {
                         if lock.is_none() {
                             *lock = Some(
                                 WalReader::new(
-                                    tokio::fs::File::open(&self.wal_path).await?.compat(),
+                                    TokioWalFile::open(self.wal_tx.as_ref().path()).await?,
                                 )
                                 .await?,
-                            )
+                            );
                         }
 
                         let wal_reader = lock.as_mut().unwrap();
-                        wal_reader.block(&block_id, pos).await.map(|b| Some(b.data))?
+                        wal_reader
+                            .block(&block_id, pos)
+                            .await
+                            .map(|b| Some(b.data))?
                     } else {
                         todo!()
                     }
@@ -481,7 +475,7 @@ impl Uncommitted {
             mut modified_data: ModifiedData,
             committed_clusters: &Clusters,
             config: &Config,
-            wal: &mut wal::Tx<TokioFileWal>,
+            wal: &mut WalTx,
             wal_blocks: &mut HashMap<BlockId, Position<u64, u32>>,
         ) -> Result<(Commit, Clusters), BlockError> {
             modified_data
@@ -530,7 +524,7 @@ impl Uncommitted {
                     Committed {
                         commit: self.previous_commit,
                         clusters: self.committed_clusters,
-                        wal: wal.map(|w| (w, self.wal_path)),
+                        wal,
                     },
                 ));
             }
@@ -539,7 +533,7 @@ impl Uncommitted {
         match self.wal_tx.commit(&new_commit).await {
             Ok((wal, tx_details)) => {
                 match wal
-                    .io()
+                    .as_ref()
                     .as_file()
                     .metadata()
                     .await
@@ -555,7 +549,7 @@ impl Uncommitted {
                 Ok(Committed {
                     commit: new_commit,
                     clusters,
-                    wal: Some((wal, self.wal_path)),
+                    wal: Some(wal),
                 })
             }
             Err((e, rbr)) => {
@@ -565,7 +559,7 @@ impl Uncommitted {
                     Committed {
                         commit: self.previous_commit,
                         clusters: self.committed_clusters,
-                        wal: wal.map(|w| (w, self.wal_path)),
+                        wal,
                     },
                 ))
             }
@@ -577,7 +571,7 @@ impl Uncommitted {
         Committed {
             commit: self.previous_commit,
             clusters: self.committed_clusters,
-            wal: wal.map(|w| (w, self.wal_path)),
+            wal,
         }
     }
 }
@@ -873,10 +867,10 @@ impl VirtualBlockDevice {
     }
 }
 
-pub(crate) type ClusterId = ContentId<Cluster>;
+pub type ClusterId = ContentId<Cluster>;
 
 #[derive(Clone)]
-pub(crate) struct Block {
+pub struct Block {
     content_id: BlockId,
     data: Bytes,
 }
@@ -962,7 +956,7 @@ impl From<ClusterMut> for Cluster {
 }
 
 #[derive(Clone)]
-pub(crate) struct Cluster {
+pub struct Cluster {
     content_id: ClusterId,
     blocks: Vec<BlockId>,
 }
@@ -1055,7 +1049,7 @@ impl FromStr for BlockSize {
     }
 }
 
-type BlockId = ContentId<Block>;
+pub type BlockId = ContentId<Block>;
 
 impl BlockId {
     fn new<D: AsRef<[u8]>>(specs: &FixedSpecs, data: D) -> Result<Self, BlockError> {
@@ -1084,6 +1078,18 @@ impl BlockId {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Position<O, L> {
+    pub offset: O,
+    pub length: L,
+}
+
+impl<O, L> Position<O, L> {
+    fn new(offset: O, length: L) -> Self {
+        Self { offset, length }
+    }
+}
+
 /// Returns true if the supplied byte slice only contains `0x00`
 fn all_zeroes(buffer: &[u8]) -> bool {
     let len = buffer.len();
@@ -1100,7 +1106,7 @@ fn all_zeroes(buffer: &[u8]) -> bool {
 }
 
 #[derive(Error, Debug)]
-enum BlockError {
+pub enum BlockError {
     #[error("data length {data_len} does not correspond to block size {block_size}")]
     InvalidDataLength { block_size: usize, data_len: usize },
     #[error("the given block number {block_no} is out of range")]
@@ -1110,7 +1116,7 @@ enum BlockError {
     #[error("cluster with id {cluster_id} not found")]
     ClusterNoFound { cluster_id: ClusterId },
     #[error("WAL error")]
-    WalError(#[from] wal::WalError),
+    WalError(#[from] WalError),
     #[error("IO error")]
     IoError(#[from] std::io::Error),
 }

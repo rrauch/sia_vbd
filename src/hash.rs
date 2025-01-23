@@ -81,7 +81,7 @@ impl Hasher {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum Hash {
+pub enum Hash {
     Tent([u8; 20]),
     Blake3(blake3::Hash),
     XXH3([u8; 16]),
