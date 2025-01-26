@@ -8,7 +8,10 @@ use crate::vbd::wal::{
     TxCommit, TxDetailBuilder, TxDetails, WalError, WalId, WalSource, MAGIC_NUMBER, PREAMBLE_LEN,
     VALID_BODY_LEN, VALID_HEADER_LEN, VALID_PADDING_LEN,
 };
-use crate::vbd::{BlockError, BlockId, ClusterId, ClusterMut, Commit, FixedSpecs, Position, VbdId};
+use crate::vbd::{
+    BlockId, ClusterId, ClusterMut, Commit, CommitId, CommitMut, FixedSpecs, Position,
+    VbdId,
+};
 use crate::AsyncReadExtBuffered;
 use anyhow::anyhow;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -41,7 +44,7 @@ impl<IO: WalSource> WalReader<IO> {
         })
     }
 
-    pub fn transactions(&mut self, preceding_content_id: Option<Commit>) -> TxStream<&mut IO> {
+    pub fn transactions(&mut self, preceding_content_id: Option<CommitId>) -> TxStream<&mut IO> {
         TxStream::new(
             &mut self.io,
             self.first_frame_offset,
@@ -78,8 +81,7 @@ impl<IO: WalSource> WalReader<IO> {
         }
 
         let specs = self.header.specs.clone();
-        let block = crate::vbd::Block::new(&specs, self.read(pos).await?)
-            .map_err(|e| <BlockError as Into<anyhow::Error>>::into(e))?;
+        let block = crate::vbd::Block::from_bytes(&specs, self.read(pos).await?);
         if &block.content_id != block_id {
             Err(anyhow!(
                 "BlockIds do not match: {} != {}",
@@ -126,38 +128,46 @@ impl<IO: WalSource> WalReader<IO> {
     }
 
     #[instrument(skip(self))]
-    pub async fn state(
+    pub async fn commit(
         &mut self,
-        commit: &Commit,
+        commit_id: &CommitId,
         pos: &Position<u64, u32>,
-    ) -> Result<Vec<ClusterId>, WalError> {
-        tracing::debug!("reading STATE from WAL");
-        let state = protos::State::decode(self.read(pos).await?)
+    ) -> Result<Commit, WalError> {
+        tracing::debug!("reading COMMIT from WAL");
+        let commit = protos::State::decode(self.read(pos).await?)
             .map_err(|p| WalError::ParseError(ParseError::ProtoError(p)))?;
 
-        let cluster_ids = state
+        let cluster_ids = commit
             .cluster_ids
             .into_iter()
             .map(|h| <crate::protos::Hash as TryInto<ClusterId>>::try_into(h))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let state_commit: Commit = (&cluster_ids, &self.header.specs).into();
+        let commit =
+            CommitMut::from_cluster_ids(cluster_ids.into_iter(), self.header.specs.clone())
+                .finalize();
 
-        if &state_commit != commit {
+        if commit.content_id() != commit_id {
             Err(anyhow!(
-                "Commits do not match: {} != {}",
-                state_commit,
-                commit
+                "Commit Ids do not match: {} != {}",
+                commit.content_id(),
+                commit_id
             ))?;
         }
 
-        Ok(cluster_ids)
+        Ok(commit)
     }
 }
 
 impl<IO> WalReader<IO> {
     pub fn header(&self) -> &FileHeader {
         &self.header
+    }
+}
+
+impl<IO> AsRef<IO> for WalReader<IO> {
+    fn as_ref(&self) -> &IO {
+        &self.io
     }
 }
 
@@ -171,7 +181,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
     fn new(
         io: IO,
         first_frame_offset: u64,
-        preceding_cid: Option<Commit>,
+        preceding_cid: Option<CommitId>,
         wal_id: WalId,
         specs: &'a FixedSpecs,
     ) -> Self {
@@ -184,7 +194,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
 
     fn next_tx_begin(
         mut frame_stream: FrameStream<'a, IO>,
-        preceding_cid: Option<Commit>,
+        preceding_cid: Option<CommitId>,
         wal_id: WalId,
         vbd_id: VbdId,
     ) -> BoxFuture<
@@ -270,7 +280,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                     }
                     ReadFrameItem::State(state) => {
                         if let Some(body) = state.body {
-                            tx_builder.states.insert(state.header, body);
+                            tx_builder.commits.insert(state.header, body);
                         }
                         Ok(Either::Left(tx_builder))
                     }
@@ -286,7 +296,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
 }
 
 enum TxStreamState<'a, IO: WalSource> {
-    New(FrameStream<'a, IO>, Option<Commit>),
+    New(FrameStream<'a, IO>, Option<CommitId>),
     AwaitingNextTxBegin(
         BoxFuture<
             'a,
@@ -353,7 +363,7 @@ impl<'a, IO: WalSource + 'a> Stream for TxStream<'a, IO> {
                     Poll::Ready((Ok(Either::Right(tx_details)), frame_stream)) => {
                         self.state = TxStreamState::AwaitingNextTxBegin(Self::next_tx_begin(
                             frame_stream,
-                            Some(tx_details.commit.clone()),
+                            Some(tx_details.commit_id.clone()),
                             self.wal_id.clone(),
                             self.specs.vbd_id.clone(),
                         ));
@@ -612,7 +622,7 @@ enum ReadFrameItem {
     TxCommit(ReadFrame<TxCommit>),
     Block(ReadFrame<Block>),
     Cluster(ReadFrame<ClusterId>),
-    State(ReadFrame<Commit>),
+    State(ReadFrame<CommitId>),
 }
 
 impl Display for ReadFrameItem {

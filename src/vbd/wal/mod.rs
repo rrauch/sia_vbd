@@ -2,7 +2,7 @@ mod protos;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
-use crate::vbd::{BlockId, ClusterId, Commit, FixedSpecs, Position, TypedUuid, VbdId};
+use crate::vbd::{BlockId, ClusterId, CommitId, FixedSpecs, Position, TypedUuid, VbdId};
 use chrono::{DateTime, Duration, Utc};
 use futures::{AsyncRead, AsyncSeek, AsyncWrite};
 use prost::DecodeError;
@@ -140,14 +140,14 @@ pub struct TxDetails {
     pub tx_id: TxId,
     pub wal_id: WalId,
     pub vbd_id: VbdId,
-    pub commit: Commit,
-    pub preceding_commit: Commit,
+    pub commit_id: CommitId,
+    pub preceding_commit_id: CommitId,
     pub created: DateTime<Utc>,
     pub committed: DateTime<Utc>,
     //pub position: Position<u64, u64>,
     pub blocks: HashMap<BlockId, Position<u64, u32>>,
     pub clusters: HashMap<ClusterId, Position<u64, u32>>,
-    pub states: HashMap<Commit, Position<u64, u32>>,
+    pub commits: HashMap<CommitId, Position<u64, u32>>,
 }
 
 impl TxDetails {
@@ -165,11 +165,11 @@ struct TxDetailBuilder {
     tx_id: TxId,
     wal_id: WalId,
     vbd_id: VbdId,
-    preceding_commit: Commit,
+    preceding_commit_id: CommitId,
     created: DateTime<Utc>,
     blocks: HashMap<BlockId, Position<u64, u32>>,
     clusters: HashMap<ClusterId, Position<u64, u32>>,
-    states: HashMap<Commit, Position<u64, u32>>,
+    commits: HashMap<CommitId, Position<u64, u32>>,
 }
 
 impl TxDetailBuilder {
@@ -177,33 +177,33 @@ impl TxDetailBuilder {
         tx_id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
-        preceding_commit: Commit,
+        preceding_commit_id: CommitId,
         created: DateTime<Utc>,
     ) -> Self {
         Self {
             tx_id,
             wal_id,
             vbd_id,
-            preceding_commit,
+            preceding_commit_id,
             created,
             blocks: HashMap::default(),
             clusters: HashMap::default(),
-            states: HashMap::default(),
+            commits: HashMap::default(),
         }
     }
 
-    fn build(self, commit: Commit, committed: DateTime<Utc>) -> TxDetails {
+    fn build(self, commit: CommitId, committed: DateTime<Utc>) -> TxDetails {
         TxDetails {
             tx_id: self.tx_id,
             wal_id: self.wal_id,
             vbd_id: self.vbd_id,
-            commit,
-            preceding_commit: self.preceding_commit,
+            commit_id: commit,
+            preceding_commit_id: self.preceding_commit_id,
             created: self.created,
             committed,
             blocks: self.blocks,
             clusters: self.clusters,
-            states: self.states,
+            commits: self.commits,
         }
     }
 }
@@ -214,13 +214,13 @@ pub type TxId = TypedUuid<Tx_>;
 
 struct TxBegin {
     transaction_id: TxId,
-    preceding_content_id: Commit,
+    preceding_content_id: CommitId,
     created: DateTime<Utc>,
 }
 
 struct TxCommit {
     transaction_id: TxId,
-    content_id: Commit,
+    content_id: CommitId,
     committed: DateTime<Utc>,
 }
 
@@ -277,16 +277,16 @@ impl Preamble {
 #[derive(Error, Debug)]
 pub enum WalError {
     /// WAL File Parse error
-    #[error("WAL File Parse error")]
+    #[error(transparent)]
     ParseError(#[from] ParseError),
     /// WAL File Encode error
-    #[error("WAL File Encode error")]
+    #[error(transparent)]
     EncodeError(#[from] EncodeError),
     /// An `IO` error occurred reading from or writing to the wal
-    #[error("io error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
     /// Rolling back the last transaction failed
-    #[error("io error")]
+    #[error(transparent)]
     RollbackError(#[from] RollbackError),
     /// Unexpected frame type found
     #[error("Frame type {exp} expected, but found different frame type")]
@@ -295,7 +295,7 @@ pub enum WalError {
     #[error(
         "Preceding commit with content id {exp} expected, but found {found} content id instead"
     )]
-    IncorrectPrecedingCommit { exp: Commit, found: Commit },
+    IncorrectPrecedingCommit { exp: CommitId, found: CommitId },
     /// Dangling Transaction detected
     #[error("Dangling tx detected, tx [{tx_id}] never committed")]
     DanglingTxDetected { tx_id: TxId },
@@ -307,7 +307,7 @@ pub enum WalError {
 
 #[derive(Error, Debug)]
 pub enum RollbackError {
-    #[error("io error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error("transaction state unclear")]
     UnclearState,
@@ -325,7 +325,7 @@ pub enum EncodeError {
     #[error("Maximum Wal size exceeded")]
     MaxWalSizeExceeded,
     /// Protobuf related parsing error
-    #[error("Protobuf related parsing error")]
+    #[error(transparent)]
     ProtoError(#[from] prost::EncodeError),
 }
 
@@ -335,19 +335,19 @@ pub enum ParseError {
     #[error("Invalid Magic Number")]
     InvalidMagicNumber,
     /// Preamble error
-    #[error("Preamble error")]
+    #[error(transparent)]
     PreambleError(#[from] PreambleError),
     /// Header error
-    #[error("Header error")]
+    #[error(transparent)]
     HeaderError(#[from] HeaderError),
     /// Frame error
-    #[error("Frame error")]
+    #[error(transparent)]
     FrameError(#[from] FrameError),
     /// Buffer size insufficient
     #[error("Buffer size too small, required {req} != {rem} remaining")]
     BufferTooSmall { req: usize, rem: usize },
     /// Protobuf related parsing error
-    #[error("Protobuf related parsing error")]
+    #[error(transparent)]
     ProtoError(#[from] DecodeError),
 }
 
@@ -386,16 +386,16 @@ pub enum FrameError {
     #[error("File Type missing or invalid")]
     FrameTypeInvalid,
     /// Commit Frame error
-    #[error("Commit Frame error")]
+    #[error(transparent)]
     CommitFrameError(#[from] CommitFrameError),
     /// Block Frame error
-    #[error("Block Frame error")]
+    #[error(transparent)]
     BlockFrameError(#[from] BlockFrameError),
     /// Cluster Frame error
-    #[error("Cluster Frame error")]
+    #[error(transparent)]
     ClusterFrameError(#[from] ClusterFrameError),
     /// State Frame error
-    #[error("State Frame error")]
+    #[error(transparent)]
     StateFrameError(#[from] StateFrameError),
 }
 

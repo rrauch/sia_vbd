@@ -216,6 +216,10 @@ impl From<BlockError> for Error {
                 format!("wal related error: {}", e),
             )),
             BlockError::IoError(e) => Self::IoError(e),
+            BlockError::Other(e) => Self::IoError(std::io::Error::new(
+                ErrorKind::Other,
+                format!("other error: {}", e),
+            )),
         }
     }
 }

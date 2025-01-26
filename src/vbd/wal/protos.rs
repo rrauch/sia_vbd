@@ -1,6 +1,6 @@
 use crate::vbd::wal::HeaderError::{CreatedInvalid, FileIdInvalid, VbdSpecsInvalid};
 use crate::vbd::wal::{BlockFrameError, FrameError, HeaderError, TxId, WalId};
-use crate::vbd::{ClusterId, Commit};
+use crate::vbd::{ClusterId, CommitId};
 use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/protos/wal.rs"));
@@ -178,7 +178,7 @@ impl TryFrom<frame_header::Cluster> for ClusterId {
     }
 }
 
-impl TryFrom<frame_header::State> for Commit {
+impl TryFrom<frame_header::State> for CommitId {
     type Error = FrameError;
 
     fn try_from(value: frame_header::State) -> Result<Self, Self::Error> {

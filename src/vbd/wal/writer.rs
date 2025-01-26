@@ -3,7 +3,7 @@ use crate::vbd::wal::{
     TxDetailBuilder, TxDetails, TxId, WalError, WalId, WalSink, MAGIC_NUMBER, PREAMBLE_LEN,
     VALID_HEADER_LEN,
 };
-use crate::vbd::{BlockId, ClusterId, Commit, FixedSpecs, Position, VbdId};
+use crate::vbd::{BlockId, ClusterId, Commit, CommitId, FixedSpecs, Position, VbdId};
 use crate::AsyncWriteBytesExt;
 use async_scoped::TokioScope;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -83,7 +83,7 @@ impl<IO: WalSink> WalWriter<IO> {
     #[instrument(skip(self), fields(wal_id = %self.id, preceding_commit = %preceding_commit))]
     pub async fn begin(
         self,
-        preceding_commit: Commit,
+        preceding_commit: CommitId,
         reserve_space: u64,
     ) -> Result<Tx<IO>, (WalError, Result<Self, RollbackError>)> {
         tracing::debug!("starting new transaction");
@@ -152,7 +152,7 @@ impl<IO: WalSink> Tx<IO> {
         id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
-        preceding_commit: Commit,
+        preceding_commit: CommitId,
         created: DateTime<Utc>,
         max_len: u64,
         mut writer: WalWriter<IO>,
@@ -210,7 +210,7 @@ impl<IO: WalSink> Tx<IO> {
 
     async fn write_tx_begin(
         &mut self,
-        preceding_commit: Commit,
+        preceding_commit: CommitId,
         created: DateTime<Utc>,
     ) -> Result<(), WalError> {
         let frame = WriteFrame::TxBegin(TxBegin {
@@ -328,25 +328,28 @@ impl<IO: WalSink> Tx<IO> {
         Ok(pos)
     }
 
-    #[instrument(skip_all, fields(content_id = %content_id))]
-    pub async fn state(
-        &mut self,
-        content_id: &Commit,
-        cluster_ids: impl Iterator<Item = &ClusterId>,
-    ) -> Result<Position<u64, u32>, WalError> {
-        if let Some(pos) = self.builder.states.get(content_id) {
+    #[instrument(skip_all, fields(commit_id = %commit.content_id))]
+    pub async fn state(&mut self, commit: &Commit) -> Result<Position<u64, u32>, WalError> {
+        if let Some(pos) = self.builder.commits.get(commit.content_id()) {
             return Ok(pos.clone());
         }
-        tracing::debug!("writing STATE to wal");
-        let commit = content_id.clone();
+        tracing::debug!("writing COMMIT to wal");
+        let commit_id = commit.content_id.clone();
         let state = protos::State {
-            content_id: Some(content_id.into()),
-            cluster_ids: cluster_ids.into_iter().map(|c| c.into()).collect(),
+            content_id: Some(commit_id.into()),
+            cluster_ids: commit
+                .clusters
+                .as_ref()
+                .into_iter()
+                .map(|c| c.into())
+                .collect(),
         };
-        let frame = WriteFrame::State((&state, &commit));
+        let frame = WriteFrame::State((&state, commit.content_id()));
         self.write_frame(frame).await?;
         let pos = self.write_body(state.encode_to_vec(), 0, 0).await?;
-        self.builder.states.insert(commit, pos.clone());
+        self.builder
+            .commits
+            .insert(commit.content_id.clone(), pos.clone());
         Ok(pos)
     }
 
@@ -354,7 +357,7 @@ impl<IO: WalSink> Tx<IO> {
     ))]
     pub async fn commit(
         mut self,
-        content_id: &Commit,
+        content_id: &CommitId,
     ) -> Result<(WalWriter<IO>, TxDetails), (WalError, Result<WalWriter<IO>, RollbackError>)> {
         let committed = Utc::now();
         let frame = WriteFrame::TxCommit(TxCommit {
@@ -390,7 +393,7 @@ impl<IO: WalSink> Tx<IO> {
 
     #[instrument(skip_all, fields(tx_id = %self.builder.tx_id, wal_id = %self.builder.wal_id, vbd_id = %self.builder.vbd_id))]
     pub async fn rollback(mut self) -> Result<WalWriter<IO>, RollbackError> {
-        tracing::info!("rolling back transaction");
+        tracing::warn!("rolling back transaction");
         match self.writer.take() {
             Some(mut wal) => {
                 _rollback(&mut wal, self.initial_len).await?;
@@ -501,7 +504,7 @@ enum WriteFrame<'a> {
     TxCommit(TxCommit),
     Block((Block, Option<u32>, Option<u32>)),
     Cluster((&'a protos::Cluster, &'a ClusterId)),
-    State((&'a protos::State, &'a Commit)),
+    State((&'a protos::State, &'a CommitId)),
 }
 
 impl<'a> Display for WriteFrame<'a> {

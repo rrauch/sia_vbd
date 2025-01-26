@@ -1,7 +1,9 @@
+pub(crate) mod inventory;
 pub mod nbd_device;
 pub(crate) mod wal;
 
 use crate::hash::{Hash, HashAlgorithm};
+use crate::vbd::inventory::Inventory;
 use crate::vbd::wal::{ReadOnly, ReadWrite, RollbackError, TokioWalFile, WalError, WalId};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
@@ -10,13 +12,14 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hasher;
 use std::marker::PhantomData;
-use std::ops::{Deref, Range};
+use std::ops::{Deref, DerefMut, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+use tracing::instrument;
 use uuid::Uuid;
 
 const BS16K: usize = 16 * 1024;
@@ -79,6 +82,14 @@ impl<T> From<Uuid> for TypedUuid<T> {
     }
 }
 
+impl<T> TryFrom<&[u8]> for TypedUuid<T> {
+    type Error = uuid::Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Uuid::from_slice(value).map(|uuid| uuid.into())
+    }
+}
+
 impl<T> Clone for TypedUuid<T> {
     fn clone(&self) -> Self {
         Self(self.0.clone(), self.1.clone())
@@ -121,9 +132,91 @@ impl<T> Deref for TypedUuid<T> {
     }
 }
 
-pub struct State_;
+#[derive(Clone)]
+pub struct Commit {
+    content_id: CommitId,
+    clusters: Arc<Vec<ClusterId>>,
+}
 
-pub type Commit = ContentId<State_>;
+impl Commit {
+    pub fn content_id(&self) -> &CommitId {
+        &self.content_id
+    }
+    pub fn len(&self) -> usize {
+        self.clusters.len()
+    }
+}
+
+#[derive(Clone)]
+struct CommitMut {
+    clusters: Vec<ClusterId>,
+    specs: FixedSpecs,
+}
+
+impl CommitMut {
+    pub fn zeroed(specs: FixedSpecs, zero_cluster_id: &ClusterId, num_clusters: usize) -> Self {
+        assert!(num_clusters > 0);
+        Self {
+            clusters: (0..num_clusters).map(|_| zero_cluster_id.clone()).collect(),
+            specs,
+        }
+    }
+
+    pub fn from_commit(commit: Commit, specs: FixedSpecs) -> Self {
+        Self {
+            clusters: Arc::try_unwrap(commit.clusters)
+                .unwrap_or_else(|clusters| clusters.as_ref().clone()),
+            specs,
+        }
+    }
+
+    pub fn from_cluster_ids<I: Iterator<Item = ClusterId>>(ids: I, specs: FixedSpecs) -> Self {
+        Self {
+            clusters: ids.into_iter().collect(),
+            specs,
+        }
+    }
+
+    fn calc_content_id(&self) -> CommitId {
+        let mut hasher = self.specs.meta_hash.new();
+        hasher.update("--sia_vbd commit hash v1 start--\n".as_bytes());
+        hasher.update("uuid: ".as_bytes());
+        hasher.update(&self.specs.vbd_id.as_bytes());
+        hasher.update("\nblock_size: ".as_bytes());
+        hasher.update(&self.specs.block_size.to_be_bytes());
+        hasher.update("\ncluster_size: ".as_bytes());
+        hasher.update(&self.specs.cluster_size.to_be_bytes());
+        hasher.update("number_of_clusters: ".as_bytes());
+        hasher.update(&self.clusters.len().to_be_bytes());
+        hasher.update("\ncontent: ".as_bytes());
+        self.clusters.iter().enumerate().for_each(|(i, c)| {
+            hasher.update("\n--cluster entry start--\n".as_bytes());
+            hasher.update("cluster no: ".as_bytes());
+            hasher.update(i.to_be_bytes());
+            hasher.update("\n cluster hash: ".as_bytes());
+            hasher.update(c.as_ref());
+            hasher.update("\n--cluster entry end--".as_bytes());
+        });
+        hasher.update("\n--sia_vbd commit hash v1 end--".as_bytes());
+        hasher.finalize().into()
+    }
+
+    pub fn finalize(self) -> Commit {
+        self.into()
+    }
+}
+
+impl From<CommitMut> for Commit {
+    fn from(value: CommitMut) -> Self {
+        let content_id = value.calc_content_id();
+        Commit {
+            content_id,
+            clusters: Arc::new(value.clusters),
+        }
+    }
+}
+
+pub type CommitId = ContentId<Commit>;
 pub type VbdId = TypedUuid<VirtualBlockDevice>;
 
 type WalTx = wal::writer::Tx<TokioWalFile<ReadWrite>>;
@@ -133,20 +226,23 @@ type WalWriter = wal::writer::WalWriter<TokioWalFile<ReadWrite>>;
 pub struct VirtualBlockDevice {
     config: Arc<Config>,
     state: State,
+    inventory: Arc<RwLock<Inventory>>,
 }
 
 struct Config {
     specs: FixedSpecs,
-    zero_cluster_id: ClusterId,
+    zero_cluster: Cluster,
     zero_block: Block,
     max_tx_size: u64,
     max_write_buffer: usize,
     wal_dir: PathBuf,
     max_wal_size: u64,
+    db_file: PathBuf,
+    max_db_connections: u8,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct FixedSpecs {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedSpecs {
     pub vbd_id: VbdId,
     pub cluster_size: ClusterSize,
     pub block_size: BlockSize,
@@ -160,62 +256,19 @@ enum State {
     Poisoned,
 }
 
-#[derive(Clone)]
-struct Clusters {
-    clusters: Vec<ClusterId>,
-    cluster_map: HashMap<ClusterId, Arc<Cluster>>,
-    blocks: HashMap<BlockId, Block>,
-}
-
-impl From<(&Vec<ClusterId>, &FixedSpecs)> for Commit {
-    fn from((clusters, specs): (&Vec<ClusterId>, &FixedSpecs)) -> Self {
-        let mut hasher = specs.meta_hash.new();
-        hasher.update("--sia_vbd commit hash v1 start--\n".as_bytes());
-        hasher.update("uuid: ".as_bytes());
-        hasher.update(specs.vbd_id.as_bytes());
-        hasher.update("\nblock_size: ".as_bytes());
-        hasher.update(specs.block_size.to_be_bytes());
-        hasher.update("\ncluster_size: ".as_bytes());
-        hasher.update(specs.cluster_size.to_be_bytes());
-        hasher.update("number_of_clusters: ".as_bytes());
-        hasher.update(clusters.len().to_be_bytes());
-        hasher.update("\ncontent: ".as_bytes());
-        clusters.iter().enumerate().for_each(|(i, c)| {
-            hasher.update("\n--cluster entry start--\n".as_bytes());
-            hasher.update("cluster no: ".as_bytes());
-            hasher.update(i.to_be_bytes());
-            hasher.update("\n cluster hash: ".as_bytes());
-            hasher.update(c.as_ref());
-            hasher.update("\n--cluster entry end--".as_bytes());
-        });
-        hasher.update("\n--sia_vbd commit hash v1 end--".as_bytes());
-        hasher.finalize().into()
-    }
-}
-
-impl Clusters {
-    fn calc_commit(&self, config: &Config) -> Commit {
-        (&self.clusters, &config.specs).into()
-    }
-
-    async fn get(&self, cluster_no: usize) -> Result<Arc<Cluster>, BlockError> {
-        let cluster_id = self
-            .clusters
-            .get(cluster_no)
-            .expect("cluster_no to be in range 0");
-        Ok(self
-            .cluster_map
-            .get(cluster_id)
-            .map(|c| c.clone())
-            .ok_or_else(|| BlockError::ClusterNoFound {
-                cluster_id: cluster_id.clone(),
-            })?)
+impl State {
+    fn commit(&self) -> &Commit {
+        match &self {
+            State::Committed(state) => &state.commit,
+            State::Uncommitted(state) => &state.previous_commit,
+            State::Poisoned => unreachable!("poisoned state"),
+        }
     }
 }
 
 struct Committed {
     commit: Commit,
-    clusters: Clusters,
+    inventory: Arc<RwLock<Inventory>>,
     wal: Option<WalWriter>,
 }
 
@@ -262,16 +315,16 @@ impl Committed {
             }
         };
 
-        match Uncommitted::new(wal, self.commit.clone(), self.clusters, config).await {
+        match Uncommitted::new(wal, self.commit.clone(), config, self.inventory.clone()).await {
             Ok(u) => Ok(u),
-            Err((err, (clusters, wal))) => {
+            Err((err, wal)) => {
                 let wal = wal.ok();
                 Err((
                     err,
                     Self {
                         commit: self.commit,
-                        clusters,
                         wal,
+                        inventory: self.inventory,
                     },
                 ))
             }
@@ -281,7 +334,7 @@ impl Committed {
 
 struct ModifiedData {
     unflushed_blocks: HashMap<(usize, usize), Option<Bytes>>,
-    clusters: HashMap<usize, ClusterMut>,
+    clusters: HashMap<usize, HashMap<usize, BlockId>>,
 }
 
 enum ModifiedBlock {
@@ -306,7 +359,7 @@ impl ModifiedData {
         if let Some(block_id) = self
             .clusters
             .get(&cluster_no)
-            .map(|c| c.blocks.get(block_no))
+            .map(|m| m.get(&block_no))
             .flatten()
         {
             return Some(ModifiedBlock::BlockId(block_id.clone()));
@@ -319,16 +372,16 @@ impl ModifiedData {
         self.unflushed_blocks.insert((cluster_no, block_no), data);
     }
 
+    #[instrument(skip(self, config, wal, wal_blocks), fields(tx_id = %wal.id()))]
     async fn flush(
         &mut self,
         config: &Config,
-        committed_clusters: &Clusters,
         wal: &mut WalTx,
         wal_blocks: &mut HashMap<BlockId, Position<u64, u32>>,
     ) -> Result<(), BlockError> {
+        tracing::debug!("flushing active tx");
         for ((cluster_no, block_no), data) in self.unflushed_blocks.drain() {
-            let block = data.map(|d| Block::new(&config.specs, d)).transpose()?;
-
+            let block = data.map(|d| Block::from_bytes(&config.specs, d));
             let block_id = match block {
                 Some(block) => {
                     let block_id = block.content_id.clone();
@@ -342,48 +395,48 @@ impl ModifiedData {
             };
 
             if !self.clusters.contains_key(&cluster_no) {
-                let c = committed_clusters.get(cluster_no).await?;
-                self.clusters.insert(
-                    cluster_no,
-                    ClusterMut::from_cluster(c.as_ref().clone(), config.specs.clone()),
-                );
+                self.clusters.insert(cluster_no, HashMap::default());
             }
-
-            let cluster = self.clusters.get_mut(&cluster_no).unwrap();
-            cluster.blocks[block_no] = block_id;
+            self.clusters
+                .get_mut(&cluster_no)
+                .unwrap()
+                .insert(block_no, block_id);
         }
+        tracing::debug!("flushing complete");
         Ok(())
     }
 }
 
 struct Uncommitted {
     previous_commit: Commit,
-    committed_clusters: Clusters,
     config: Arc<Config>,
     last_modified: Instant,
     data: ModifiedData,
     wal_tx: WalTx,
     wal_reader: Mutex<Option<WalReader>>,
     wal_blocks: HashMap<BlockId, Position<u64, u32>>,
+    inventory: Arc<RwLock<Inventory>>,
 }
 
 impl Uncommitted {
     async fn new(
         wal: WalWriter,
         previous_commit: Commit,
-        committed_clusters: Clusters,
         config: Arc<Config>,
-    ) -> Result<Self, (BlockError, (Clusters, Result<WalWriter, RollbackError>))> {
-        let wal_tx = match wal.begin(previous_commit.clone(), config.max_tx_size).await {
+        inventory: Arc<RwLock<Inventory>>,
+    ) -> Result<Self, (BlockError, Result<WalWriter, RollbackError>)> {
+        let wal_tx = match wal
+            .begin(previous_commit.content_id().clone(), config.max_tx_size)
+            .await
+        {
             Ok(wal) => wal,
             Err((e, wal)) => {
-                return Err((e.into(), (committed_clusters, wal)));
+                return Err((e.into(), wal));
             }
         };
 
         Ok(Self {
             previous_commit,
-            committed_clusters,
             config,
             data: ModifiedData {
                 unflushed_blocks: HashMap::default(),
@@ -393,9 +446,11 @@ impl Uncommitted {
             wal_tx,
             wal_blocks: HashMap::default(),
             wal_reader: Mutex::new(None),
+            inventory,
         })
     }
 
+    #[instrument(skip(self))]
     async fn get(
         &self,
         cluster_no: usize,
@@ -406,24 +461,33 @@ impl Uncommitted {
                 ModifiedBlock::Data(data) => Some(data),
                 ModifiedBlock::Zeroed => None,
                 ModifiedBlock::BlockId(block_id) => {
-                    if let Some(pos) = self.wal_blocks.get(&block_id) {
-                        let mut lock = self.wal_reader.lock().await;
-                        if lock.is_none() {
-                            *lock = Some(
-                                WalReader::new(
-                                    TokioWalFile::open(self.wal_tx.as_ref().path()).await?,
-                                )
-                                .await?,
-                            );
-                        }
-
-                        let wal_reader = lock.as_mut().unwrap();
-                        wal_reader
-                            .block(&block_id, pos)
-                            .await
-                            .map(|b| Some(b.data))?
+                    if &block_id == self.config.zero_block.content_id() {
+                        None
                     } else {
-                        todo!()
+                        if let Some(pos) = self.wal_blocks.get(&block_id) {
+                            let mut lock = self.wal_reader.lock().await;
+                            if lock.is_none() {
+                                *lock = Some(
+                                    WalReader::new(
+                                        TokioWalFile::open(self.wal_tx.as_ref().path()).await?,
+                                    )
+                                    .await?,
+                                );
+                            }
+
+                            let wal_reader = lock.as_mut().unwrap();
+                            wal_reader
+                                .block(&block_id, pos)
+                                .await
+                                .map(|b| Some(b.data))?
+                        } else {
+                            tracing::warn!(block_id = %block_id, "uncommited block not found in wal");
+                            let lock = self.inventory.read().await;
+                            lock.block_by_id(&block_id)
+                                .await?
+                                .map(|b| Some(b.data))
+                                .flatten()
+                        }
                     }
                 }
             }));
@@ -431,6 +495,7 @@ impl Uncommitted {
         Ok(None)
     }
 
+    #[instrument(skip(self, data))]
     async fn put(
         &mut self,
         cluster_no: usize,
@@ -440,12 +505,7 @@ impl Uncommitted {
         if self.buffered_size() + data.len() >= self.config.max_write_buffer {
             // time to flush to wal
             self.data
-                .flush(
-                    &self.config,
-                    &self.committed_clusters,
-                    &mut self.wal_tx,
-                    &mut self.wal_blocks,
-                )
+                .flush(&self.config, &mut self.wal_tx, &mut self.wal_blocks)
                 .await?;
         }
         self.data.put(cluster_no, block_no, Some(data));
@@ -467,42 +527,64 @@ impl Uncommitted {
     }
 
     fn is_full(&self) -> bool {
-        self.wal_tx.remaining() == 0
+        //self.wal_tx.remaining() == 0
+        self.wal_tx.remaining() <= self.buffered_size() as u64 + 1024 * 1024
     }
 
+    #[instrument(skip(self), fields(tx_id = %self.wal_tx.id()))]
     async fn try_commit(mut self) -> Result<Committed, (BlockError, Committed)> {
         async fn apply_changes(
             mut modified_data: ModifiedData,
-            committed_clusters: &Clusters,
+            previous_commit: &Commit,
+            inventory: &Inventory,
             config: &Config,
             wal: &mut WalTx,
             wal_blocks: &mut HashMap<BlockId, Position<u64, u32>>,
-        ) -> Result<(Commit, Clusters), BlockError> {
-            modified_data
-                .flush(config, committed_clusters, wal, wal_blocks)
-                .await?;
-            let mut new_clusters = committed_clusters.clone();
+        ) -> Result<Commit, BlockError> {
+            modified_data.flush(config, wal, wal_blocks).await?;
+            let mut commit = CommitMut::from_commit(previous_commit.clone(), config.specs.clone());
 
-            for (cluster_no, cluster) in modified_data.clusters.drain() {
-                let cluster = cluster.finalize();
-                wal.cluster(&cluster).await?;
-                new_clusters.clusters[cluster_no] = cluster.content_id.clone();
-                if !new_clusters.cluster_map.contains_key(cluster.content_id()) {
-                    new_clusters
-                        .cluster_map
-                        .insert(cluster.content_id.clone(), Arc::new(cluster));
+            let mut non_zero_clusters = 0;
+
+            for (cluster_no, modified_blocks) in modified_data.clusters.drain() {
+                let cluster_id = previous_commit
+                    .clusters
+                    .get(cluster_no)
+                    .expect("cluster no in bounds");
+
+                let cluster = inventory.cluster_by_id(cluster_id).await?.ok_or_else(|| {
+                    BlockError::ClusterNoFound {
+                        cluster_id: cluster_id.clone(),
+                    }
+                })?;
+
+                let mut cluster = ClusterMut::from_cluster(cluster, config.specs.clone());
+                for (idx, block_id) in modified_blocks.into_iter() {
+                    cluster.blocks[idx] = block_id;
                 }
+                let cluster = cluster.finalize();
+
+                if cluster.content_id() != config.zero_cluster.content_id() {
+                    wal.cluster(&cluster).await?;
+                    non_zero_clusters += 1;
+                }
+                commit.clusters[cluster_no] = cluster.content_id.clone();
             }
 
-            let commit = new_clusters.calc_commit(config);
-            wal.state(&commit, new_clusters.clusters.iter()).await?;
+            let commit = commit.finalize();
+            if non_zero_clusters > 0 {
+                wal.state(&commit).await?;
+            }
 
-            Ok((commit, new_clusters))
+            Ok(commit)
         }
+        tracing::debug!("commit started");
+        let mut inventory = self.inventory.write().await;
 
-        let (new_commit, clusters) = match apply_changes(
+        let new_commit = match apply_changes(
             self.data,
-            &self.committed_clusters,
+            &self.previous_commit,
+            inventory.deref_mut(),
             &self.config,
             &mut self.wal_tx,
             &mut self.wal_blocks,
@@ -511,90 +593,74 @@ impl Uncommitted {
         {
             Ok(c) => c,
             Err(err) => {
+                tracing::error!(error = %err, "commit failed, beginning rollback");
                 // rolling back
                 let wal = match self.wal_tx.rollback().await {
-                    Ok(wal) => Some(wal),
-                    Err(_re) => {
-                        //todo: logging
+                    Ok(wal) => {
+                        tracing::debug!("rollback succeeded");
+                        Some(wal)
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "rollback failed");
                         None
                     }
                 };
+                drop(inventory);
                 return Err((
                     err,
                     Committed {
                         commit: self.previous_commit,
-                        clusters: self.committed_clusters,
                         wal,
+                        inventory: self.inventory,
                     },
                 ));
             }
         };
 
-        match self.wal_tx.commit(&new_commit).await {
+        match self.wal_tx.commit(new_commit.content_id()).await {
             Ok((wal, tx_details)) => {
-                match wal
-                    .as_ref()
-                    .as_file()
-                    .metadata()
-                    .await
-                    .map(|m| (m.len(), m.modified().expect("access to last_modified")))
-                {
-                    Ok((file_size, file_last_modified)) => {
-                        //todo: tx_details
-                    }
-                    Err(err) => {
-                        todo!()
-                    }
+                tracing::debug!(commit = %new_commit.content_id(), "wal commit succeeded");
+                if let Err(err) = inventory.update_wal(&tx_details, wal.as_ref().path()).await {
+                    tracing::error!(error = %err, commit = %new_commit.content_id(), "wal sync failed after commit");
                 }
-                Ok(Committed {
-                    commit: new_commit,
-                    clusters,
-                    wal: Some(wal),
+                Ok({
+                    drop(inventory);
+                    Committed {
+                        commit: new_commit,
+                        wal: Some(wal),
+                        inventory: self.inventory,
+                    }
                 })
             }
             Err((e, rbr)) => {
+                tracing::error!(commit = %new_commit.content_id(), error = %e, "commit failed");
                 let wal = rbr.ok();
+                drop(inventory);
                 Err((
                     e.into(),
                     Committed {
                         commit: self.previous_commit,
-                        clusters: self.committed_clusters,
                         wal,
+                        inventory: self.inventory,
                     },
                 ))
             }
         }
     }
-
-    async fn rollback(self) -> Committed {
-        let wal = self.wal_tx.rollback().await.ok();
-        Committed {
-            commit: self.previous_commit,
-            clusters: self.committed_clusters,
-            wal,
-        }
-    }
 }
 
 impl VirtualBlockDevice {
-    pub async fn new(
-        vbd_id: VbdId,
+    pub async fn create_new(
         cluster_size: ClusterSize,
         num_clusters: usize,
         block_size: BlockSize,
         content_hash: HashAlgorithm,
         meta_hash: HashAlgorithm,
-        max_write_buffer: usize,
+        db_file: impl AsRef<Path>,
         wal_dir: impl AsRef<Path>,
-        max_wal_size: u64,
-        max_tx_size: u64,
-    ) -> Result<Self, anyhow::Error> {
-        assert!(num_clusters > 0);
-        let max_tx_size = min(max_tx_size, max_wal_size - 1024 * 1024 * 10);
-        if max_tx_size < 1024 * 1024 * 10 {
-            bail!("max_tx_size too small");
-        }
-
+        branch: impl AsRef<str>,
+    ) -> Result<(FixedSpecs, String, CommitId), anyhow::Error> {
+        let vbd_id = Uuid::now_v7().into();
         let specs = FixedSpecs {
             vbd_id,
             cluster_size,
@@ -602,68 +668,80 @@ impl VirtualBlockDevice {
             content_hash,
             meta_hash,
         };
+        let inventory = Inventory::create(
+            db_file.as_ref(),
+            2,
+            &specs,
+            num_clusters,
+            branch.as_ref(),
+            wal_dir,
+        )
+        .await?;
+        Ok((
+            specs,
+            branch.as_ref().to_string(),
+            inventory.current_commit().content_id.clone(),
+        ))
+    }
 
-        let zero_block = Block::new(&specs, BytesMut::zeroed(*block_size).freeze())?;
-
-        let zero_block_id = zero_block.content_id().clone();
-
-        let blocks = [(zero_block_id.clone(), zero_block.clone())]
-            .into_iter()
-            .collect();
-
-        let zero_cluster = Arc::new(ClusterMut::new_empty(specs.clone(), zero_block_id).finalize());
-        let zero_cluster_id = zero_cluster.content_id().clone();
-        let clusters = (0..num_clusters).map(|_| zero_cluster_id.clone()).collect();
-        let cluster_map = [(zero_cluster_id.clone(), zero_cluster.clone())]
-            .into_iter()
-            .collect();
-
-        let wal_dir = wal_dir.as_ref();
-        let meta_data = tokio::fs::metadata(wal_dir).await?;
-        if !meta_data.is_dir() {
-            bail!(
-                "Path {} is not a directory or does not exist",
-                wal_dir.display()
-            );
+    pub async fn load(
+        max_write_buffer: usize,
+        wal_dir: impl AsRef<Path>,
+        max_wal_size: u64,
+        max_tx_size: u64,
+        db_file: impl AsRef<Path>,
+        max_db_connections: u8,
+        branch: impl AsRef<str>,
+    ) -> Result<Self, anyhow::Error> {
+        let max_tx_size = min(max_tx_size, max_wal_size - 1024 * 1024 * 10);
+        if max_tx_size < 1024 * 1024 * 10 {
+            bail!("max_tx_size too small");
         }
 
+        let wal_dir = wal_dir.as_ref();
+        match tokio::fs::try_exists(wal_dir).await {
+            Ok(exists) if exists => {}
+            _ => bail!(
+                "WAL path {} is not a directory or does not exist",
+                wal_dir.display()
+            ),
+        }
+
+        let inventory = Arc::new(RwLock::new(
+            Inventory::load(db_file.as_ref(), max_db_connections, branch, wal_dir).await?,
+        ));
+
+        let lock = inventory.read().await;
+        let zero_block = lock.zero_block().clone();
+        let zero_cluster = lock.zero_cluster().clone();
+
         let config = Config {
-            specs,
-            zero_cluster_id,
+            specs: lock.specs().clone(),
+            zero_cluster,
             zero_block,
             max_tx_size,
             max_write_buffer,
             wal_dir: wal_dir.into(),
             max_wal_size,
+            db_file: db_file.as_ref().to_path_buf(),
+            max_db_connections,
         };
 
-        let clusters = Clusters {
-            clusters,
-            cluster_map,
-            blocks,
-        };
-
-        let commit = clusters.calc_commit(&config);
+        let commit = lock.current_commit().clone();
+        drop(lock);
 
         eprintln!("vbd id: {}", config.specs.vbd_id);
-        eprintln!("commit: {}", &commit);
+        eprintln!("commit: {}", commit.content_id());
 
         Ok(Self {
             config: Arc::new(config),
             state: State::Committed(Committed {
                 commit,
-                clusters,
                 wal: None,
+                inventory: inventory.clone(),
             }),
+            inventory,
         })
-    }
-
-    fn clusters(&self) -> &Clusters {
-        match &self.state {
-            State::Committed(s) => &s.clusters,
-            State::Uncommitted(s) => &s.committed_clusters,
-            State::Poisoned => unreachable!("poisoned state"),
-        }
     }
 
     fn calc_cluster_block(&self, block_no: usize) -> Result<(usize, usize), BlockError> {
@@ -690,7 +768,8 @@ impl VirtualBlockDevice {
             let cluster_no = block_no / cluster_size;
             let relative_block_no = block_no % cluster_size;
 
-            if cluster_no >= self.clusters().clusters.len() || relative_block_no >= cluster_size {
+            if cluster_no >= self.state.commit().clusters.len() || relative_block_no >= cluster_size
+            {
                 return Err(BlockError::OutOfRange { block_no });
             }
 
@@ -707,7 +786,9 @@ impl VirtualBlockDevice {
         Ok(clustered_blocks)
     }
 
+    #[instrument(skip(self))]
     pub async fn get(&self, block_no: usize) -> Result<Option<Bytes>, BlockError> {
+        tracing::trace!("get called");
         let (cluster_no, relative_block_no) = self.calc_cluster_block(block_no)?;
 
         // check pending transaction first
@@ -718,20 +799,30 @@ impl VirtualBlockDevice {
             }
         }
 
-        let cluster_id = self.clusters().clusters[cluster_no].clone();
+        let cluster_id = self
+            .state
+            .commit()
+            .clusters
+            .get(cluster_no)
+            .unwrap()
+            .clone();
 
-        if cluster_id == self.config.zero_cluster_id {
+        if &cluster_id == self.config.zero_cluster.content_id() {
             // the whole cluster is empty
             return Ok(None);
         }
 
-        let block_id = self
-            .clusters()
-            .cluster_map
-            .get(&cluster_id)
-            .ok_or_else(|| BlockError::ClusterNoFound { cluster_id })?
+        let lock = self.inventory.read().await;
+
+        let cluster = lock
+            .cluster_by_id(&cluster_id)
+            .await?
+            .ok_or_else(|| BlockError::ClusterNoFound { cluster_id })?;
+
+        let block_id = &cluster
             .blocks
             .get(relative_block_no)
+            .map(|id| id.clone())
             .expect("block_no in range");
 
         if block_id == self.config.zero_block.content_id() {
@@ -740,23 +831,18 @@ impl VirtualBlockDevice {
         }
 
         Ok(Some(
-            self.clusters()
-                .blocks
-                .get(block_id)
-                .ok_or_else(|| {
-                    println!(
-                        "foo: {} ({}, {}): {}",
-                        block_no, cluster_no, relative_block_no, block_id
-                    );
-                    BlockError::BlockNotFound {
-                        block_id: block_id.clone(),
-                    }
-                })
-                .map(|block| block.data.clone())?,
+            lock.block_by_id(&block_id)
+                .await?
+                .ok_or_else(|| BlockError::BlockNotFound {
+                    block_id: block_id.clone(),
+                })?
+                .data,
         ))
     }
 
+    #[instrument(skip(self, data))]
     pub async fn put(&mut self, block_no: usize, data: Bytes) -> Result<(), BlockError> {
+        tracing::trace!("put called");
         let (cluster_no, relative_block_no) = self.calc_cluster_block(block_no)?;
         if all_zeroes(data.as_ref()) {
             // use delete instead
@@ -768,7 +854,9 @@ impl VirtualBlockDevice {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(blocks = ?blocks))]
     pub async fn delete(&mut self, blocks: Range<usize>) -> Result<(), BlockError> {
+        tracing::trace!("delete called");
         let clusters = self.calc_clusters_blocks(blocks)?;
         let uncommitted = self.prepare_writing().await?;
 
@@ -824,7 +912,9 @@ impl VirtualBlockDevice {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn flush(&mut self) -> Result<(), BlockError> {
+        tracing::debug!("flush called");
         // commit the pending transaction if there is one
         self.commit().await?;
         Ok(())
@@ -834,12 +924,8 @@ impl VirtualBlockDevice {
         self.config.specs.vbd_id
     }
 
-    pub fn last_commit(&self) -> &Commit {
-        match &self.state {
-            State::Committed(c) => &c.commit,
-            State::Uncommitted(u) => &u.previous_commit,
-            _ => unreachable!("poisoned state"),
-        }
+    pub fn last_commit_id(&self) -> &CommitId {
+        self.state.commit().content_id()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -855,7 +941,7 @@ impl VirtualBlockDevice {
     }
 
     pub fn blocks(&self) -> usize {
-        *self.config.specs.cluster_size * self.clusters().clusters.len()
+        *self.config.specs.cluster_size * self.state.commit().clusters.len()
     }
 
     pub fn cluster_size(&self) -> usize {
@@ -876,9 +962,31 @@ pub struct Block {
 }
 
 impl Block {
-    fn new(specs: &FixedSpecs, data: Bytes) -> Result<Self, BlockError> {
-        let content_id = BlockId::new(specs, &data)?;
-        Ok(Self { content_id, data })
+    fn from_bytes(specs: &FixedSpecs, bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        Self {
+            content_id: Self::calc_content_id(specs, &bytes),
+            data: bytes,
+        }
+    }
+
+    fn zeroed(specs: &FixedSpecs) -> Self {
+        Self::from_bytes(specs, BytesMut::zeroed(*specs.block_size).freeze())
+    }
+
+    fn calc_content_id(specs: &FixedSpecs, bytes: &Bytes) -> BlockId {
+        let mut hasher = specs.content_hash.new();
+        hasher.update("--sia_vbd block hash v1 start--\n".as_bytes());
+        hasher.update("uuid: ".as_bytes());
+        hasher.update(specs.vbd_id.as_bytes());
+        hasher.update("\nblock_size: ".as_bytes());
+        hasher.update(bytes.len().to_be_bytes());
+        hasher.update("hash_algorithm: ".as_bytes());
+        hasher.update(specs.content_hash.as_str().as_bytes());
+        hasher.update("\n content: \n".as_bytes());
+        hasher.update(&bytes);
+        hasher.update("\n--sia_vbd block hash v1 end--".as_bytes());
+        hasher.finalize().into()
     }
 
     pub fn content_id(&self) -> &BlockId {
@@ -893,7 +1001,7 @@ struct ClusterMut {
 }
 
 impl ClusterMut {
-    pub fn new_empty(specs: FixedSpecs, zero_block_id: BlockId) -> Self {
+    pub fn zeroed(specs: FixedSpecs, zero_block_id: &BlockId) -> Self {
         Self {
             blocks: (0..*specs.cluster_size)
                 .map(|_| zero_block_id.clone())
@@ -904,7 +1012,8 @@ impl ClusterMut {
 
     pub fn from_cluster(cluster: Cluster, specs: FixedSpecs) -> Self {
         Self {
-            blocks: cluster.blocks,
+            blocks: Arc::try_unwrap(cluster.blocks)
+                .unwrap_or_else(|blocks| blocks.as_ref().clone()),
             specs,
         }
     }
@@ -950,7 +1059,7 @@ impl From<ClusterMut> for Cluster {
         let content_id = value.calc_content_id();
         Cluster {
             content_id,
-            blocks: value.blocks,
+            blocks: Arc::new(value.blocks),
         }
     }
 }
@@ -958,7 +1067,7 @@ impl From<ClusterMut> for Cluster {
 #[derive(Clone)]
 pub struct Cluster {
     content_id: ClusterId,
-    blocks: Vec<BlockId>,
+    blocks: Arc<Vec<BlockId>>,
 }
 
 impl Cluster {
@@ -1051,33 +1160,6 @@ impl FromStr for BlockSize {
 
 pub type BlockId = ContentId<Block>;
 
-impl BlockId {
-    fn new<D: AsRef<[u8]>>(specs: &FixedSpecs, data: D) -> Result<Self, BlockError> {
-        let block_size = *specs.block_size;
-        let data = data.as_ref();
-        if data.len() != block_size {
-            return Err(BlockError::InvalidDataLength {
-                block_size,
-                data_len: data.len(),
-            });
-        }
-
-        let mut hasher = specs.content_hash.new();
-        hasher.update("--sia_vbd block hash v1 start--\n".as_bytes());
-        hasher.update("uuid: ".as_bytes());
-        hasher.update(specs.vbd_id.as_bytes());
-        hasher.update("\nblock_size: ".as_bytes());
-        hasher.update(block_size.to_be_bytes());
-        hasher.update("hash_algorithm: ".as_bytes());
-        hasher.update(specs.content_hash.as_str().as_bytes());
-        hasher.update("\n content: \n".as_bytes());
-        hasher.update(data);
-        hasher.update("\n--sia_vbd block hash v1 end--".as_bytes());
-
-        Ok(Self(hasher.finalize(), PhantomData::default()))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Position<O, L> {
     pub offset: O,
@@ -1115,15 +1197,17 @@ pub enum BlockError {
     BlockNotFound { block_id: BlockId },
     #[error("cluster with id {cluster_id} not found")]
     ClusterNoFound { cluster_id: ClusterId },
-    #[error("WAL error")]
+    #[error(transparent)]
     WalError(#[from] WalError),
-    #[error("IO error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 mod protos {
     use crate::hash::Hash;
-    use crate::vbd::{BlockId, ClusterId, Commit, VbdId};
+    use crate::vbd::{BlockId, ClusterId, CommitId, VbdId};
     use uuid::Uuid;
 
     impl From<VbdId> for crate::protos::Uuid {
@@ -1138,19 +1222,19 @@ mod protos {
         }
     }
 
-    impl From<Commit> for crate::protos::Hash {
-        fn from(value: Commit) -> Self {
+    impl From<CommitId> for crate::protos::Hash {
+        fn from(value: CommitId) -> Self {
             value.0.into()
         }
     }
 
-    impl From<&Commit> for crate::protos::Hash {
-        fn from(value: &Commit) -> Self {
+    impl From<&CommitId> for crate::protos::Hash {
+        fn from(value: &CommitId) -> Self {
             (&value.0).into()
         }
     }
 
-    impl TryFrom<crate::protos::Hash> for Commit {
+    impl TryFrom<crate::protos::Hash> for CommitId {
         type Error = <Hash as TryFrom<crate::protos::Hash>>::Error;
 
         fn try_from(value: crate::protos::Hash) -> Result<Self, Self::Error> {

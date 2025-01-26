@@ -289,10 +289,10 @@ impl TransmissionHandler {
 #[derive(Error, Debug)]
 pub(super) enum NbdError {
     /// A request related error occurred when reading data from the client
-    #[error("client request error")]
+    #[error(transparent)]
     RequestError(#[from] ReadError),
     /// An `IO` error occurred reading from or writing to the client
-    #[error("client io error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
     /// The connection had to be terminated
     #[error("termination received")]

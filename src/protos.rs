@@ -140,6 +140,14 @@ impl TryFrom<Hash> for crate::hash::Hash {
     type Error = anyhow::Error;
 
     fn try_from(value: Hash) -> Result<Self, Self::Error> {
+        (value.value.as_slice(), value.algo().into()).try_into()
+    }
+}
+
+/*impl TryFrom<Hash> for crate::hash::Hash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Hash) -> Result<Self, Self::Error> {
         let len = value.value.len();
         match value.algo() {
             HashAlgorithm::Tent => {
@@ -176,4 +184,4 @@ impl TryFrom<Hash> for crate::hash::Hash {
             }
         }
     }
-}
+}*/

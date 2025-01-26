@@ -666,13 +666,13 @@ async fn _send_reply<TX: AsyncWrite + Unpin>(
 #[derive(Error, Debug)]
 pub(super) enum NbdError {
     /// A protocol related error occurred during the handshake phase
-    #[error("handshake error")]
+    #[error(transparent)]
     HandshakeFailure(#[from] HandshakeError),
     /// Request was not valid
-    #[error("invalid request")]
+    #[error(transparent)]
     InvalidRequest(#[from] RequestError),
     /// An `IO` error occurred reading from or writing to the client
-    #[error("client io error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
 
@@ -692,10 +692,10 @@ pub(super) enum RequestError {
     #[error("option header invalid")]
     InvalidOptionHeader,
     /// An error related to the supplied client request option
-    #[error("invalid option")]
+    #[error(transparent)]
     InvalidOption(#[from] OptionError),
     /// An `IO` error occurred reading from the client
-    #[error("client io error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
 
@@ -708,7 +708,7 @@ pub(super) enum OptionError {
     #[error("missing mandatory option data")]
     MissingData,
     /// The option data was invalid, with details
-    #[error("invalid option data")]
+    #[error(transparent)]
     InvalidData(#[from] DataError),
     /// Option does not support or allow data, but data was supplied nonetheless
     #[error("superfluous option data supplied")]

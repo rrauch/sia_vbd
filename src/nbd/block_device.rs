@@ -214,7 +214,7 @@ pub type Result<T> = result::Result<T, Error>;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("block device io error")]
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error("read queue closed prematurely")]
     ReadQueueError,

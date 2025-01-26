@@ -239,7 +239,7 @@ fn deserialize(
 #[derive(Error, Debug)]
 pub(in crate::nbd) enum ReadError {
     /// A request related error occurred when reading data from the client
-    #[error("client request error")]
+    #[error(transparent)]
     RequestError(#[from] RequestError),
     /// An `IO` error occurred while reading from the client
     #[error(transparent)]

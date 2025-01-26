@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use once_cell::sync::Lazy;
+use sqlx::{Pool, Sqlite};
 use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
@@ -306,6 +307,22 @@ impl<R: AsyncRead + Unpin, B: BufMut> Future for ReadExactBuffered<'_, R, B> {
             }
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SqlitePool {
+    writer: Pool<Sqlite>,
+    reader: Pool<Sqlite>,
+}
+
+impl SqlitePool {
+    pub fn read(&self) -> &Pool<Sqlite> {
+        &self.reader
+    }
+
+    pub fn write(&self) -> &Pool<Sqlite> {
+        &self.writer
     }
 }
 

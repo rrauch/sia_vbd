@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use url::Url;
-use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -120,21 +119,42 @@ async fn main() -> anyhow::Result<()> {
     let num_clusters =
         (arguments.size.as_u64() as usize + cluster_size_bytes - 1) / cluster_size_bytes;
 
+    let db_dir = PathBuf::from("/tmp/foo/db/");
+    let db_file = db_dir.join("sia_vbd.sqlite");
+    let max_db_connections = 25;
+    let branch = "Main".to_string();
+
+    if !tokio::fs::try_exists(&db_file).await? {
+        let (vbd_specs, branch, commit) = VirtualBlockDevice::create_new(
+            arguments.cluster_size,
+            num_clusters,
+            arguments.block_size,
+            arguments.content_hash,
+            arguments.meta_hash,
+            &db_file,
+            &arguments.wal_dir,
+            &branch,
+        )
+        .await?;
+
+        eprintln!(
+            "new vbd created: vbd_id: {}, branch: {}, commit: {}",
+            &vbd_specs.vbd_id, &branch, &commit
+        );
+    }
+
     let runner = builder
         .with_export(
             arguments.export_name,
             NbdDevice::new(
-                VirtualBlockDevice::new(
-                    Uuid::now_v7().into(),
-                    arguments.cluster_size,
-                    num_clusters,
-                    arguments.block_size,
-                    arguments.content_hash,
-                    arguments.meta_hash,
+                VirtualBlockDevice::load(
                     arguments.max_write_buffer.as_u64() as usize,
                     arguments.wal_dir,
                     arguments.max_wal_size.as_u64(),
                     arguments.max_tx_size.as_u64(),
+                    &db_file,
+                    max_db_connections,
+                    &branch,
                 )
                 .await?,
             ),

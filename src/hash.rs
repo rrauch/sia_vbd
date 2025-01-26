@@ -1,7 +1,8 @@
+use anyhow::anyhow;
 use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HashAlgorithm {
     Tent,
     Blake3,
@@ -123,6 +124,46 @@ impl AsRef<[u8]> for Hash {
             Hash::Tent(bytes) => bytes.as_slice(),
             Hash::Blake3(hash) => hash.as_bytes().as_slice(),
             Hash::XXH3(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+impl TryFrom<(&[u8], HashAlgorithm)> for Hash {
+    type Error = anyhow::Error;
+
+    fn try_from((value, algo): (&[u8], HashAlgorithm)) -> Result<Self, Self::Error> {
+        let len = value.len();
+        match algo {
+            HashAlgorithm::Tent => {
+                if len == 20 {
+                    Ok(Hash::Tent(value.try_into()?))
+                } else {
+                    Err(anyhow!(
+                        "tent hash length incorrect, expected 20 bytes, but found {}",
+                        len
+                    ))
+                }
+            }
+            HashAlgorithm::Blake3 => {
+                if len == 32 {
+                    Ok(Hash::Blake3(blake3::Hash::from_bytes(value.try_into()?)))
+                } else {
+                    Err(anyhow!(
+                        "blake3 hash length incorrect, expected 32 bytes, but found {}",
+                        len
+                    ))
+                }
+            }
+            HashAlgorithm::XXH3 => {
+                if len == 16 {
+                    Ok(Hash::XXH3(value.try_into()?))
+                } else {
+                    Err(anyhow!(
+                        "blake3 hash length incorrect, expected 16 bytes, but found {}",
+                        len
+                    ))
+                }
+            }
         }
     }
 }
