@@ -142,13 +142,18 @@ impl Commit {
     pub fn content_id(&self) -> &CommitId {
         &self.content_id
     }
+
     pub fn len(&self) -> usize {
         self.clusters.len()
+    }
+
+    pub fn cluster_ids(&self) -> impl Iterator<Item = &ClusterId> {
+        self.clusters.iter()
     }
 }
 
 #[derive(Clone)]
-struct CommitMut {
+pub(crate) struct CommitMut {
     clusters: Vec<ClusterId>,
     specs: FixedSpecs,
 }
@@ -175,6 +180,10 @@ impl CommitMut {
             clusters: ids.into_iter().collect(),
             specs,
         }
+    }
+
+    pub fn clusters(&mut self) -> &mut Vec<ClusterId> {
+        &mut self.clusters
     }
 
     fn calc_content_id(&self) -> CommitId {
@@ -220,7 +229,7 @@ pub type CommitId = ContentId<Commit>;
 pub type VbdId = TypedUuid<VirtualBlockDevice>;
 
 type WalTx = wal::writer::Tx<TokioWalFile<ReadWrite>>;
-type WalReader = wal::reader::WalReader<TokioWalFile<ReadOnly>>;
+pub(crate) type WalReader = wal::reader::WalReader<TokioWalFile<ReadOnly>>;
 type WalWriter = wal::writer::WalWriter<TokioWalFile<ReadWrite>>;
 
 pub struct VirtualBlockDevice {
@@ -278,10 +287,10 @@ impl Committed {
             mut wal: Option<WalWriter>,
             config: &Config,
         ) -> Result<WalWriter, BlockError> {
-            let mut previous_wal_id = None;
+            let mut preceding_wal_id = None;
             if let Some(existing_wal) = wal.take() {
                 if existing_wal.remaining().await? <= config.max_tx_size {
-                    previous_wal_id = Some(existing_wal.id().clone());
+                    preceding_wal_id = Some(existing_wal.id().clone());
                 } else {
                     wal = Some(existing_wal);
                 }
@@ -293,16 +302,13 @@ impl Committed {
                 let file = TokioWalFile::create_new(config.wal_dir.join(format!("{}.wal", wal_id)))
                     .await?;
 
-                wal = Some(
-                    WalWriter::new(
-                        file,
-                        wal_id,
-                        previous_wal_id,
-                        config.max_wal_size,
-                        config.specs.clone(),
-                    )
-                    .await?,
-                );
+                let mut builder = WalWriter::builder(file, wal_id, config.specs.clone())
+                    .max_file_size(config.max_wal_size);
+                if let Some(wal_id) = preceding_wal_id {
+                    builder = builder.preceding_wal_id(wal_id);
+                }
+                //todo: compressor
+                wal = Some(builder.build().await?);
             }
 
             Ok(wal.expect("wal should be Some"))
@@ -385,10 +391,7 @@ impl ModifiedData {
             let block_id = match block {
                 Some(block) => {
                     let block_id = block.content_id.clone();
-                    wal_blocks.insert(
-                        block_id.clone(),
-                        wal.block(block.content_id(), &block.data).await?,
-                    );
+                    wal_blocks.insert(block_id.clone(), wal.put(&block).await?);
                     block_id
                 }
                 None => config.zero_block.content_id.clone(),
@@ -565,7 +568,7 @@ impl Uncommitted {
                 let cluster = cluster.finalize();
 
                 if cluster.content_id() != config.zero_cluster.content_id() {
-                    wal.cluster(&cluster).await?;
+                    wal.put(&cluster).await?;
                     non_zero_clusters += 1;
                 }
                 commit.clusters[cluster_no] = cluster.content_id.clone();
@@ -573,7 +576,7 @@ impl Uncommitted {
 
             let commit = commit.finalize();
             if non_zero_clusters > 0 {
-                wal.state(&commit).await?;
+                wal.put(&commit).await?;
             }
 
             Ok(commit)
@@ -962,7 +965,7 @@ pub struct Block {
 }
 
 impl Block {
-    fn from_bytes(specs: &FixedSpecs, bytes: impl Into<Bytes>) -> Self {
+    pub fn from_bytes(specs: &FixedSpecs, bytes: impl Into<Bytes>) -> Self {
         let bytes = bytes.into();
         Self {
             content_id: Self::calc_content_id(specs, &bytes),
@@ -992,10 +995,18 @@ impl Block {
     pub fn content_id(&self) -> &BlockId {
         &self.content_id
     }
+
+    pub fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
 }
 
 #[derive(Clone)]
-struct ClusterMut {
+pub(crate) struct ClusterMut {
     blocks: Vec<BlockId>,
     specs: FixedSpecs,
 }
@@ -1023,6 +1034,10 @@ impl ClusterMut {
             blocks: ids.into_iter().collect(),
             specs,
         }
+    }
+
+    pub fn blocks(&mut self) -> &mut Vec<BlockId> {
+        &mut self.blocks
     }
 
     fn calc_content_id(&self) -> ClusterId {
@@ -1073,6 +1088,14 @@ pub struct Cluster {
 impl Cluster {
     pub fn content_id(&self) -> &ClusterId {
         &self.content_id
+    }
+
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn block_ids(&self) -> impl Iterator<Item = &BlockId> {
+        self.blocks.iter()
     }
 }
 
@@ -1167,7 +1190,7 @@ pub struct Position<O, L> {
 }
 
 impl<O, L> Position<O, L> {
-    fn new(offset: O, length: L) -> Self {
+    pub fn new(offset: O, length: L) -> Self {
         Self { offset, length }
     }
 }
@@ -1188,7 +1211,7 @@ fn all_zeroes(buffer: &[u8]) -> bool {
 }
 
 #[derive(Error, Debug)]
-pub enum BlockError {
+pub(crate) enum BlockError {
     #[error("data length {data_len} does not correspond to block size {block_size}")]
     InvalidDataLength { block_size: usize, data_len: usize },
     #[error("the given block number {block_no} is out of range")]
@@ -1210,62 +1233,62 @@ mod protos {
     use crate::vbd::{BlockId, ClusterId, CommitId, VbdId};
     use uuid::Uuid;
 
-    impl From<VbdId> for crate::protos::Uuid {
+    impl From<VbdId> for crate::serde::protos::Uuid {
         fn from(value: VbdId) -> Self {
             value.0.into()
         }
     }
 
-    impl From<crate::protos::Uuid> for VbdId {
-        fn from(value: crate::protos::Uuid) -> Self {
+    impl From<crate::serde::protos::Uuid> for VbdId {
+        fn from(value: crate::serde::protos::Uuid) -> Self {
             Into::<Uuid>::into(value).into()
         }
     }
 
-    impl From<CommitId> for crate::protos::Hash {
+    impl From<CommitId> for crate::serde::protos::Hash {
         fn from(value: CommitId) -> Self {
             value.0.into()
         }
     }
 
-    impl From<&CommitId> for crate::protos::Hash {
+    impl From<&CommitId> for crate::serde::protos::Hash {
         fn from(value: &CommitId) -> Self {
             (&value.0).into()
         }
     }
 
-    impl TryFrom<crate::protos::Hash> for CommitId {
-        type Error = <Hash as TryFrom<crate::protos::Hash>>::Error;
+    impl TryFrom<crate::serde::protos::Hash> for CommitId {
+        type Error = <Hash as TryFrom<crate::serde::protos::Hash>>::Error;
 
-        fn try_from(value: crate::protos::Hash) -> Result<Self, Self::Error> {
+        fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
             TryInto::<Hash>::try_into(value).map(|h| h.into())
         }
     }
 
-    impl From<&BlockId> for crate::protos::Hash {
+    impl From<&BlockId> for crate::serde::protos::Hash {
         fn from(value: &BlockId) -> Self {
             (&value.0).into()
         }
     }
 
-    impl TryFrom<crate::protos::Hash> for BlockId {
-        type Error = <Hash as TryFrom<crate::protos::Hash>>::Error;
+    impl TryFrom<crate::serde::protos::Hash> for BlockId {
+        type Error = <Hash as TryFrom<crate::serde::protos::Hash>>::Error;
 
-        fn try_from(value: crate::protos::Hash) -> Result<Self, Self::Error> {
+        fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
             TryInto::<Hash>::try_into(value).map(|h| h.into())
         }
     }
 
-    impl From<&ClusterId> for crate::protos::Hash {
+    impl From<&ClusterId> for crate::serde::protos::Hash {
         fn from(value: &ClusterId) -> Self {
             (&value.0).into()
         }
     }
 
-    impl TryFrom<crate::protos::Hash> for ClusterId {
-        type Error = <Hash as TryFrom<crate::protos::Hash>>::Error;
+    impl TryFrom<crate::serde::protos::Hash> for ClusterId {
+        type Error = <Hash as TryFrom<crate::serde::protos::Hash>>::Error;
 
-        fn try_from(value: crate::protos::Hash) -> Result<Self, Self::Error> {
+        fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
             TryInto::<Hash>::try_into(value).map(|h| h.into())
         }
     }

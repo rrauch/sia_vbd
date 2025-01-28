@@ -16,9 +16,11 @@ fn main() -> anyhow::Result<()> {
     prost_config.protoc_executable(protoc);
     prost_config.out_dir(out_dir);
     prost_config.compile_protos(&["protos/common.proto"], &[""])?;
-
-    prost_config.extern_path(".common", "crate::protos");
+    prost_config.extern_path(".common", "crate::serde::protos");
     prost_config.compile_protos(&["protos/wal.proto"], &[""])?;
+    prost_config.extern_path(".wal", "crate::vbd::wal::protos");
+    prost_config.compile_protos(&["protos/frame.proto"], &[""])?;
+    prost_config.extern_path(".frame", "crate::serde::protos::frame");
     println!("cargo:rerun-if-changed=protos");
 
     // Set up a temporary sqlite database, so SQLx's compile time

@@ -6,13 +6,12 @@ mod request;
 use crate::nbd::block_device::RequestContext;
 use crate::nbd::transmission::request::ReadError;
 use crate::nbd::{Export, TransmissionMode};
-use crate::{AsyncReadBytesExt, ClientEndpoint, LimitedReader};
-use anyhow::anyhow;
+use crate::{AsyncReadBytesExt, ClientEndpoint, CountingReader, LimitedReader, WrappedReader};
+use futures::lock::Mutex;
 use futures::{AsyncRead, AsyncWrite};
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -140,9 +139,10 @@ impl TransmissionHandler {
                     length,
                     fua,
                 } if !read_only => {
-                    let (reader_tx, reader_rx) = oneshot::channel();
+                    let arc_rx = Arc::new(Mutex::new(CountingReader::new(rx)));
+                    let lock = arc_rx.clone().lock_owned().await;
                     let mut payload =
-                        LimitedReader::new(rx, req.payload_length as usize, reader_tx);
+                        LimitedReader::new(WrappedReader(lock), req.payload_length as usize);
                     let block_device = block_device.clone();
                     let req_id = req.id;
                     let writer = writer.clone();
@@ -161,11 +161,14 @@ impl TransmissionHandler {
                         }
                     });
 
-                    let remaining;
-                    (rx, remaining) = reader_rx
-                        .await
-                        .map_err(|_| anyhow!("input reader was not returned"))?;
-                    payload_remaining = remaining;
+                    let _ = arc_rx.lock().await;
+
+                    let counting = Arc::into_inner(arc_rx)
+                        .expect("exclusive arc_rx")
+                        .into_inner();
+                    let read = counting.read();
+                    rx = counting.into_inner();
+                    payload_remaining = (req.payload_length as usize) - read;
                 }
                 Command::WriteZeroes {
                     offset,

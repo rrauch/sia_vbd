@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package frame;
+import "protos/common.proto";
+import "protos/wal.proto";
+
+message Header {
+  message TxBegin {
+    common.Uuid transaction_id = 1;
+    common.Hash preceding_cid = 2;
+    common.Timestamp created = 4;
+  }
+
+  message TxCommit {
+    common.Uuid transaction_id = 1;
+    common.Hash cid = 2;
+    common.Timestamp committed = 3;
+  }
+
+  message Block {
+    common.Hash cid = 1;
+  }
+
+  message Cluster {
+    common.Hash cid = 1;
+  }
+
+  message Commit {
+    common.Hash cid = 1;
+  }
+
+  optional Body body = 1;
+
+  oneof type {
+    TxBegin tx_begin = 10;
+    TxCommit tx_commit = 11;
+    Block block = 12;
+    Cluster cluster = 13;
+    Commit commit = 14;
+    wal.FileInfo wal_info = 15;
+  }
+}
+
+message Body {
+  enum Type {
+    BLOCK_CONTENT = 0;
+    CLUSTER_PROTO3 = 1;
+    COMMIT_PROTO3 = 2;
+  }
+
+  Type type = 1;
+  optional common.Compressed compressed = 2;
+}
+

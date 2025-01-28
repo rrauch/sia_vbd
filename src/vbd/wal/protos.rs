@@ -1,20 +1,19 @@
 use crate::vbd::wal::HeaderError::{CreatedInvalid, FileIdInvalid, VbdSpecsInvalid};
-use crate::vbd::wal::{BlockFrameError, FrameError, HeaderError, TxId, WalId};
-use crate::vbd::{ClusterId, CommitId};
+use crate::vbd::wal::{HeaderError, TxId, WalId};
 use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/protos/wal.rs"));
 
-impl TryFrom<frame_header::TxBegin> for super::TxBegin {
-    type Error = FrameError;
+impl TryFrom<crate::serde::protos::frame::header::TxBegin> for super::TxBegin {
+    type Error = crate::serde::protos::frame::Error;
 
-    fn try_from(value: frame_header::TxBegin) -> Result<Self, Self::Error> {
+    fn try_from(value: crate::serde::protos::frame::header::TxBegin) -> Result<Self, Self::Error> {
         use crate::vbd::wal::CommitFrameError::*;
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
             preceding_content_id: value
-                .preceding_content_id
+                .preceding_cid
                 .ok_or(ContentIdInvalid)?
                 .try_into()
                 .map_err(|_| ContentIdInvalid)?,
@@ -28,26 +27,26 @@ impl TryFrom<frame_header::TxBegin> for super::TxBegin {
     }
 }
 
-impl From<&super::TxBegin> for frame_header::TxBegin {
+impl From<&super::TxBegin> for crate::serde::protos::frame::header::TxBegin {
     fn from(value: &super::TxBegin) -> Self {
-        let mut begin = frame_header::TxBegin::default();
+        let mut begin = crate::serde::protos::frame::header::TxBegin::default();
         begin.transaction_id = Some(value.transaction_id.into());
-        begin.preceding_content_id = Some((&value.preceding_content_id.0).into());
+        begin.preceding_cid = Some((&value.preceding_content_id.0).into());
         begin.created = Some(value.created.into());
         begin
     }
 }
 
-impl TryFrom<frame_header::TxCommit> for super::TxCommit {
-    type Error = FrameError;
+impl TryFrom<crate::serde::protos::frame::header::TxCommit> for super::TxCommit {
+    type Error = crate::serde::protos::frame::Error;
 
-    fn try_from(value: frame_header::TxCommit) -> Result<Self, Self::Error> {
+    fn try_from(value: crate::serde::protos::frame::header::TxCommit) -> Result<Self, Self::Error> {
         use crate::vbd::wal::CommitFrameError::*;
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
             content_id: value
-                .content_id
+                .cid
                 .ok_or(ContentIdInvalid)?
                 .try_into()
                 .map_err(|_| ContentIdInvalid)?,
@@ -60,11 +59,11 @@ impl TryFrom<frame_header::TxCommit> for super::TxCommit {
     }
 }
 
-impl From<&super::TxCommit> for frame_header::TxCommit {
+impl From<&super::TxCommit> for crate::serde::protos::frame::header::TxCommit {
     fn from(value: &super::TxCommit) -> Self {
-        let mut commit = frame_header::TxCommit::default();
+        let mut commit = crate::serde::protos::frame::header::TxCommit::default();
         commit.transaction_id = Some(value.transaction_id.into());
-        commit.content_id = Some((&value.content_id.0).into());
+        commit.cid = Some((&value.content_id.0).into());
         commit.committed = Some(value.committed.into());
         commit
     }
@@ -106,97 +105,26 @@ impl From<&super::FileHeader> for FileInfo {
     }
 }
 
-impl From<WalId> for crate::protos::Uuid {
+impl From<WalId> for crate::serde::protos::Uuid {
     fn from(value: WalId) -> Self {
         value.0.into()
     }
 }
 
-impl From<crate::protos::Uuid> for WalId {
-    fn from(value: crate::protos::Uuid) -> Self {
+impl From<crate::serde::protos::Uuid> for WalId {
+    fn from(value: crate::serde::protos::Uuid) -> Self {
         Into::<Uuid>::into(value).into()
     }
 }
 
-impl From<TxId> for crate::protos::Uuid {
+impl From<TxId> for crate::serde::protos::Uuid {
     fn from(value: TxId) -> Self {
         value.0.into()
     }
 }
 
-impl From<crate::protos::Uuid> for TxId {
-    fn from(value: crate::protos::Uuid) -> Self {
+impl From<crate::serde::protos::Uuid> for TxId {
+    fn from(value: crate::serde::protos::Uuid) -> Self {
         Into::<Uuid>::into(value).into()
-    }
-}
-
-impl From<&super::Block> for frame_header::Block {
-    fn from(value: &super::Block) -> Self {
-        Self {
-            content_id: Some((&value.content_id).into()),
-            length: value.length,
-        }
-    }
-}
-
-impl TryFrom<frame_header::Block> for super::Block {
-    type Error = FrameError;
-
-    fn try_from(value: frame_header::Block) -> Result<Self, Self::Error> {
-        use BlockFrameError::*;
-
-        Ok(super::Block {
-            content_id: value
-                .content_id
-                .ok_or(ContentIdInvalid)?
-                .try_into()
-                .map_err(|_| ContentIdInvalid)?,
-            length: value.length,
-        })
-    }
-}
-
-impl From<&ClusterId> for frame_header::Cluster {
-    fn from(value: &ClusterId) -> Self {
-        Self {
-            content_id: Some(value.into()),
-        }
-    }
-}
-
-impl TryFrom<frame_header::Cluster> for ClusterId {
-    type Error = FrameError;
-
-    fn try_from(value: frame_header::Cluster) -> Result<Self, Self::Error> {
-        use super::ClusterFrameError::*;
-
-        Ok(value
-            .content_id
-            .ok_or(ContentIdInvalid)?
-            .try_into()
-            .map_err(|_| ContentIdInvalid)?)
-    }
-}
-
-impl TryFrom<frame_header::State> for CommitId {
-    type Error = FrameError;
-
-    fn try_from(value: frame_header::State) -> Result<Self, Self::Error> {
-        use super::StateFrameError::*;
-
-        Ok(value
-            .content_id
-            .ok_or(ContentIdInvalid)?
-            .try_into()
-            .map_err(|_| ContentIdInvalid)?)
-    }
-}
-
-impl From<&super::super::Cluster> for Cluster {
-    fn from(value: &super::super::Cluster) -> Self {
-        Self {
-            content_id: Some((&value.content_id).into()),
-            block_ids: value.blocks.iter().map(|b| b.into()).collect::<Vec<_>>(),
-        }
     }
 }

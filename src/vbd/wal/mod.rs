@@ -1,4 +1,4 @@
-mod protos;
+pub(crate) mod protos;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
@@ -10,21 +10,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Error, SeekFrom};
 use std::marker::PhantomData;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-const PREAMBLE_LEN: usize = 14;
-const VALID_HEADER_LEN: Range<u16> = 8..2048;
-const VALID_BODY_LEN: Range<u32> = 0..1024 * 1024 * 100;
-const VALID_PADDING_LEN: Range<u32> = 0..1024 * 1024 * 10;
-
-const MAGIC_NUMBER: &'static [u8; 18] = &[
-    0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x57, 0x41, 0x4C, 0x00, 0x00, 0x00,
-    0x00, 0x01,
+const MAGIC_NUMBER: &'static [u8; 16] = &[
+    0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x57, 0x41, 0x4C, 0x00, 0x00, 0x01,
 ];
 
 pub(crate) trait WalSink: AsyncWrite + AsyncSeek + Unpin + Send {
@@ -144,7 +137,6 @@ pub struct TxDetails {
     pub preceding_commit_id: CommitId,
     pub created: DateTime<Utc>,
     pub committed: DateTime<Utc>,
-    //pub position: Position<u64, u64>,
     pub blocks: HashMap<BlockId, Position<u64, u32>>,
     pub clusters: HashMap<ClusterId, Position<u64, u32>>,
     pub commits: HashMap<CommitId, Position<u64, u32>>,
@@ -154,10 +146,6 @@ impl TxDetails {
     pub fn duration(&self) -> Duration {
         self.committed - self.created
     }
-
-    /*pub fn len(&self) -> u64 {
-        self.position.length
-    }*/
 }
 
 #[derive(Clone)]
@@ -212,24 +200,19 @@ pub struct Tx_ {}
 
 pub type TxId = TypedUuid<Tx_>;
 
-struct TxBegin {
-    transaction_id: TxId,
-    preceding_content_id: CommitId,
-    created: DateTime<Utc>,
+pub(crate) struct TxBegin {
+    pub transaction_id: TxId,
+    pub preceding_content_id: CommitId,
+    pub created: DateTime<Utc>,
 }
 
-struct TxCommit {
-    transaction_id: TxId,
-    content_id: CommitId,
-    committed: DateTime<Utc>,
+pub(crate) struct TxCommit {
+    pub transaction_id: TxId,
+    pub content_id: CommitId,
+    pub committed: DateTime<Utc>,
 }
 
-struct Block {
-    content_id: BlockId,
-    length: u32,
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileHeader {
     pub wal_id: WalId,
     pub specs: FixedSpecs,
@@ -237,48 +220,14 @@ pub struct FileHeader {
     pub preceding_wal_id: Option<WalId>,
 }
 
-#[derive(Debug)]
-struct Preamble {
-    header: u16,
-    padding1: u32,
-    body: u32,
-    padding2: u32,
-}
-
-impl Preamble {
-    fn header_only<H: Into<u16>>(header: H) -> Self {
-        Self {
-            header: header.into(),
-            padding1: 0,
-            body: 0,
-            padding2: 0,
-        }
-    }
-
-    fn full<H: Into<u16>, P1: Into<Option<u32>>, B: Into<Option<u32>>, P2: Into<Option<u32>>>(
-        header: H,
-        padding1: P1,
-        body: B,
-        padding2: P2,
-    ) -> Self {
-        Self {
-            header: header.into(),
-            padding1: padding1.into().unwrap_or(0),
-            body: body.into().unwrap_or(0),
-            padding2: padding2.into().unwrap_or(0),
-        }
-    }
-
-    fn content_len(&self) -> u64 {
-        self.header as u64 + self.padding1 as u64 + self.body as u64 + self.padding2 as u64
-    }
-}
 
 #[derive(Error, Debug)]
-pub enum WalError {
+pub(crate) enum WalError {
     /// WAL File Parse error
     #[error(transparent)]
     ParseError(#[from] ParseError),
+    #[error(transparent)]
+    DecodingError(#[from] crate::serde::encoded::DecodingError),
     /// WAL File Encode error
     #[error(transparent)]
     EncodeError(#[from] EncodeError),
@@ -301,6 +250,8 @@ pub enum WalError {
     DanglingTxDetected { tx_id: TxId },
     #[error("TxId {exp} expected, but found {found} instead")]
     IncorrectTxId { exp: TxId, found: TxId },
+    #[error("Incorrect type encountered")]
+    IncorrectType,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -315,9 +266,6 @@ pub enum RollbackError {
 
 #[derive(Error, Debug)]
 pub enum EncodeError {
-    /// Buffer size insufficient
-    #[error("Buffer size too small, required {req} != {rem} remaining")]
-    BufferTooSmall { req: usize, rem: usize },
     /// Wal space insufficient
     #[error("Wal space insufficient, required {req} != {rem} remaining")]
     WalSpaceInsufficient { req: u64, rem: u64 },
@@ -334,37 +282,15 @@ pub enum ParseError {
     /// Invalid Magic Number
     #[error("Invalid Magic Number")]
     InvalidMagicNumber,
-    /// Preamble error
-    #[error(transparent)]
-    PreambleError(#[from] PreambleError),
     /// Header error
     #[error(transparent)]
     HeaderError(#[from] HeaderError),
     /// Frame error
     #[error(transparent)]
-    FrameError(#[from] FrameError),
-    /// Buffer size insufficient
-    #[error("Buffer size too small, required {req} != {rem} remaining")]
-    BufferTooSmall { req: usize, rem: usize },
+    FrameError(#[from] crate::serde::protos::frame::Error),
     /// Protobuf related parsing error
     #[error(transparent)]
     ProtoError(#[from] DecodeError),
-}
-
-#[derive(Error, Debug)]
-pub enum PreambleError {
-    /// Invalid Preamble Length
-    #[error("Invalid Preamble Length")]
-    InvalidLength,
-    /// Invalid Header Length
-    #[error("header length {len} needs to be in range {min}-{max}")]
-    InvalidHeaderLength { len: u16, min: u16, max: u16 },
-    /// Invalid Body Length
-    #[error("body length {len} needs to be in range {min}-{max}")]
-    InvalidBodyLength { len: u32, min: u32, max: u32 },
-    /// Invalid Padding Length
-    #[error("padding length {len} needs to be in range {min}-{max}")]
-    InvalidPaddingLength { len: u32, min: u32, max: u32 },
 }
 
 #[derive(Error, Debug)]
@@ -378,25 +304,6 @@ pub enum HeaderError {
     /// Created Missing or Invalid
     #[error("Creation Timestamp Missing or Invalid")]
     CreatedInvalid,
-}
-
-#[derive(Error, Debug)]
-pub enum FrameError {
-    /// Frame Type Invalid
-    #[error("File Type missing or invalid")]
-    FrameTypeInvalid,
-    /// Commit Frame error
-    #[error(transparent)]
-    CommitFrameError(#[from] CommitFrameError),
-    /// Block Frame error
-    #[error(transparent)]
-    BlockFrameError(#[from] BlockFrameError),
-    /// Cluster Frame error
-    #[error(transparent)]
-    ClusterFrameError(#[from] ClusterFrameError),
-    /// State Frame error
-    #[error(transparent)]
-    StateFrameError(#[from] StateFrameError),
 }
 
 #[derive(Error, Debug)]

@@ -1,31 +1,70 @@
+use crate::serde::encoded::{Encodable, EncodingSinkBuilder};
 use crate::vbd::wal::{
-    protos, Block, EncodeError, FileHeader, Preamble, RollbackError, TxBegin, TxCommit,
-    TxDetailBuilder, TxDetails, TxId, WalError, WalId, WalSink, MAGIC_NUMBER, PREAMBLE_LEN,
-    VALID_HEADER_LEN,
+    EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
+    WalError, WalId, WalSink, MAGIC_NUMBER,
 };
-use crate::vbd::{BlockId, ClusterId, Commit, CommitId, FixedSpecs, Position, VbdId};
-use crate::AsyncWriteBytesExt;
+use crate::vbd::{Block, Cluster, Commit, CommitId, FixedSpecs, Position, VbdId};
 use async_scoped::TokioScope;
-use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures::{AsyncSeekExt, AsyncWriteExt};
-use prost::Message;
-use std::fmt::{Display, Formatter};
+use futures::{AsyncSeekExt, AsyncWriteExt, SinkExt};
 use std::io::SeekFrom;
 use tracing::instrument;
 use uuid::Uuid;
 
+const MAX_WAL_FILE_SIZE: u64 = 1024 * 1024 * 128;
+
+pub(crate) struct WalWriterBuilder<IO> {
+    io: IO,
+    id: WalId,
+    max_size: u64,
+    specs: FixedSpecs,
+    preceding_wal_id: Option<WalId>,
+}
+
+impl<IO: WalSink> WalWriterBuilder<IO> {
+    pub fn max_file_size(mut self, max_size: u64) -> Self {
+        assert!(max_size > 0);
+        self.max_size = max_size;
+        self
+    }
+
+    pub fn preceding_wal_id(mut self, wal_id: WalId) -> Self {
+        self.preceding_wal_id = Some(wal_id);
+        self
+    }
+
+    pub async fn build(self) -> Result<WalWriter<IO>, WalError> {
+        WalWriter::new(
+            self.io,
+            self.id,
+            self.preceding_wal_id,
+            self.max_size,
+            self.specs,
+        )
+        .await
+    }
+}
+
 pub(crate) struct WalWriter<IO> {
     id: WalId,
     io: IO,
-    offset: usize,
     header: FileHeader,
     max_size: u64,
 }
 
 impl<IO: WalSink> WalWriter<IO> {
+    pub fn builder(io: IO, id: WalId, specs: FixedSpecs) -> WalWriterBuilder<IO> {
+        WalWriterBuilder {
+            io,
+            id,
+            specs,
+            max_size: MAX_WAL_FILE_SIZE,
+            preceding_wal_id: None,
+        }
+    }
+
     #[instrument(skip(io))]
-    pub async fn new(
+    async fn new(
         mut io: IO,
         wal_id: WalId,
         preceding_wal_id: Option<WalId>,
@@ -41,20 +80,12 @@ impl<IO: WalSink> WalWriter<IO> {
 
         tracing::debug!("creating new wal");
 
-        let mut offset = 0usize;
         io.write_all(MAGIC_NUMBER).await?;
-        offset += MAGIC_NUMBER.len();
 
-        let fi = Into::<protos::FileInfo>::into(&header);
-        let mut buf = BytesMut::with_capacity(PREAMBLE_LEN + fi.encoded_len());
+        let mut sink = EncodingSinkBuilder::from_writer(&mut io).build();
+        sink.send((&header).into()).await?;
+        sink.close().await?;
 
-        offset += encode_preamble(&Preamble::header_only(fi.encoded_len() as u16), &mut buf)?;
-
-        fi.encode(&mut buf)
-            .map_err(|e| Into::<EncodeError>::into(e))?;
-        offset += fi.encoded_len();
-
-        io.write_all(&buf).await?;
         io.flush().await?;
 
         tracing::info!("new wal created");
@@ -63,7 +94,6 @@ impl<IO: WalSink> WalWriter<IO> {
             id: wal_id,
             io,
             header,
-            offset,
             max_size,
         })
     }
@@ -133,7 +163,6 @@ pub struct Tx<IO: WalSink> {
     len: u64,
     position: u64,
     writer: Option<WalWriter<IO>>,
-    buf: BytesMut,
     builder: TxDetailBuilder,
 }
 
@@ -143,6 +172,40 @@ impl<IO: WalSink> AsRef<IO> for Tx<IO> {
             .as_ref()
             .map(|w| &w.io)
             .expect("writer to be set")
+    }
+}
+
+enum Puttable<'a> {
+    Block(&'a Block),
+    Cluster(&'a Cluster),
+    Commit(&'a Commit),
+}
+
+impl<'a> From<Puttable<'a>> for Encodable<'a> {
+    fn from(value: Puttable<'a>) -> Self {
+        match value {
+            Puttable::Block(block) => Encodable::Block(block),
+            Puttable::Cluster(cluster) => Encodable::Cluster(cluster),
+            Puttable::Commit(commit) => Encodable::Commit(commit),
+        }
+    }
+}
+
+impl<'a> From<&'a Block> for Puttable<'a> {
+    fn from(value: &'a Block) -> Self {
+        Puttable::Block(value)
+    }
+}
+
+impl<'a> From<&'a Cluster> for Puttable<'a> {
+    fn from(value: &'a Cluster) -> Self {
+        Puttable::Cluster(value)
+    }
+}
+
+impl<'a> From<&'a Commit> for Puttable<'a> {
+    fn from(value: &'a Commit) -> Self {
+        Puttable::Commit(value)
     }
 }
 
@@ -187,7 +250,6 @@ impl<IO: WalSink> Tx<IO> {
             len: initial_len + max_len,
             position: initial_len,
             writer: Some(writer),
-            buf: BytesMut::with_capacity(VALID_HEADER_LEN.end as usize + PREAMBLE_LEN),
             builder: tx_detail_builder,
         };
 
@@ -213,144 +275,79 @@ impl<IO: WalSink> Tx<IO> {
         preceding_commit: CommitId,
         created: DateTime<Utc>,
     ) -> Result<(), WalError> {
-        let frame = WriteFrame::TxBegin(TxBegin {
+        let tx_begin = TxBegin {
             transaction_id: self.id(),
             preceding_content_id: preceding_commit,
             created,
-        });
-        self.write_frame(frame).await?;
+        };
+        self.write_frame(&tx_begin).await?;
         Ok(())
     }
 
-    #[instrument(skip(self), fields(frame = %frame))]
-    async fn write_frame(&mut self, frame: WriteFrame<'_>) -> Result<Position<u64, u16>, WalError> {
-        let buf = &mut self.buf;
-        buf.clear();
-        tracing::trace!("encoding frame");
-        let header_len = encode_frame(&mut *buf, frame)? - PREAMBLE_LEN;
-        let remaining = self.len - self.position;
-        if remaining < buf.len() as u64 {
-            return Err(EncodeError::WalSpaceInsufficient {
-                req: buf.len() as u64,
-                rem: remaining,
-            })?;
-        }
-        tracing::trace!(
-            offset = self.position,
-            encoded_length = buf.len(),
-            "writing frame"
-        );
-        self.writer.as_mut().unwrap().io.write_all(&buf).await?;
-        let header_pos = Position::new(self.position + PREAMBLE_LEN as u64, header_len as u16);
-        self.position += buf.len() as u64;
-        Ok(header_pos)
-    }
-
     #[instrument(skip_all)]
-    async fn write_body(
+    async fn write_frame<'a, T: Into<Encodable<'a>>>(
         &mut self,
-        body: impl AsRef<[u8]>,
-        padding1: u32,
-        padding2: u32,
+        input: T,
     ) -> Result<Position<u64, u32>, WalError> {
-        let body = body.as_ref();
-        let total_len = body.len() as u64 + padding1 as u64 + padding2 as u64;
-        tracing::trace!(offset = self.position, length = total_len, "writing body");
-        let remaining = self.remaining();
-        if total_len > remaining {
-            return Err(EncodeError::WalSpaceInsufficient {
-                req: total_len,
-                rem: remaining,
-            })?;
-        }
-        if padding1 > 0 {
-            self.writer
-                .as_mut()
-                .unwrap()
-                .io
-                .write_zeroes(padding1 as usize)
-                .await?;
-        }
-        self.writer.as_mut().unwrap().io.write_all(body).await?;
-        if padding2 > 0 {
-            self.writer
-                .as_mut()
-                .unwrap()
-                .io
-                .write_zeroes(padding2 as usize)
-                .await?;
-        }
-        let body_pos = Position::new(self.position + padding1 as u64, body.len() as u32);
-        self.position += total_len;
-        Ok(body_pos)
+        tracing::trace!("encoding frame");
+
+        let start_position = self.writer.as_mut().unwrap().io.stream_position().await?;
+
+        let mut sink =
+            EncodingSinkBuilder::from_writer(&mut self.writer.as_mut().unwrap().io).build();
+        sink.send(input.into()).await?;
+        sink.close().await?;
+        self.position = sink.into_inner().into_inner().stream_position().await?;
+        let header_len = self.position - start_position;
+
+        Ok(Position {
+            offset: start_position,
+            length: header_len as u32,
+        })
     }
 
     pub fn remaining(&self) -> u64 {
         self.len - self.position
     }
 
-    #[instrument(skip_all, fields(block_id = %block_id, data_len = data.len()))]
-    pub async fn block(
+    #[instrument(skip_all)]
+    pub async fn put<'a, T: Into<Puttable<'a>>>(
         &mut self,
-        block_id: &BlockId,
-        data: &Bytes,
+        value: T,
     ) -> Result<Position<u64, u32>, WalError> {
-        if let Some(pos) = self.builder.blocks.get(block_id) {
-            return Ok(pos.clone());
-        }
-        tracing::debug!("writing BLOCK to wal");
-        let block = Block {
-            content_id: block_id.clone(),
-            length: data.len() as u32,
-        };
-        let frame = WriteFrame::Block((block, None, None));
-        self.write_frame(frame).await?;
-        let pos = self.write_body(data, 0, 0).await?;
-        self.builder.blocks.insert(block_id.clone(), pos.clone());
-        Ok(pos)
-    }
-
-    #[instrument(skip_all, fields(cluster_id = %cluster.content_id))]
-    pub async fn cluster(
-        &mut self,
-        cluster: &crate::vbd::Cluster,
-    ) -> Result<Position<u64, u32>, WalError> {
-        if let Some(pos) = self.builder.clusters.get(cluster.content_id()) {
-            return Ok(pos.clone());
-        }
-        tracing::debug!("writing CLUSTER to wal");
-        let cluster_id = cluster.content_id.clone();
-        let cluster = cluster.into();
-        let frame = WriteFrame::Cluster((&cluster, &cluster_id));
-        self.write_frame(frame).await?;
-        let pos = self.write_body(cluster.encode_to_vec(), 0, 0).await?;
-        self.builder.clusters.insert(cluster_id, pos.clone());
-        Ok(pos)
-    }
-
-    #[instrument(skip_all, fields(commit_id = %commit.content_id))]
-    pub async fn state(&mut self, commit: &Commit) -> Result<Position<u64, u32>, WalError> {
-        if let Some(pos) = self.builder.commits.get(commit.content_id()) {
-            return Ok(pos.clone());
-        }
-        tracing::debug!("writing COMMIT to wal");
-        let commit_id = commit.content_id.clone();
-        let state = protos::State {
-            content_id: Some(commit_id.into()),
-            cluster_ids: commit
-                .clusters
-                .as_ref()
-                .into_iter()
-                .map(|c| c.into())
-                .collect(),
-        };
-        let frame = WriteFrame::State((&state, commit.content_id()));
-        self.write_frame(frame).await?;
-        let pos = self.write_body(state.encode_to_vec(), 0, 0).await?;
-        self.builder
-            .commits
-            .insert(commit.content_id.clone(), pos.clone());
-        Ok(pos)
+        let value = value.into();
+        Ok(match &value {
+            Puttable::Block(block) => {
+                if let Some(pos) = self.builder.blocks.get(block.content_id()) {
+                    return Ok(pos.clone());
+                }
+                let id = block.content_id().clone();
+                tracing::debug!("writing BLOCK [{}] to wal", &id);
+                let pos = self.write_frame(value).await?;
+                self.builder.blocks.insert(id, pos.clone());
+                pos
+            }
+            Puttable::Cluster(cluster) => {
+                if let Some(pos) = self.builder.clusters.get(cluster.content_id()) {
+                    return Ok(pos.clone());
+                }
+                let id = cluster.content_id().clone();
+                tracing::debug!("writing CLUSTER [{}] to wal", &id);
+                let pos = self.write_frame(value).await?;
+                self.builder.clusters.insert(id, pos.clone());
+                pos
+            }
+            Puttable::Commit(commit) => {
+                if let Some(pos) = self.builder.commits.get(commit.content_id()) {
+                    return Ok(pos.clone());
+                }
+                let id = commit.content_id().clone();
+                tracing::debug!("writing COMMIT [{}] to wal", &id);
+                let pos = self.write_frame(value).await?;
+                self.builder.commits.insert(id, pos.clone());
+                pos
+            }
+        })
     }
 
     #[instrument(skip_all, fields(tx_id = %self.builder.tx_id, wal_id = %self.builder.wal_id, vbd_id = %self.builder.vbd_id, content_id = %content_id
@@ -360,22 +357,22 @@ impl<IO: WalSink> Tx<IO> {
         content_id: &CommitId,
     ) -> Result<(WalWriter<IO>, TxDetails), (WalError, Result<WalWriter<IO>, RollbackError>)> {
         let committed = Utc::now();
-        let frame = WriteFrame::TxCommit(TxCommit {
+        let tx_commit = TxCommit {
             transaction_id: self.id(),
             content_id: content_id.clone(),
             committed: committed.clone(),
-        });
+        };
         tracing::trace!("starting commit");
         async fn write_commit<IO: WalSink>(
             tx: &mut Tx<IO>,
-            frame: WriteFrame<'_>,
+            tx_commit: &TxCommit,
         ) -> Result<(), WalError> {
-            tx.write_frame(frame).await?;
+            tx.write_frame(tx_commit).await?;
             tx.writer.as_mut().unwrap().io.set_len(tx.position).await?;
             tx.writer.as_mut().unwrap().io.flush().await?;
             Ok(())
         }
-        if let Err(err) = write_commit(&mut self, frame).await {
+        if let Err(err) = write_commit(&mut self, &tx_commit).await {
             // error during commit, rolling back
             if let Err(re) = _rollback(&mut self.writer.as_mut().unwrap(), self.initial_len).await {
                 return Err((err, Err(re)));
@@ -428,127 +425,4 @@ impl<IO: WalSink> Drop for Tx<IO> {
             });
         }
     }
-}
-
-fn encode_frame<B: BufMut>(mut buf: B, frame: WriteFrame) -> Result<usize, EncodeError> {
-    let (header, preamble) = {
-        match frame {
-            WriteFrame::TxBegin(begin) => {
-                let header = protos::FrameHeader {
-                    r#type: Some(protos::frame_header::Type::TxBegin((&begin).into())),
-                };
-                let preamble = Preamble::header_only(header.encoded_len() as u16);
-                (header, preamble)
-            }
-            WriteFrame::TxCommit(commit) => {
-                let header = protos::FrameHeader {
-                    r#type: Some(protos::frame_header::Type::TxCommit((&commit).into())),
-                };
-                let preamble = Preamble::header_only(header.encoded_len() as u16);
-                (header, preamble)
-            }
-            WriteFrame::Block((block, padding1, padding2)) => {
-                let header = protos::FrameHeader {
-                    r#type: Some(protos::frame_header::Type::Block((&block).into())),
-                };
-                let preamble = Preamble::full(
-                    header.encoded_len() as u16,
-                    padding1,
-                    Some(block.length),
-                    padding2,
-                );
-                (header, preamble)
-            }
-            WriteFrame::Cluster((cluster, _)) => {
-                let header = protos::FrameHeader {
-                    r#type: Some(protos::frame_header::Type::Cluster(
-                        protos::frame_header::Cluster {
-                            content_id: cluster.content_id.clone(),
-                        },
-                    )),
-                };
-                let preamble = Preamble::full(
-                    header.encoded_len() as u16,
-                    None,
-                    cluster.encoded_len() as u32,
-                    None,
-                );
-                (header, preamble)
-            }
-            WriteFrame::State((state, _)) => {
-                let header = protos::FrameHeader {
-                    r#type: Some(protos::frame_header::Type::State(
-                        protos::frame_header::State {
-                            content_id: state.content_id.clone(),
-                        },
-                    )),
-                };
-                let preamble = Preamble::full(
-                    header.encoded_len() as u16,
-                    None,
-                    state.encoded_len() as u32,
-                    None,
-                );
-                (header, preamble)
-            }
-        }
-    };
-    let mut len = encode_preamble(&preamble, &mut buf)?;
-    header.encode(&mut buf)?;
-    len += header.encoded_len();
-    Ok(len)
-}
-
-enum WriteFrame<'a> {
-    TxBegin(TxBegin),
-    TxCommit(TxCommit),
-    Block((Block, Option<u32>, Option<u32>)),
-    Cluster((&'a protos::Cluster, &'a ClusterId)),
-    State((&'a protos::State, &'a CommitId)),
-}
-
-impl<'a> Display for WriteFrame<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TxBegin(tx_begin) => {
-                write!(
-                    f,
-                    "TxBegin[id={}, preceding_content_id={}, created={}]",
-                    tx_begin.transaction_id, tx_begin.preceding_content_id, tx_begin.created
-                )
-            }
-            Self::TxCommit(tx_commit) => {
-                write!(
-                    f,
-                    "TxCommit[id={}, content_id={}, committed={}]",
-                    tx_commit.transaction_id, tx_commit.content_id, tx_commit.committed
-                )
-            }
-            Self::Block((block, _, _)) => {
-                write!(f, "Block[id={}, length={}]", block.content_id, block.length)
-            }
-            Self::Cluster((_, id)) => {
-                write!(f, "Cluster[content_id={}]", id)
-            }
-            Self::State((_, id)) => {
-                write!(f, "State[content_id={}]", id)
-            }
-        }
-    }
-}
-
-fn encode_preamble<B: BufMut>(preamble: &Preamble, mut buf: B) -> Result<usize, EncodeError> {
-    if buf.remaining_mut() < PREAMBLE_LEN {
-        return Err(EncodeError::BufferTooSmall {
-            req: PREAMBLE_LEN,
-            rem: buf.remaining_mut(),
-        });
-    }
-
-    buf.put_u16(preamble.header);
-    buf.put_u32(preamble.padding1);
-    buf.put_u32(preamble.body);
-    buf.put_u32(preamble.padding2);
-
-    Ok(PREAMBLE_LEN)
 }

@@ -30,3 +30,26 @@ message FixedSpecs {
   HashAlgorithm content_hash = 4;
   HashAlgorithm meta_hash = 5;
 }
+
+message Compression {
+  message Zstd {}
+
+  oneof type {
+    Zstd zstd = 1;
+  }
+}
+
+message Compressed {
+  Compression compression = 1;
+  uint64 uncompressed = 2;
+}
+
+message Cluster {
+  common.Hash cid = 1;
+  repeated common.Hash block_ids = 2;
+}
+
+message Commit {
+  common.Hash cid = 1;
+  repeated common.Hash cluster_ids = 2;
+}
