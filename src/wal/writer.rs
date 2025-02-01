@@ -1,5 +1,5 @@
 use crate::serde::encoded::{Encodable, Encoder, EncodingSinkBuilder};
-use crate::vbd::wal::{
+use crate::wal::{
     EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
     WalError, WalId, WalSink, MAGIC_NUMBER,
 };

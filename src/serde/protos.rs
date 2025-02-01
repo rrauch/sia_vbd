@@ -276,7 +276,7 @@ impl From<&crate::vbd::Commit> for Commit {
 pub(crate) mod frame {
     use self::Error::*;
     use crate::serde::{BodyType, Compressed};
-    use crate::vbd::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, StateFrameError};
+    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, StateFrameError};
     use crate::vbd::{BlockId, ClusterId, CommitId};
     use thiserror::Error;
 

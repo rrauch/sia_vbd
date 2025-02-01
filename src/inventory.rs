@@ -1,5 +1,5 @@
 use crate::hash::{Hash, HashAlgorithm};
-use crate::vbd::wal::{TokioWalFile, TxDetails, WalId};
+use crate::wal::{TokioWalFile, TxDetails, WalId};
 use crate::vbd::{
     Block, BlockId, Cluster, ClusterId, ClusterMut, Commit, CommitId, CommitMut, FixedSpecs,
     Position, WalReader,
@@ -148,7 +148,7 @@ impl Inventory {
         let mut tx = pool.writer.begin().await?;
 
         {
-            let block_id = zero_block.content_id.as_ref();
+            let block_id = zero_block.content_id().as_ref();
             sqlx::query!(
                 "
                 INSERT INTO known_blocks (block_id, used, available)
@@ -160,7 +160,7 @@ impl Inventory {
             .await?;
         }
         {
-            let cluster_id = zero_cluster.content_id.as_ref();
+            let cluster_id = zero_cluster.content_id().as_ref();
             sqlx::query!(
                 "
                 INSERT INTO known_clusters (cluster_id, used, available)
@@ -173,7 +173,7 @@ impl Inventory {
         }
 
         {
-            let commit_id = zero_commit.content_id.as_ref();
+            let commit_id = zero_commit.content_id().as_ref();
             sqlx::query!(
                 "
                 INSERT INTO known_commits (commit_id, used, available)
@@ -329,7 +329,7 @@ impl Inventory {
 
     #[instrument[skip(self)]]
     pub async fn block_by_id(&self, block_id: &BlockId) -> anyhow::Result<Option<Block>> {
-        if block_id == &self.zero_block.content_id {
+        if block_id == self.zero_block.content_id() {
             return Ok(Some(self.zero_block.clone()));
         }
 
@@ -343,7 +343,7 @@ impl Inventory {
 
     #[instrument[skip(self)]]
     pub async fn cluster_by_id(&self, cluster_id: &ClusterId) -> anyhow::Result<Option<Cluster>> {
-        if cluster_id == &self.zero_cluster.content_id {
+        if cluster_id == self.zero_cluster.content_id() {
             return Ok(Some(self.zero_cluster.clone()));
         }
 
@@ -590,10 +590,10 @@ impl Inventory {
 
         let mut commit = CommitMut::from_commit(self.zero_commit(), self.specs.clone());
         for (idx, cluster_id) in cluster_ids {
-            if idx >= commit.clusters.len() {
+            if idx >= commit.clusters().len() {
                 return Err(anyhow!("database entry for commit [{}] invalid", commit_id));
             }
-            commit.clusters[idx] = cluster_id
+            commit.clusters()[idx] = cluster_id
         }
         let commit = commit.finalize();
         if commit.content_id() == commit_id {
@@ -634,13 +634,13 @@ impl Inventory {
 
         let mut cluster = ClusterMut::from_cluster(self.zero_cluster().clone(), self.specs.clone());
         for (idx, block_id) in block_ids {
-            if idx >= cluster.blocks.len() {
+            if idx >= cluster.blocks().len() {
                 return Err(anyhow!(
                     "database entry for cluster [{}] invalid",
                     cluster_id
                 ));
             }
-            cluster.blocks[idx] = block_id
+            cluster.blocks()[idx] = block_id
         }
         let cluster = cluster.finalize();
         if cluster.content_id() == cluster_id {
@@ -671,7 +671,7 @@ impl Inventory {
             .await?;
             r.count as usize
         };
-        if num_clusters == commit.clusters.len() {
+        if num_clusters == commit.len() {
             // already synced
             return Ok(());
         };
@@ -689,7 +689,7 @@ impl Inventory {
         }
 
         let mut idx = 0;
-        for cluster_id in commit.clusters.iter() {
+        for cluster_id in commit.cluster_ids() {
             if cluster_id != zero_cluster_id {
                 let cluster_id = cluster_id.as_ref();
                 sqlx::query!(
@@ -728,7 +728,7 @@ impl Inventory {
             .await?;
             r.count as usize
         };
-        if num_blocks == cluster.blocks.len() {
+        if num_blocks == cluster.len() {
             // already synced
             return Ok(());
         };
@@ -746,7 +746,7 @@ impl Inventory {
         }
 
         let mut idx = 0;
-        for block_id in cluster.blocks.as_ref() {
+        for block_id in cluster.block_ids() {
             if block_id != zero_block_id {
                 let block_id = block_id.as_ref();
                 sqlx::query!(
@@ -898,14 +898,14 @@ impl Inventory {
 
             Self::process_tx_details(tx_details, tx.as_mut()).await?;
 
-            let zero_block_id = self.zero_block().content_id.clone();
-            let zero_cluster_id = self.zero_cluster().content_id.clone();
+            let zero_block_id = self.zero_block().content_id().clone();
+            let zero_cluster_id = self.zero_cluster().content_id().clone();
             let zero_commit_ids = {
                 self.zero_commits
                     .load()
                     .values()
                     .into_iter()
-                    .map(|c| c.content_id.clone())
+                    .map(|c| c.content_id().clone())
                     .collect::<Vec<_>>()
             };
 

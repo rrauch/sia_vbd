@@ -1,5 +1,6 @@
-use crate::vbd::wal::HeaderError::{CreatedInvalid, FileIdInvalid, VbdSpecsInvalid};
-use crate::vbd::wal::{HeaderError, TxId, WalId};
+use crate::wal::HeaderError::{CreatedInvalid, FileIdInvalid, VbdSpecsInvalid};
+use crate::wal::{HeaderError, TxId, WalId};
+use std::ops::Deref;
 use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/protos/wal.rs"));
@@ -8,7 +9,7 @@ impl TryFrom<crate::serde::protos::frame::header::TxBegin> for super::TxBegin {
     type Error = crate::serde::protos::frame::Error;
 
     fn try_from(value: crate::serde::protos::frame::header::TxBegin) -> Result<Self, Self::Error> {
-        use crate::vbd::wal::CommitFrameError::*;
+        use crate::wal::CommitFrameError::*;
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
@@ -31,7 +32,7 @@ impl From<&super::TxBegin> for crate::serde::protos::frame::header::TxBegin {
     fn from(value: &super::TxBegin) -> Self {
         let mut begin = crate::serde::protos::frame::header::TxBegin::default();
         begin.transaction_id = Some(value.transaction_id.into());
-        begin.preceding_cid = Some((&value.preceding_content_id.0).into());
+        begin.preceding_cid = Some((&value.preceding_content_id).into());
         begin.created = Some(value.created.into());
         begin
     }
@@ -41,7 +42,7 @@ impl TryFrom<crate::serde::protos::frame::header::TxCommit> for super::TxCommit 
     type Error = crate::serde::protos::frame::Error;
 
     fn try_from(value: crate::serde::protos::frame::header::TxCommit) -> Result<Self, Self::Error> {
-        use crate::vbd::wal::CommitFrameError::*;
+        use crate::wal::CommitFrameError::*;
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
@@ -63,7 +64,7 @@ impl From<&super::TxCommit> for crate::serde::protos::frame::header::TxCommit {
     fn from(value: &super::TxCommit) -> Self {
         let mut commit = crate::serde::protos::frame::header::TxCommit::default();
         commit.transaction_id = Some(value.transaction_id.into());
-        commit.cid = Some((&value.content_id.0).into());
+        commit.cid = Some((&value.content_id).into());
         commit.committed = Some(value.committed.into());
         commit
     }
@@ -107,7 +108,7 @@ impl From<&super::FileHeader> for FileInfo {
 
 impl From<WalId> for crate::serde::protos::Uuid {
     fn from(value: WalId) -> Self {
-        value.0.into()
+        value.deref().into()
     }
 }
 
@@ -119,7 +120,7 @@ impl From<crate::serde::protos::Uuid> for WalId {
 
 impl From<TxId> for crate::serde::protos::Uuid {
     fn from(value: TxId) -> Self {
-        value.0.into()
+        value.deref().into()
     }
 }
 

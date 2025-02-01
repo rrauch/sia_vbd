@@ -1,7 +1,7 @@
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
 use crate::serde::protos::frame;
 use crate::serde::{framed, protos, Body, BodyType, Compressed, Compression, Compressor};
-use crate::vbd::wal::{FileHeader as WalInfo, TxBegin, TxCommit};
+use crate::wal::{FileHeader as WalInfo, TxBegin, TxCommit};
 use crate::vbd::{Block, BlockId, Cluster, ClusterId, Commit, CommitId, FixedSpecs, Position};
 use crate::{AsyncReadExtBuffered, WrappedReader};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -296,7 +296,7 @@ pub(crate) enum DecodingError {
     #[error(transparent)]
     ProtoError(#[from] DecodeError),
     #[error(transparent)]
-    WalHeaderError(#[from] crate::vbd::wal::HeaderError),
+    WalHeaderError(#[from] crate::wal::HeaderError),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]

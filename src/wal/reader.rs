@@ -1,8 +1,8 @@
 use crate::hash::HashAlgorithm;
 use crate::serde::encoded::{Decoded, DecodedStream, Decoder};
-use crate::vbd::wal::ParseError::InvalidMagicNumber;
+use crate::wal::ParseError::InvalidMagicNumber;
 
-use crate::vbd::wal::{
+use crate::wal::{
     FileHeader, HeaderError, ParseError, TxDetailBuilder, TxDetails, WalError, WalId, WalSource,
     MAGIC_NUMBER,
 };

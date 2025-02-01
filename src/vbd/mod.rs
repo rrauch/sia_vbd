@@ -1,10 +1,7 @@
-pub(crate) mod inventory;
-pub mod nbd_device;
-pub(crate) mod wal;
-
 use crate::hash::{Hash, HashAlgorithm};
-use crate::vbd::inventory::Inventory;
-use crate::vbd::wal::{ReadOnly, ReadWrite, RollbackError, TokioWalFile, WalError, WalId};
+use crate::inventory::Inventory;
+use crate::wal;
+use crate::wal::{ReadOnly, ReadWrite, RollbackError, TokioWalFile, WalError, WalId};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use std::cmp::min;
@@ -21,6 +18,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::instrument;
 use uuid::Uuid;
+
+pub mod nbd_device;
 
 const BS16K: usize = 16 * 1024;
 const BS64K: usize = 64 * 1024;
@@ -973,7 +972,7 @@ impl Block {
         }
     }
 
-    fn zeroed(specs: &FixedSpecs) -> Self {
+    pub fn zeroed(specs: &FixedSpecs) -> Self {
         Self::from_bytes(specs, BytesMut::zeroed(*specs.block_size).freeze())
     }
 

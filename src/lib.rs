@@ -17,6 +17,8 @@ pub mod hash;
 pub mod nbd;
 pub mod serde;
 pub mod vbd;
+pub mod wal;
+pub mod inventory;
 
 static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
 
