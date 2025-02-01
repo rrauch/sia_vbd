@@ -8,7 +8,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::io::BufReader;
 use futures::lock::OwnedMutexGuard;
-use futures::{AsyncRead, AsyncWrite, Sink, Stream};
+use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, Sink, SinkExt, Stream, StreamExt};
 use pin_project_lite::pin_project;
 use prost::{DecodeError, Message};
 use std::fmt::{Display, Formatter};
@@ -128,6 +128,26 @@ impl<'a, R: InnerReader + 'a> DecodedReadFrame<CommitId, R, Commit> {
             ))?;
         }
         Ok(commit)
+    }
+}
+
+pub(crate) struct Decoder {
+    fixed_specs: FixedSpecs,
+}
+
+impl Decoder {
+    pub fn new(fixed_specs: FixedSpecs) -> Self {
+        Self { fixed_specs }
+    }
+
+    pub async fn read<T: InnerReader>(
+        &self,
+        reader: T,
+    ) -> Result<Option<Decoded<WrappedReader<OwnedMutexGuard<T>>>>, DecodingError> {
+        DecodedStream::from_reader(reader, self.fixed_specs.clone())
+            .next()
+            .await
+            .transpose()
     }
 }
 
@@ -557,6 +577,36 @@ impl<'a> Display for Encodable<'a> {
                 )
             }
         }
+    }
+}
+
+pub(crate) struct Encoder {
+    compressor: Option<Compressor>,
+}
+
+impl Encoder {
+    pub fn new(compressor: Option<Compressor>) -> Self {
+        Self { compressor }
+    }
+
+    pub async fn encode<'a, T: Into<Encodable<'a>>, O: AsyncWrite + AsyncSeek + Unpin + Send>(
+        &self,
+        input: T,
+        mut writer: O,
+    ) -> Result<Position<u64, u32>, std::io::Error> {
+        let start_position = writer.stream_position().await?;
+
+        let mut sink = EncodingSinkBuilder::from_writer(writer).build();
+        sink.send(input.into()).await?;
+        sink.close().await?;
+
+        let end_position = sink.into_inner().into_inner().stream_position().await?;
+        let header_len = end_position - start_position;
+
+        Ok(Position {
+            offset: start_position,
+            length: header_len as u32,
+        })
     }
 }
 

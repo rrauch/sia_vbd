@@ -1,5 +1,5 @@
 use crate::hash::HashAlgorithm;
-use crate::serde::encoded::{Decoded, DecodedStream};
+use crate::serde::encoded::{Decoded, DecodedStream, Decoder};
 use crate::vbd::wal::ParseError::InvalidMagicNumber;
 
 use crate::vbd::wal::{
@@ -27,6 +27,7 @@ pub struct WalReader<IO> {
     io: IO,
     header: FileHeader,
     first_frame_offset: u64,
+    decoder: Decoder,
 }
 
 impl<IO: WalSource> WalReader<IO> {
@@ -36,6 +37,7 @@ impl<IO: WalSource> WalReader<IO> {
 
         Ok(Self {
             io,
+            decoder: Decoder::new(header.specs.clone()),
             header,
             first_frame_offset: pos.offset + pos.length as u64,
         })
@@ -63,16 +65,14 @@ impl<IO: WalSource> WalReader<IO> {
     ) -> Result<Decoded<WrappedReader<OwnedMutexGuard<&mut IO>>>, WalError> {
         tracing::trace!(offset = pos.offset, len = pos.length, "reading from WAL");
         self.io.seek(SeekFrom::Start(pos.offset)).await?;
-        Ok(
-            DecodedStream::from_reader(&mut self.io, self.header.specs.clone())
-                .next()
-                .await
-                .transpose()?
-                .ok_or(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "Unexpected Eof",
-                ))?,
-        )
+        Ok(self
+            .decoder
+            .read(&mut self.io)
+            .await?
+            .ok_or(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "Unexpected Eof",
+            ))?)
     }
 
     #[instrument(skip(self))]

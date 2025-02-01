@@ -1,4 +1,4 @@
-use crate::serde::encoded::{Encodable, EncodingSinkBuilder};
+use crate::serde::encoded::{Encodable, Encoder, EncodingSinkBuilder};
 use crate::vbd::wal::{
     EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
     WalError, WalId, WalSink, MAGIC_NUMBER,
@@ -145,6 +145,7 @@ impl<IO: WalSink> WalWriter<IO> {
             Utc::now(),
             reserve_space,
             self,
+            Encoder::new(None),
         )
         .await?;
         tracing::info!(id = %tx.id(), "new transaction started");
@@ -164,6 +165,7 @@ pub struct Tx<IO: WalSink> {
     position: u64,
     writer: Option<WalWriter<IO>>,
     builder: TxDetailBuilder,
+    encoder: Encoder,
 }
 
 impl<IO: WalSink> AsRef<IO> for Tx<IO> {
@@ -210,7 +212,7 @@ impl<'a> From<&'a Commit> for Puttable<'a> {
 }
 
 impl<IO: WalSink> Tx<IO> {
-    #[instrument(skip(writer))]
+    #[instrument(skip(writer, encoder))]
     async fn new(
         id: TxId,
         wal_id: WalId,
@@ -219,6 +221,7 @@ impl<IO: WalSink> Tx<IO> {
         created: DateTime<Utc>,
         max_len: u64,
         mut writer: WalWriter<IO>,
+        encoder: Encoder,
     ) -> Result<Self, (WalError, Result<WalWriter<IO>, RollbackError>)> {
         async fn prepare_wal<IO: WalSink>(
             writer: &mut WalWriter<IO>,
@@ -251,6 +254,7 @@ impl<IO: WalSink> Tx<IO> {
             position: initial_len,
             writer: Some(writer),
             builder: tx_detail_builder,
+            encoder,
         };
 
         if let Err(e) = this.write_tx_begin(preceding_commit, created).await {
@@ -290,20 +294,10 @@ impl<IO: WalSink> Tx<IO> {
         input: T,
     ) -> Result<Position<u64, u32>, WalError> {
         tracing::trace!("encoding frame");
-
-        let start_position = self.writer.as_mut().unwrap().io.stream_position().await?;
-
-        let mut sink =
-            EncodingSinkBuilder::from_writer(&mut self.writer.as_mut().unwrap().io).build();
-        sink.send(input.into()).await?;
-        sink.close().await?;
-        self.position = sink.into_inner().into_inner().stream_position().await?;
-        let header_len = self.position - start_position;
-
-        Ok(Position {
-            offset: start_position,
-            length: header_len as u32,
-        })
+        let out = &mut self.writer.as_mut().unwrap().io;
+        let pos = self.encoder.encode(input, &mut *out).await?;
+        self.position = out.stream_position().await?;
+        Ok(pos)
     }
 
     pub fn remaining(&self) -> u64 {
