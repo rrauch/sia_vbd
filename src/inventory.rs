@@ -1,13 +1,12 @@
 use crate::hash::{Hash, HashAlgorithm};
-use crate::wal::{TokioWalFile, TxDetails, WalId};
 use crate::vbd::{
     Block, BlockId, Cluster, ClusterId, ClusterMut, Commit, CommitId, CommitMut, FixedSpecs,
-    Position, WalReader,
+    WalReader,
 };
+use crate::wal::{TokioWalFile, TxDetails, WalId};
 use crate::SqlitePool;
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use futures::{Stream, TryStreamExt};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, SqliteConnection};
@@ -397,20 +396,15 @@ impl Inventory {
     async fn open_wal_reader(&self, wal_id: &WalId) -> anyhow::Result<WalReader> {
         let path = self.wal_dir.join(format!("{}.wal", wal_id));
         tracing::debug!(path = %path.display(), "opening wal reader");
-        Ok(
-            WalReader::new(
-                TokioWalFile::open(&path).await?,
-            )
-            .await?,
-        )
+        Ok(WalReader::new(TokioWalFile::open(&path).await?).await?)
     }
 
     #[instrument[skip(self)]]
     async fn commit_from_wal(&self, commit_id: &CommitId) -> anyhow::Result<Option<Commit>> {
         tracing::debug!("reading commit from wal");
-        for (wal_id, positions) in {
+        for (wal_id, offsets) in {
             let mut conn = self.pool.read().acquire().await?;
-            self.wal_positions_for_id(commit_id, conn.as_mut()).await?
+            self.wal_offsets_for_id(commit_id, conn.as_mut()).await?
         } {
             let mut wal_reader = match self.open_wal_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
@@ -419,8 +413,8 @@ impl Inventory {
                     continue;
                 }
             };
-            for position in positions {
-                match wal_reader.commit(commit_id, &position).await {
+            for offset in offsets {
+                match wal_reader.commit(commit_id, offset).await {
                     Ok(commit) => return Ok(Some(commit)),
                     Err(err) => {
                         tracing::error!(error = %err, wal_id = %wal_id, "reading commit failed");
@@ -434,9 +428,9 @@ impl Inventory {
     #[instrument[skip(self)]]
     async fn cluster_from_wal(&self, cluster_id: &ClusterId) -> anyhow::Result<Option<Cluster>> {
         tracing::debug!("reading cluster from wal");
-        for (wal_id, positions) in {
+        for (wal_id, offsets) in {
             let mut conn = self.pool.read().acquire().await?;
-            self.wal_positions_for_id(cluster_id, conn.as_mut()).await?
+            self.wal_offsets_for_id(cluster_id, conn.as_mut()).await?
         } {
             let mut wal_reader = match self.open_wal_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
@@ -445,8 +439,8 @@ impl Inventory {
                     continue;
                 }
             };
-            for position in positions {
-                match wal_reader.cluster(cluster_id, &position).await {
+            for offset in offsets {
+                match wal_reader.cluster(cluster_id, offset).await {
                     Ok(cluster) => return Ok(Some(cluster)),
                     Err(err) => {
                         tracing::error!(error = %err, wal_id = %wal_id, "reading cluster failed");
@@ -460,9 +454,9 @@ impl Inventory {
     #[instrument[skip(self)]]
     async fn block_from_wal(&self, block_id: &BlockId) -> anyhow::Result<Option<Block>> {
         tracing::debug!("reading block from wal");
-        for (wal_id, positions) in {
+        for (wal_id, offsets) in {
             let mut conn = self.pool.read().acquire().await?;
-            self.wal_positions_for_id(block_id, conn.as_mut()).await?
+            self.wal_offsets_for_id(block_id, conn.as_mut()).await?
         } {
             let mut wal_reader = match self.open_wal_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
@@ -471,8 +465,8 @@ impl Inventory {
                     continue;
                 }
             };
-            for position in positions {
-                match wal_reader.block(block_id, &position).await {
+            for offset in offsets {
+                match wal_reader.block(block_id, offset).await {
                     Ok(block) => return Ok(Some(block)),
                     Err(err) => {
                         tracing::error!(error = %err, wal_id = %wal_id, "reading block failed");
@@ -483,28 +477,19 @@ impl Inventory {
         Ok(None)
     }
 
-    async fn wal_positions_for_id(
+    async fn wal_offsets_for_id(
         &self,
         id: impl Into<Id<'_>>,
         conn: &mut SqliteConnection,
-    ) -> anyhow::Result<impl Iterator<Item = (WalId, Vec<Position<u64, u32>>)>> {
+    ) -> anyhow::Result<impl Iterator<Item = (WalId, Vec<u64>)>> {
         #[derive(Debug)]
         struct Row {
             wal_id: Vec<u8>,
             file_offset: i64,
-            content_length: i64,
         }
 
-        fn try_convert(row: Row) -> anyhow::Result<(WalId, Position<u64, u32>)> {
-            Ok(WalId::try_from(row.wal_id.as_slice()).map(|w| {
-                (
-                    w,
-                    Position {
-                        offset: row.file_offset as u64,
-                        length: row.content_length as u32,
-                    },
-                )
-            })?)
+        fn try_convert(row: Row) -> anyhow::Result<(WalId, u64)> {
+            Ok(WalId::try_from(row.wal_id.as_slice()).map(|w| (w, row.file_offset as u64))?)
         }
 
         let id = id.into();
@@ -514,7 +499,7 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, file_offset, content_length FROM wal_content
+                    SELECT wal_id, file_offset FROM wal_content
                     WHERE content_type = 'B' AND block_id = ? AND commit_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
@@ -524,7 +509,7 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, file_offset, content_length FROM wal_content
+                    SELECT wal_id, file_offset FROM wal_content
                     WHERE content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND commit_id IS NULL
                     ",
                     id_slice
@@ -534,7 +519,7 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, file_offset, content_length FROM wal_content
+                    SELECT wal_id, file_offset FROM wal_content
                     WHERE content_type = 'S' AND commit_id = ? AND block_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
@@ -544,7 +529,7 @@ impl Inventory {
 
         let mut matches = HashMap::new();
 
-        while let Some((wal_id, pos)) = stream
+        while let Some((wal_id, offset)) = stream
             .try_next()
             .await?
             .map(|r| try_convert(r))
@@ -553,7 +538,7 @@ impl Inventory {
             if !matches.contains_key(&wal_id) {
                 matches.insert(wal_id.clone(), Vec::default());
             }
-            matches.get_mut(&wal_id).unwrap().push(pos);
+            matches.get_mut(&wal_id).unwrap().push(offset);
         }
 
         Ok(matches.into_iter())
@@ -833,15 +818,24 @@ impl Inventory {
         let items = tx_details
             .blocks
             .iter()
-            .map(|(b, pos)| (Id::from(b), pos))
-            .chain(tx_details.clusters.iter().map(|(c, pos)| (c.into(), pos)))
-            .chain(tx_details.commits.iter().map(|(c, pos)| (c.into(), pos)));
+            .map(|(b, offset)| (Id::from(b), *offset))
+            .chain(
+                tx_details
+                    .clusters
+                    .iter()
+                    .map(|(c, offset)| (c.into(), *offset)),
+            )
+            .chain(
+                tx_details
+                    .commits
+                    .iter()
+                    .map(|(c, offset)| (c.into(), *offset)),
+            );
 
         let wal_id = tx_details.wal_id.as_bytes().as_slice();
 
-        for (id, pos) in items.into_iter() {
-            let file_offset = pos.offset as i64;
-            let content_length = pos.length as i32;
+        for (id, offset) in items.into_iter() {
+            let file_offset = offset as i64;
             let id_bytes = id.as_bytes();
             let (content_type, block_id, cluster_id, commit_id) = match &id {
                 Id::BlockId(_) => ("B", Some(id_bytes), None, None),
@@ -850,13 +844,12 @@ impl Inventory {
             };
             sqlx::query!(
             "
-                    INSERT INTO wal_content (wal_id, file_offset, content_type, content_length, block_id, cluster_id, commit_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    INSERT INTO wal_content (wal_id, file_offset, content_type, block_id, cluster_id, commit_id)
+                    VALUES (?, ?, ?, ?, ?, ?);
                     ",
             wal_id,
             file_offset,
             content_type,
-            content_length,
             block_id,
             cluster_id,
             commit_id
@@ -876,22 +869,18 @@ impl Inventory {
         {
             let mut wal_reader = WalReader::new(TokioWalFile::open(wal_file).await?).await?;
             let id = tx_details.wal_id.as_bytes().as_slice();
-            let metadata = wal_reader.as_ref().as_file().metadata().await?;
-            let file_size = metadata.len() as i64;
-            let last_modified: DateTime<Utc> = metadata.modified()?.into();
+            let etag = wal_reader.as_ref().etag().await?;
+            let etag = etag.as_ref();
             let mut tx = self.pool.writer.begin().await?;
-
             sqlx::query!(
                 "
-                INSERT INTO wal_files (id, file_size, last_modified)
-                VALUES (?, ?, ?)
+                INSERT INTO wal_files (id, etag)
+                VALUES (?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    file_size = excluded.file_size,
-                    last_modified = excluded.last_modified;
+                    etag = excluded.etag;
                 ",
                 id,
-                file_size,
-                last_modified,
+                etag,
             )
             .execute(tx.as_mut())
             .await?;
@@ -936,15 +925,15 @@ impl Inventory {
                 match id {
                     Id::BlockId(_) => {}
                     Id::ClusterId(cluster_id) => {
-                        if let Some(pos) = tx_details.clusters.get(&cluster_id) {
-                            let cluster = wal_reader.cluster(&cluster_id, pos).await?;
+                        if let Some(offset) = tx_details.clusters.get(&cluster_id) {
+                            let cluster = wal_reader.cluster(&cluster_id, *offset).await?;
                             Self::sync_cluster_content(&cluster, &zero_block_id, tx.as_mut())
                                 .await?;
                         }
                     }
                     Id::CommitId(commit_id) => {
-                        if let Some(pos) = tx_details.commits.get(&commit_id) {
-                            let commit = wal_reader.commit(&commit_id, pos).await?;
+                        if let Some(offset) = tx_details.commits.get(&commit_id) {
+                            let commit = wal_reader.commit(&commit_id, *offset).await?;
                             Self::sync_commit_content(&commit, &zero_cluster_id, tx.as_mut())
                                 .await?;
                         }

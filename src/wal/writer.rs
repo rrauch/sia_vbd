@@ -1,9 +1,9 @@
 use crate::serde::encoded::{Encodable, Encoder, EncodingSinkBuilder};
+use crate::vbd::{Block, Cluster, Commit, CommitId, FixedSpecs, VbdId};
 use crate::wal::{
     EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
     WalError, WalId, WalSink, MAGIC_NUMBER,
 };
-use crate::vbd::{Block, Cluster, Commit, CommitId, FixedSpecs, Position, VbdId};
 use async_scoped::TokioScope;
 use chrono::{DateTime, Utc};
 use futures::{AsyncSeekExt, AsyncWriteExt, SinkExt};
@@ -289,15 +289,12 @@ impl<IO: WalSink> Tx<IO> {
     }
 
     #[instrument(skip_all)]
-    async fn write_frame<'a, T: Into<Encodable<'a>>>(
-        &mut self,
-        input: T,
-    ) -> Result<Position<u64, u32>, WalError> {
+    async fn write_frame<'a, T: Into<Encodable<'a>>>(&mut self, input: T) -> Result<u64, WalError> {
         tracing::trace!("encoding frame");
         let out = &mut self.writer.as_mut().unwrap().io;
         let pos = self.encoder.encode(input, &mut *out).await?;
         self.position = out.stream_position().await?;
-        Ok(pos)
+        Ok(pos.offset)
     }
 
     pub fn remaining(&self) -> u64 {
@@ -305,15 +302,12 @@ impl<IO: WalSink> Tx<IO> {
     }
 
     #[instrument(skip_all)]
-    pub async fn put<'a, T: Into<Puttable<'a>>>(
-        &mut self,
-        value: T,
-    ) -> Result<Position<u64, u32>, WalError> {
+    pub async fn put<'a, T: Into<Puttable<'a>>>(&mut self, value: T) -> Result<u64, WalError> {
         let value = value.into();
         Ok(match &value {
             Puttable::Block(block) => {
-                if let Some(pos) = self.builder.blocks.get(block.content_id()) {
-                    return Ok(pos.clone());
+                if let Some(offset) = self.builder.blocks.get(block.content_id()) {
+                    return Ok(*offset);
                 }
                 let id = block.content_id().clone();
                 tracing::debug!("writing BLOCK [{}] to wal", &id);

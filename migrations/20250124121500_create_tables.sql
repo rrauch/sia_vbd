@@ -267,10 +267,10 @@ END;
 
 CREATE TABLE wal_files
 (
-    id            BLOB      NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
-                                                        LENGTH(id) == 16),
-    file_size     INTEGER   NOT NULL CHECK (file_size >= 0),
-    last_modified TIMESTAMP NOT NULL
+    id   BLOB NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                          LENGTH(id) == 16),
+    etag BLOB NOT NULL CHECK (TYPEOF(id) == 'blob' AND
+                              LENGTH(id) >= 8)
 );
 
 -- Prevent Id changes
@@ -289,7 +289,6 @@ CREATE TABLE wal_content
                                            LENGTH(wal_id) == 16),
     file_offset    INTEGER NOT NULL CHECK (file_offset > 0),
     content_type   TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'S')),
-    content_length INTEGER NOT NULL CHECK (content_length > 0),
 
     block_id       BLOB,
     cluster_id     BLOB,

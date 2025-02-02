@@ -382,7 +382,7 @@ impl ModifiedData {
         &mut self,
         config: &Config,
         wal: &mut WalTx,
-        wal_blocks: &mut HashMap<BlockId, Position<u64, u32>>,
+        wal_blocks: &mut HashMap<BlockId, u64>,
     ) -> Result<(), BlockError> {
         tracing::debug!("flushing active tx");
         for ((cluster_no, block_no), data) in self.unflushed_blocks.drain() {
@@ -416,7 +416,7 @@ struct Uncommitted {
     data: ModifiedData,
     wal_tx: WalTx,
     wal_reader: Mutex<Option<WalReader>>,
-    wal_blocks: HashMap<BlockId, Position<u64, u32>>,
+    wal_blocks: HashMap<BlockId, u64>,
     inventory: Arc<RwLock<Inventory>>,
 }
 
@@ -466,7 +466,7 @@ impl Uncommitted {
                     if &block_id == self.config.zero_block.content_id() {
                         None
                     } else {
-                        if let Some(pos) = self.wal_blocks.get(&block_id) {
+                        if let Some(offset) = self.wal_blocks.get(&block_id) {
                             let mut lock = self.wal_reader.lock().await;
                             if lock.is_none() {
                                 *lock = Some(
@@ -479,7 +479,7 @@ impl Uncommitted {
 
                             let wal_reader = lock.as_mut().unwrap();
                             wal_reader
-                                .block(&block_id, pos)
+                                .block(&block_id, *offset)
                                 .await
                                 .map(|b| Some(b.data))?
                         } else {
@@ -541,7 +541,7 @@ impl Uncommitted {
             inventory: &Inventory,
             config: &Config,
             wal: &mut WalTx,
-            wal_blocks: &mut HashMap<BlockId, Position<u64, u32>>,
+            wal_blocks: &mut HashMap<BlockId, u64>,
         ) -> Result<Commit, BlockError> {
             modified_data.flush(config, wal, wal_blocks).await?;
             let mut commit = CommitMut::from_commit(previous_commit.clone(), config.specs.clone());

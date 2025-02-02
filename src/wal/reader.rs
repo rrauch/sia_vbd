@@ -2,12 +2,12 @@ use crate::hash::HashAlgorithm;
 use crate::serde::encoded::{Decoded, DecodedStream, Decoder};
 use crate::wal::ParseError::InvalidMagicNumber;
 
+use crate::vbd::{
+    BlockId, BlockSize, ClusterId, ClusterSize, Commit, CommitId, FixedSpecs, Position, VbdId,
+};
 use crate::wal::{
     FileHeader, HeaderError, ParseError, TxDetailBuilder, TxDetails, WalError, WalId, WalSource,
     MAGIC_NUMBER,
-};
-use crate::vbd::{
-    BlockId, BlockSize, ClusterId, ClusterSize, Commit, CommitId, FixedSpecs, Position, VbdId,
 };
 use crate::{AsyncReadExtBuffered, WrappedReader};
 use anyhow::anyhow;
@@ -61,10 +61,10 @@ impl<IO: WalSource> WalReader<IO> {
     #[instrument(skip(self))]
     async fn read(
         &mut self,
-        pos: &Position<u64, u32>,
+        offset: u64,
     ) -> Result<Decoded<WrappedReader<OwnedMutexGuard<&mut IO>>>, WalError> {
-        tracing::trace!(offset = pos.offset, len = pos.length, "reading from WAL");
-        self.io.seek(SeekFrom::Start(pos.offset)).await?;
+        tracing::trace!(offset = offset, "reading from WAL");
+        self.io.seek(SeekFrom::Start(offset)).await?;
         Ok(self
             .decoder
             .read(&mut self.io)
@@ -79,10 +79,10 @@ impl<IO: WalSource> WalReader<IO> {
     pub async fn block(
         &mut self,
         block_id: &BlockId,
-        pos: &Position<u64, u32>,
+        offset: u64,
     ) -> Result<crate::vbd::Block, WalError> {
         tracing::debug!("reading BLOCK from WAL");
-        let mut frame = match self.read(pos).await? {
+        let mut frame = match self.read(offset).await? {
             Decoded::Block(frame) => frame,
             _ => {
                 return Err(WalError::IncorrectType);
@@ -104,10 +104,10 @@ impl<IO: WalSource> WalReader<IO> {
     pub async fn cluster(
         &mut self,
         cluster_id: &ClusterId,
-        pos: &Position<u64, u32>,
+        offset: u64,
     ) -> Result<crate::vbd::Cluster, WalError> {
         tracing::debug!("reading CLUSTER from WAL");
-        let mut frame = match self.read(pos).await? {
+        let mut frame = match self.read(offset).await? {
             Decoded::Cluster(frame) => frame,
             _ => {
                 return Err(WalError::IncorrectType);
@@ -126,13 +126,9 @@ impl<IO: WalSource> WalReader<IO> {
     }
 
     #[instrument(skip(self))]
-    pub async fn commit(
-        &mut self,
-        commit_id: &CommitId,
-        pos: &Position<u64, u32>,
-    ) -> Result<Commit, WalError> {
+    pub async fn commit(&mut self, commit_id: &CommitId, offset: u64) -> Result<Commit, WalError> {
         tracing::debug!("reading COMMIT from WAL");
-        let mut frame = match self.read(pos).await? {
+        let mut frame = match self.read(offset).await? {
             Decoded::Commit(frame) => frame,
             _ => {
                 return Err(WalError::IncorrectType);
@@ -257,22 +253,22 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                     }
                     Decoded::Block(frame) => {
                         if let Some(_) = frame.body() {
-                            let pos = frame.position().clone();
-                            tx_builder.blocks.insert(frame.into_header(), pos);
+                            let offset = frame.position().offset;
+                            tx_builder.blocks.insert(frame.into_header(), offset);
                         }
                         Ok(Either::Left(tx_builder))
                     }
                     Decoded::Cluster(frame) => {
                         if let Some(_) = frame.body() {
-                            let pos = frame.position().clone();
-                            tx_builder.clusters.insert(frame.into_header(), pos);
+                            let offset = frame.position().offset;
+                            tx_builder.clusters.insert(frame.into_header(), offset);
                         }
                         Ok(Either::Left(tx_builder))
                     }
                     Decoded::Commit(frame) => {
                         if let Some(_) = frame.body() {
-                            let pos = frame.position().clone();
-                            tx_builder.commits.insert(frame.into_header(), pos);
+                            let offset = frame.position().offset;
+                            tx_builder.commits.insert(frame.into_header(), offset);
                         }
                         Ok(Either::Left(tx_builder))
                     }

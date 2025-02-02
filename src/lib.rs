@@ -14,11 +14,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 pub mod hash;
+pub mod inventory;
 pub mod nbd;
 pub mod serde;
 pub mod vbd;
 pub mod wal;
-pub mod inventory;
 
 static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
 
@@ -425,6 +425,47 @@ fn highest_power_of_two(n: u32) -> u32 {
         0
     } else {
         1 << (31 - n.leading_zeros())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Etag {
+    data: Bytes,
+}
+
+impl Etag {
+    pub fn copy_from<T: AsRef<[u8]>>(input: T) -> Self {
+        Self {
+            data: Bytes::copy_from_slice(input.as_ref()),
+        }
+    }
+}
+
+impl<T: Into<Bytes>> From<T> for Etag {
+    fn from(value: T) -> Self {
+        Self { data: value.into() }
+    }
+}
+
+impl Display for Etag {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.data.as_ref();
+        for &byte in bytes {
+            write!(f, "{:0>2x}", byte)?;
+        }
+        Ok(())
+    }
+}
+
+impl Debug for Etag {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self, f)
+    }
+}
+
+impl AsRef<[u8]> for Etag {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_ref()
     }
 }
 

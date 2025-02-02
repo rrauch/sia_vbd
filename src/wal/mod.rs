@@ -2,17 +2,20 @@ pub(crate) mod protos;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
-use crate::vbd::{BlockId, ClusterId, CommitId, FixedSpecs, Position, TypedUuid, VbdId};
+use crate::hash::HashAlgorithm;
+use crate::vbd::{BlockId, ClusterId, CommitId, FixedSpecs, TypedUuid, VbdId};
+use crate::Etag;
 use chrono::{DateTime, Duration, Utc};
 use futures::{AsyncRead, AsyncSeek, AsyncWrite};
 use prost::DecodeError;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::{Error, SeekFrom};
+use std::io::{Error, ErrorKind, SeekFrom};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 use thiserror::Error;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -35,7 +38,7 @@ pub struct ReadWrite;
 impl Readable for ReadWrite {}
 impl Writable for ReadWrite {}
 
-pub struct TokioWalFile<M> {
+pub(crate) struct TokioWalFile<M> {
     file: tokio_util::compat::Compat<tokio::fs::File>,
     path: PathBuf,
     _phantom_data: PhantomData<M>,
@@ -66,8 +69,20 @@ impl TokioWalFile<ReadOnly> {
 }
 
 impl<M> TokioWalFile<M> {
-    pub fn as_file(&self) -> &tokio::fs::File {
-        self.file.get_ref()
+    pub async fn etag(&self) -> std::io::Result<Etag> {
+        let metadata = self.file.get_ref().metadata().await?;
+        let mut hasher = HashAlgorithm::XXH3.new();
+        hasher.update(
+            metadata
+                .modified()?
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "file last_modified before 1970"))?
+                .as_nanos()
+                .to_be_bytes(),
+        );
+        hasher.update(metadata.len().to_be_bytes());
+        let hash = hasher.finalize();
+        Ok(Etag::copy_from(hash.as_ref()))
     }
 
     pub fn path(&self) -> &Path {
@@ -137,9 +152,9 @@ pub struct TxDetails {
     pub preceding_commit_id: CommitId,
     pub created: DateTime<Utc>,
     pub committed: DateTime<Utc>,
-    pub blocks: HashMap<BlockId, Position<u64, u32>>,
-    pub clusters: HashMap<ClusterId, Position<u64, u32>>,
-    pub commits: HashMap<CommitId, Position<u64, u32>>,
+    pub blocks: HashMap<BlockId, u64>,
+    pub clusters: HashMap<ClusterId, u64>,
+    pub commits: HashMap<CommitId, u64>,
 }
 
 impl TxDetails {
@@ -155,9 +170,9 @@ struct TxDetailBuilder {
     vbd_id: VbdId,
     preceding_commit_id: CommitId,
     created: DateTime<Utc>,
-    blocks: HashMap<BlockId, Position<u64, u32>>,
-    clusters: HashMap<ClusterId, Position<u64, u32>>,
-    commits: HashMap<CommitId, Position<u64, u32>>,
+    blocks: HashMap<BlockId, u64>,
+    clusters: HashMap<ClusterId, u64>,
+    commits: HashMap<CommitId, u64>,
 }
 
 impl TxDetailBuilder {
@@ -219,7 +234,6 @@ pub struct FileHeader {
     pub created: DateTime<Utc>,
     pub preceding_wal_id: Option<WalId>,
 }
-
 
 #[derive(Error, Debug)]
 pub(crate) enum WalError {
