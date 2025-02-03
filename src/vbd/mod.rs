@@ -1,6 +1,7 @@
 use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::Inventory;
 use crate::wal;
+use crate::wal::man::WalMan;
 use crate::wal::{ReadOnly, ReadWrite, RollbackError, TokioWalFile, WalError, WalId};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
@@ -78,6 +79,14 @@ pub struct TypedUuid<T>(Uuid, PhantomData<T>);
 impl<T> From<Uuid> for TypedUuid<T> {
     fn from(value: Uuid) -> Self {
         TypedUuid(value, PhantomData::default())
+    }
+}
+
+impl<T> TryFrom<&str> for TypedUuid<T> {
+    type Error = uuid::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Uuid::parse_str(value).map(|uuid| uuid.into())
     }
 }
 
@@ -186,14 +195,14 @@ impl CommitMut {
     }
 
     fn calc_content_id(&self) -> CommitId {
-        let mut hasher = self.specs.meta_hash.new();
+        let mut hasher = self.specs.meta_hash().new();
         hasher.update("--sia_vbd commit hash v1 start--\n".as_bytes());
-        hasher.update("uuid: ".as_bytes());
-        hasher.update(&self.specs.vbd_id.as_bytes());
+        hasher.update("vbd_id: ".as_bytes());
+        hasher.update(&self.specs.vbd_id().as_bytes());
         hasher.update("\nblock_size: ".as_bytes());
-        hasher.update(&self.specs.block_size.to_be_bytes());
+        hasher.update(&self.specs.block_size().to_be_bytes());
         hasher.update("\ncluster_size: ".as_bytes());
-        hasher.update(&self.specs.cluster_size.to_be_bytes());
+        hasher.update(&self.specs.cluster_size().to_be_bytes());
         hasher.update("number_of_clusters: ".as_bytes());
         hasher.update(&self.clusters.len().to_be_bytes());
         hasher.update("\ncontent: ".as_bytes());
@@ -251,11 +260,56 @@ struct Config {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FixedSpecs {
-    pub vbd_id: VbdId,
-    pub cluster_size: ClusterSize,
-    pub block_size: BlockSize,
-    pub content_hash: HashAlgorithm,
-    pub meta_hash: HashAlgorithm,
+    inner: Arc<FixedSpecsInner>,
+}
+
+impl FixedSpecs {
+    pub fn new(
+        vbd_id: VbdId,
+        cluster_size: ClusterSize,
+        block_size: BlockSize,
+        content_hash: HashAlgorithm,
+        meta_hash: HashAlgorithm,
+    ) -> Self {
+        Self {
+            inner: Arc::new(FixedSpecsInner {
+                vbd_id,
+                cluster_size,
+                block_size,
+                content_hash,
+                meta_hash,
+            }),
+        }
+    }
+
+    pub fn vbd_id(&self) -> VbdId {
+        self.inner.vbd_id
+    }
+
+    pub fn cluster_size(&self) -> ClusterSize {
+        self.inner.cluster_size
+    }
+
+    pub fn block_size(&self) -> BlockSize {
+        self.inner.block_size
+    }
+
+    pub fn content_hash(&self) -> HashAlgorithm {
+        self.inner.content_hash
+    }
+
+    pub fn meta_hash(&self) -> HashAlgorithm {
+        self.inner.meta_hash
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FixedSpecsInner {
+    vbd_id: VbdId,
+    cluster_size: ClusterSize,
+    block_size: BlockSize,
+    content_hash: HashAlgorithm,
+    meta_hash: HashAlgorithm,
 }
 
 enum State {
@@ -663,20 +717,14 @@ impl VirtualBlockDevice {
         branch: impl AsRef<str>,
     ) -> Result<(FixedSpecs, String, CommitId), anyhow::Error> {
         let vbd_id = Uuid::now_v7().into();
-        let specs = FixedSpecs {
-            vbd_id,
-            cluster_size,
-            block_size,
-            content_hash,
-            meta_hash,
-        };
+        let specs = FixedSpecs::new(vbd_id, cluster_size, block_size, content_hash, meta_hash);
         let inventory = Inventory::create(
             db_file.as_ref(),
             2,
             &specs,
             num_clusters,
             branch.as_ref(),
-            wal_dir,
+            Arc::new(WalMan::new(wal_dir)),
         )
         .await?;
         Ok((
@@ -709,8 +757,10 @@ impl VirtualBlockDevice {
             ),
         }
 
+        let wal_man = Arc::new(WalMan::new(&wal_dir));
+
         let inventory = Arc::new(RwLock::new(
-            Inventory::load(db_file.as_ref(), max_db_connections, branch, wal_dir).await?,
+            Inventory::load(db_file.as_ref(), max_db_connections, branch, wal_man).await?,
         ));
 
         let lock = inventory.read().await;
@@ -732,7 +782,7 @@ impl VirtualBlockDevice {
         let commit = lock.current_commit().clone();
         drop(lock);
 
-        eprintln!("vbd id: {}", config.specs.vbd_id);
+        eprintln!("vbd id: {}", config.specs.vbd_id());
         eprintln!("commit: {}", commit.content_id());
 
         Ok(Self {
@@ -763,7 +813,7 @@ impl VirtualBlockDevice {
         &self,
         blocks: Range<usize>,
     ) -> Result<Vec<(usize, Range<usize>)>, BlockError> {
-        let cluster_size = *self.config.specs.cluster_size;
+        let cluster_size = *self.config.specs.cluster_size();
         let mut clustered_blocks: Vec<(usize, Range<usize>)> = Vec::new();
 
         for block_no in blocks {
@@ -923,7 +973,7 @@ impl VirtualBlockDevice {
     }
 
     pub fn id(&self) -> VbdId {
-        self.config.specs.vbd_id
+        self.config.specs.vbd_id()
     }
 
     pub fn last_commit_id(&self) -> &CommitId {
@@ -939,19 +989,19 @@ impl VirtualBlockDevice {
     }
 
     pub fn block_size(&self) -> usize {
-        *self.config.specs.block_size
+        *self.config.specs.block_size()
     }
 
     pub fn blocks(&self) -> usize {
-        *self.config.specs.cluster_size * self.state.commit().clusters.len()
+        *self.config.specs.cluster_size() * self.state.commit().clusters.len()
     }
 
     pub fn cluster_size(&self) -> usize {
-        *self.config.specs.cluster_size
+        *self.config.specs.cluster_size()
     }
 
     pub fn total_size(&self) -> usize {
-        self.blocks() * *self.config.specs.block_size
+        self.blocks() * *self.config.specs.block_size()
     }
 }
 
@@ -973,18 +1023,18 @@ impl Block {
     }
 
     pub fn zeroed(specs: &FixedSpecs) -> Self {
-        Self::from_bytes(specs, BytesMut::zeroed(*specs.block_size).freeze())
+        Self::from_bytes(specs, BytesMut::zeroed(*specs.block_size()).freeze())
     }
 
     fn calc_content_id(specs: &FixedSpecs, bytes: &Bytes) -> BlockId {
-        let mut hasher = specs.content_hash.new();
+        let mut hasher = specs.content_hash().new();
         hasher.update("--sia_vbd block hash v1 start--\n".as_bytes());
-        hasher.update("uuid: ".as_bytes());
-        hasher.update(specs.vbd_id.as_bytes());
+        hasher.update("vbd_id: ".as_bytes());
+        hasher.update(specs.vbd_id().as_bytes());
         hasher.update("\nblock_size: ".as_bytes());
         hasher.update(bytes.len().to_be_bytes());
         hasher.update("hash_algorithm: ".as_bytes());
-        hasher.update(specs.content_hash.as_str().as_bytes());
+        hasher.update(specs.content_hash().as_str().as_bytes());
         hasher.update("\n content: \n".as_bytes());
         hasher.update(&bytes);
         hasher.update("\n--sia_vbd block hash v1 end--".as_bytes());
@@ -1013,7 +1063,7 @@ pub(crate) struct ClusterMut {
 impl ClusterMut {
     pub fn zeroed(specs: FixedSpecs, zero_block_id: &BlockId) -> Self {
         Self {
-            blocks: (0..*specs.cluster_size)
+            blocks: (0..*specs.cluster_size())
                 .map(|_| zero_block_id.clone())
                 .collect(),
             specs,
@@ -1040,16 +1090,16 @@ impl ClusterMut {
     }
 
     fn calc_content_id(&self) -> ClusterId {
-        let mut hasher = self.specs.meta_hash.new();
+        let mut hasher = self.specs.meta_hash().new();
         hasher.update("--sia_vbd cluster hash v1 start--\n".as_bytes());
-        hasher.update("uuid: ".as_bytes());
-        hasher.update(self.specs.vbd_id.as_bytes());
+        hasher.update("vbd_id: ".as_bytes());
+        hasher.update(self.specs.vbd_id().as_bytes());
         hasher.update("\nnumber_of_blocks: ".as_bytes());
         hasher.update(self.blocks.len().to_be_bytes());
         hasher.update("\nblock_size: ");
-        hasher.update(self.specs.block_size.to_be_bytes());
+        hasher.update(self.specs.block_size().to_be_bytes());
         hasher.update("\nhash_algorithm: ".as_bytes());
-        hasher.update(self.specs.meta_hash.as_str().as_bytes());
+        hasher.update(self.specs.meta_hash().as_str().as_bytes());
         hasher.update("\n content: ".as_bytes());
         self.blocks.iter().enumerate().for_each(|(i, id)| {
             hasher.update("\n--block entry start--\n".as_bytes());

@@ -1,8 +1,8 @@
+pub(crate) mod man;
 pub(crate) mod protos;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
-use crate::hash::HashAlgorithm;
 use crate::vbd::{BlockId, ClusterId, CommitId, FixedSpecs, TypedUuid, VbdId};
 use crate::Etag;
 use chrono::{DateTime, Duration, Utc};
@@ -10,12 +10,11 @@ use futures::{AsyncRead, AsyncSeek, AsyncWrite};
 use prost::DecodeError;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::{Error, ErrorKind, SeekFrom};
+use std::io::{Error, SeekFrom};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
 use thiserror::Error;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -71,18 +70,7 @@ impl TokioWalFile<ReadOnly> {
 impl<M> TokioWalFile<M> {
     pub async fn etag(&self) -> std::io::Result<Etag> {
         let metadata = self.file.get_ref().metadata().await?;
-        let mut hasher = HashAlgorithm::XXH3.new();
-        hasher.update(
-            metadata
-                .modified()?
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(|_| Error::new(ErrorKind::InvalidData, "file last_modified before 1970"))?
-                .as_nanos()
-                .to_be_bytes(),
-        );
-        hasher.update(metadata.len().to_be_bytes());
-        let hash = hasher.finalize();
-        Ok(Etag::copy_from(hash.as_ref()))
+        (&metadata).try_into()
     }
 
     pub fn path(&self) -> &Path {

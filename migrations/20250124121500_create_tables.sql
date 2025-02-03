@@ -39,7 +39,7 @@ CREATE TABLE known_blocks
 (
     block_id  BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(block_id) == 'blob' AND
                                                   LENGTH(block_id) >= 16 AND
-                                                  LENGTH(block_id <= 32)),
+                                                  LENGTH(block_id) <= 32),
     used      INTEGER NOT NULL CHECK (used >= 0),
     available INTEGER NOT NULL CHECK (available >= 0)
 );
@@ -67,7 +67,7 @@ CREATE TABLE known_clusters
 (
     cluster_id BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(cluster_id) == 'blob' AND
                                                    LENGTH(cluster_id) >= 16 AND
-                                                   LENGTH(cluster_id <= 32)),
+                                                   LENGTH(cluster_id) <= 32),
     used       INTEGER NOT NULL CHECK (used >= 0),
     available  INTEGER NOT NULL CHECK (available >= 0)
 );
@@ -95,7 +95,7 @@ CREATE TABLE known_commits
 (
     commit_id BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(commit_id) == 'blob' AND
                                                   LENGTH(commit_id) >= 16 AND
-                                                  LENGTH(commit_id <= 32)),
+                                                  LENGTH(commit_id) <= 32),
     used      INTEGER NOT NULL CHECK (used >= 0),
     available INTEGER NOT NULL CHECK (available >= 0)
 );
@@ -123,13 +123,13 @@ CREATE TABLE cluster_content
 (
     cluster_id  BLOB    NOT NULL CHECK (TYPEOF(cluster_id) == 'blob' AND
                                         LENGTH(cluster_id) >= 16 AND
-                                        LENGTH(cluster_id <= 32)),
+                                        LENGTH(cluster_id) <= 32),
     block_index INTEGER NOT NULL CHECK (block_index >= 0),
     block_id    BLOB    NOT NULL CHECK (TYPEOF(block_id) == 'blob' AND
                                         LENGTH(block_id) >= 16 AND
-                                        LENGTH(block_id <= 32)),
+                                        LENGTH(block_id) <= 32),
 
-    FOREIGN KEY (cluster_id) REFERENCES known_clusters (cluster_id),
+    FOREIGN KEY (cluster_id) REFERENCES known_clusters (cluster_id) ON DELETE CASCADE,
     FOREIGN KEY (block_id) REFERENCES known_blocks (block_id),
 
     UNIQUE (cluster_id, block_index)
@@ -169,13 +169,13 @@ CREATE TABLE commit_content
 (
     commit_id     BLOB    NOT NULL CHECK (TYPEOF(commit_id) == 'blob' AND
                                           LENGTH(commit_id) >= 16 AND
-                                          LENGTH(commit_id <= 32)),
+                                          LENGTH(commit_id) <= 32),
     cluster_index INTEGER NOT NULL CHECK (cluster_index >= 0),
     cluster_id    BLOB    NOT NULL CHECK (TYPEOF(cluster_id) == 'blob' AND
                                           LENGTH(cluster_id) >= 16 AND
-                                          LENGTH(cluster_id <= 32)),
+                                          LENGTH(cluster_id) <= 32),
 
-    FOREIGN KEY (commit_id) REFERENCES known_commits (commit_id),
+    FOREIGN KEY (commit_id) REFERENCES known_commits (commit_id) ON DELETE CASCADE,
     FOREIGN KEY (cluster_id) REFERENCES known_clusters (cluster_id),
 
     UNIQUE (commit_id, cluster_index)
@@ -217,7 +217,7 @@ CREATE TABLE branches
                                                                     name GLOB '[A-Za-z0-9_-]*'),
     commit_id    BLOB    NOT NULL CHECK (TYPEOF(commit_id) == 'blob' AND
                                          LENGTH(commit_id) >= 16 AND
-                                         LENGTH(commit_id <= 32)),
+                                         LENGTH(commit_id) <= 32),
     num_clusters INTEGER NOT NULL CHECK (num_clusters > 0),
 
     FOREIGN KEY (commit_id) REFERENCES known_commits (commit_id)
@@ -269,8 +269,8 @@ CREATE TABLE wal_files
 (
     id   BLOB NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
                                           LENGTH(id) == 16),
-    etag BLOB NOT NULL CHECK (TYPEOF(id) == 'blob' AND
-                              LENGTH(id) >= 8)
+    etag BLOB NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                              LENGTH(etag) >= 8)
 );
 
 -- Prevent Id changes
@@ -285,14 +285,14 @@ END;
 
 CREATE TABLE wal_content
 (
-    wal_id         BLOB    NOT NULL CHECK (TYPEOF(wal_id) == 'blob' AND
-                                           LENGTH(wal_id) == 16),
-    file_offset    INTEGER NOT NULL CHECK (file_offset > 0),
-    content_type   TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'S')),
+    wal_id       BLOB    NOT NULL CHECK (TYPEOF(wal_id) == 'blob' AND
+                                         LENGTH(wal_id) == 16),
+    file_offset  INTEGER NOT NULL CHECK (file_offset > 0),
+    content_type TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'S')),
 
-    block_id       BLOB,
-    cluster_id     BLOB,
-    commit_id      BLOB,
+    block_id     BLOB,
+    cluster_id   BLOB,
+    commit_id    BLOB,
 
     FOREIGN KEY (wal_id) REFERENCES wal_files (id) ON DELETE CASCADE,
     FOREIGN KEY (block_id) REFERENCES known_blocks (block_id),
@@ -318,7 +318,7 @@ BEGIN
 END;
 
 -- Reference Counting
-CREATE TRIGGER increment_used_counters_before_wal_content_block_insert
+CREATE TRIGGER increment_available_counter_before_wal_content_block_insert
     BEFORE INSERT
     ON wal_content
     WHEN NEW.block_id IS NOT NULL
@@ -329,7 +329,7 @@ BEGIN
     ON CONFLICT(block_id) DO UPDATE SET available = known_blocks.available + 1;
 END;
 
-CREATE TRIGGER increment_used_counters_before_wal_content_cluster_insert
+CREATE TRIGGER increment_available_counter_before_wal_content_cluster_insert
     BEFORE INSERT
     ON wal_content
     WHEN NEW.cluster_id IS NOT NULL
@@ -340,7 +340,7 @@ BEGIN
     ON CONFLICT(cluster_id) DO UPDATE SET available = available + 1;
 END;
 
-CREATE TRIGGER increment_used_counters_after_wal_content_commit_insert
+CREATE TRIGGER increment_available_counter_before_wal_content_commit_insert
     BEFORE INSERT
     ON wal_content
     WHEN NEW.commit_id IS NOT NULL
@@ -351,7 +351,7 @@ BEGIN
     ON CONFLICT(commit_id) DO UPDATE SET available = available + 1;
 END;
 
-CREATE TRIGGER decrement_used_counters_after_wal_content_delete
+CREATE TRIGGER decrement_available_counters_after_wal_content_delete
     AFTER DELETE
     ON wal_content
 BEGIN

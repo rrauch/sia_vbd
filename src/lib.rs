@@ -1,3 +1,4 @@
+use crate::hash::HashAlgorithm;
 use anyhow::anyhow;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt};
@@ -5,13 +6,15 @@ use once_cell::sync::Lazy;
 use sqlx::{Pool, Sqlite};
 use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
+use std::fs::Metadata;
 use std::future::Future;
-use std::io::{ErrorKind, SeekFrom};
+use std::io::{Error, ErrorKind, SeekFrom};
 use std::net::SocketAddr;
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 pub mod hash;
 pub mod inventory;
@@ -441,8 +444,14 @@ impl Etag {
     }
 }
 
-impl<T: Into<Bytes>> From<T> for Etag {
-    fn from(value: T) -> Self {
+impl From<Bytes> for Etag {
+    fn from(value: Bytes) -> Self {
+        Self { data: value }
+    }
+}
+
+impl From<Vec<u8>> for Etag {
+    fn from(value: Vec<u8>) -> Self {
         Self { data: value.into() }
     }
 }
@@ -466,6 +475,25 @@ impl Debug for Etag {
 impl AsRef<[u8]> for Etag {
     fn as_ref(&self) -> &[u8] {
         self.data.as_ref()
+    }
+}
+
+impl TryFrom<&Metadata> for Etag {
+    type Error = Error;
+
+    fn try_from(metadata: &Metadata) -> Result<Self, Self::Error> {
+        let mut hasher = HashAlgorithm::XXH3.new();
+        hasher.update(
+            metadata
+                .modified()?
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "file last_modified before 1970"))?
+                .as_nanos()
+                .to_be_bytes(),
+        );
+        hasher.update(metadata.len().to_be_bytes());
+        let hash = hasher.finalize();
+        Ok(Etag::copy_from(hash.as_ref()))
     }
 }
 

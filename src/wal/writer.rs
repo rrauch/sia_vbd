@@ -140,7 +140,7 @@ impl<IO: WalSink> WalWriter<IO> {
         let tx = Tx::new(
             Uuid::now_v7().into(),
             self.header.wal_id,
-            self.header.specs.vbd_id,
+            self.header.specs.vbd_id(),
             preceding_commit,
             Utc::now(),
             reserve_space,

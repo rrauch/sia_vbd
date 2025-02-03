@@ -35,14 +35,14 @@ impl From<Uuid> for uuid::Uuid {
 impl From<&crate::vbd::FixedSpecs> for FixedSpecs {
     fn from(value: &crate::vbd::FixedSpecs) -> Self {
         let mut v = Self {
-            vbd_id: Some(value.vbd_id.into()),
-            block_size: *value.block_size as u32,
-            cluster_size: *value.cluster_size as u32,
+            vbd_id: Some(value.vbd_id().into()),
+            block_size: *value.block_size() as u32,
+            cluster_size: *value.cluster_size() as u32,
             content_hash: 0,
             meta_hash: 0,
         };
-        v.set_content_hash(value.content_hash.into());
-        v.set_meta_hash(value.meta_hash.into());
+        v.set_content_hash(value.content_hash().into());
+        v.set_meta_hash(value.meta_hash().into());
         v
     }
 }
@@ -59,13 +59,13 @@ impl TryFrom<&FixedSpecs> for crate::vbd::FixedSpecs {
     type Error = anyhow::Error;
 
     fn try_from(value: &FixedSpecs) -> Result<Self, Self::Error> {
-        Ok(Self {
-            vbd_id: value.vbd_id.ok_or(anyhow!("vbd_id missing"))?.into(),
-            block_size: (value.block_size as usize).try_into()?,
-            cluster_size: (value.cluster_size as usize).try_into()?,
-            content_hash: value.content_hash().into(),
-            meta_hash: value.meta_hash().into(),
-        })
+        Ok(Self::new(
+            value.vbd_id.ok_or(anyhow!("vbd_id missing"))?.into(),
+            (value.cluster_size as usize).try_into()?,
+            (value.block_size as usize).try_into()?,
+            value.content_hash().into(),
+            value.meta_hash().into(),
+        ))
     }
 }
 
@@ -276,8 +276,8 @@ impl From<&crate::vbd::Commit> for Commit {
 pub(crate) mod frame {
     use self::Error::*;
     use crate::serde::{BodyType, Compressed};
-    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, StateFrameError};
     use crate::vbd::{BlockId, ClusterId, CommitId};
+    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, StateFrameError};
     use thiserror::Error;
 
     include!(concat!(env!("OUT_DIR"), "/protos/frame.rs"));

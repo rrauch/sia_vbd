@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
 
         eprintln!(
             "new vbd created: vbd_id: {}, branch: {}, commit: {}",
-            &vbd_specs.vbd_id, &branch, &commit
+            &vbd_specs.vbd_id(), &branch, &commit
         );
     }
 

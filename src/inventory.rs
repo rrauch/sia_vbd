@@ -3,8 +3,9 @@ use crate::vbd::{
     Block, BlockId, Cluster, ClusterId, ClusterMut, Commit, CommitId, CommitMut, FixedSpecs,
     WalReader,
 };
+use crate::wal::man::WalMan;
 use crate::wal::{TokioWalFile, TxDetails, WalId};
-use crate::SqlitePool;
+use crate::{Etag, SqlitePool};
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwap;
 use futures::{Stream, TryStreamExt};
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::iter;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::log::LevelFilter;
@@ -29,7 +30,7 @@ pub(crate) struct Inventory {
     zero_commits: ArcSwap<HashMap<usize, Commit>>,
     branch: String,
     current_commit: Commit,
-    wal_dir: PathBuf,
+    wal_man: Arc<WalMan>,
 }
 
 enum Id<'a> {
@@ -121,14 +122,15 @@ impl<'a> From<&'a CommitId> for Id<'a> {
 }
 
 impl Inventory {
-    #[instrument(fields(db_file = %db_file.display(), wal_dir = %wal_dir.as_ref().display(), branch = branch.as_ref()))]
+    #[instrument(skip(wal_man), fields(db_file = %db_file.display(), branch = branch.as_ref()
+    ))]
     pub(super) async fn create(
         db_file: &Path,
         max_db_connections: u8,
         specs: &FixedSpecs,
         num_clusters: usize,
         branch: impl AsRef<str>,
-        wal_dir: impl AsRef<Path>,
+        wal_man: Arc<WalMan>,
     ) -> Result<Self, anyhow::Error> {
         tracing::debug!("creating new inventory");
         let db_path_exists = tokio::fs::try_exists(db_file).await?;
@@ -216,16 +218,17 @@ impl Inventory {
                     .collect(),
             ),
             current_commit: zero_commit,
-            wal_dir: wal_dir.as_ref().to_path_buf(),
+            wal_man,
         })
     }
 
-    #[instrument(fields(db_file = %db_file.display(), wal_dir = %wal_dir.as_ref().display(), branch = branch.as_ref()))]
+    #[instrument(skip(wal_man), fields(db_file = %db_file.display(), branch = branch.as_ref()
+    ))]
     pub(super) async fn load(
         db_file: &Path,
         max_db_connections: u8,
         branch: impl AsRef<str>,
-        wal_dir: impl AsRef<Path>,
+        wal_man: Arc<WalMan>,
     ) -> Result<Self, anyhow::Error> {
         let (pool, specs) = db_init(db_file, max_db_connections, None).await?;
         let branch = branch.as_ref();
@@ -242,7 +245,7 @@ impl Inventory {
             .fetch_one(pool.read())
             .await?;
             (
-                Hash::try_from((r.commit_id.as_slice(), specs.meta_hash))?.into(),
+                Hash::try_from((r.commit_id.as_slice(), specs.meta_hash()))?.into(),
                 r.num_clusters as usize,
             )
         };
@@ -262,8 +265,10 @@ impl Inventory {
                     .collect(),
             ),
             current_commit: zero_commit,
-            wal_dir: wal_dir.as_ref().to_path_buf(),
+            wal_man,
         };
+
+        this.sync_wal_files().await?;
 
         this.current_commit = this
             .commit_by_id(&commit_id)
@@ -393,20 +398,13 @@ impl Inventory {
     }
 
     #[instrument[skip(self)]]
-    async fn open_wal_reader(&self, wal_id: &WalId) -> anyhow::Result<WalReader> {
-        let path = self.wal_dir.join(format!("{}.wal", wal_id));
-        tracing::debug!(path = %path.display(), "opening wal reader");
-        Ok(WalReader::new(TokioWalFile::open(&path).await?).await?)
-    }
-
-    #[instrument[skip(self)]]
     async fn commit_from_wal(&self, commit_id: &CommitId) -> anyhow::Result<Option<Commit>> {
         tracing::debug!("reading commit from wal");
         for (wal_id, offsets) in {
             let mut conn = self.pool.read().acquire().await?;
             self.wal_offsets_for_id(commit_id, conn.as_mut()).await?
         } {
-            let mut wal_reader = match self.open_wal_reader(&wal_id).await {
+            let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
                     tracing::error!(error = %err, wal_id = %wal_id, "opening wal reader failed");
@@ -432,7 +430,7 @@ impl Inventory {
             let mut conn = self.pool.read().acquire().await?;
             self.wal_offsets_for_id(cluster_id, conn.as_mut()).await?
         } {
-            let mut wal_reader = match self.open_wal_reader(&wal_id).await {
+            let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
                     tracing::error!(error = %err, wal_id = %wal_id, "opening wal reader failed");
@@ -458,7 +456,7 @@ impl Inventory {
             let mut conn = self.pool.read().acquire().await?;
             self.wal_offsets_for_id(block_id, conn.as_mut()).await?
         } {
-            let mut wal_reader = match self.open_wal_reader(&wal_id).await {
+            let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
                     tracing::error!(error = %err, wal_id = %wal_id, "opening wal reader failed");
@@ -562,7 +560,7 @@ impl Inventory {
             .map_err(|e| anyhow::Error::from(e))
             .try_filter_map(|r| async move {
                 let idx = r.cluster_index as usize;
-                Hash::try_from((r.cluster_id.as_slice(), self.specs.meta_hash))
+                Hash::try_from((r.cluster_id.as_slice(), self.specs.meta_hash()))
                     .map(|h| Some((idx, h.into())))
             })
             .try_collect::<Vec<(usize, ClusterId)>>()
@@ -606,7 +604,7 @@ impl Inventory {
             .map_err(|e| anyhow::Error::from(e))
             .try_filter_map(|r| async move {
                 let idx = r.block_index as usize;
-                Hash::try_from((r.block_id.as_slice(), self.specs.meta_hash))
+                Hash::try_from((r.block_id.as_slice(), self.specs.meta_hash()))
                     .map(|h| Some((idx, h.into())))
             })
             .try_collect::<Vec<(usize, BlockId)>>()
@@ -643,7 +641,8 @@ impl Inventory {
         commit: &Commit,
         zero_cluster_id: &ClusterId,
         tx: &mut SqliteConnection,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        let mut rows_affected = 0;
         let commit_id = commit.content_id().as_ref();
         let num_clusters = {
             let r = sqlx::query!(
@@ -658,26 +657,27 @@ impl Inventory {
         };
         if num_clusters == commit.len() {
             // already synced
-            return Ok(());
+            return Ok(rows_affected);
         };
 
         if num_clusters > 0 {
             // invalid, delete
-            sqlx::query!(
+            rows_affected += sqlx::query!(
                 "
                 DELETE FROM commit_content WHERE commit_id = ?;
                 ",
                 commit_id
             )
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
         }
 
         let mut idx = 0;
         for cluster_id in commit.cluster_ids() {
             if cluster_id != zero_cluster_id {
                 let cluster_id = cluster_id.as_ref();
-                sqlx::query!(
+                rows_affected += sqlx::query!(
                     "
                     INSERT INTO commit_content (commit_id, cluster_index, cluster_id)
                     VALUES (?, ?, ?)
@@ -687,12 +687,13 @@ impl Inventory {
                     cluster_id,
                 )
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected();
             }
             idx += 1;
         }
 
-        Ok(())
+        Ok(rows_affected)
     }
 
     #[instrument[skip(tx), fields(cluster = %cluster.content_id())]]
@@ -700,7 +701,8 @@ impl Inventory {
         cluster: &Cluster,
         zero_block_id: &BlockId,
         tx: &mut SqliteConnection,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        let mut rows_affected = 0;
         let num_blocks = {
             let cluster_id = cluster.content_id().as_ref();
             let r = sqlx::query!(
@@ -715,26 +717,27 @@ impl Inventory {
         };
         if num_blocks == cluster.len() {
             // already synced
-            return Ok(());
+            return Ok(rows_affected);
         };
         let cluster_id = cluster.content_id().as_ref();
         if num_blocks > 0 {
             // invalid, delete
-            sqlx::query!(
+            rows_affected += sqlx::query!(
                 "
                 DELETE FROM cluster_content WHERE cluster_id = ?;
                 ",
                 cluster_id
             )
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
         }
 
         let mut idx = 0;
         for block_id in cluster.block_ids() {
             if block_id != zero_block_id {
                 let block_id = block_id.as_ref();
-                sqlx::query!(
+                rows_affected += sqlx::query!(
                     "
                     INSERT INTO cluster_content (cluster_id, block_index, block_id)
                     VALUES (?, ?, ?)
@@ -744,12 +747,13 @@ impl Inventory {
                     block_id,
                 )
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected();
             }
             idx += 1;
         }
 
-        Ok(())
+        Ok(rows_affected)
     }
 
     fn unused<'a>(
@@ -775,7 +779,7 @@ impl Inventory {
         .map_err(|e| anyhow::Error::from(e))
         .try_filter_map(move |r| async move {
             if let Some(block_id) = r.block_id {
-                Hash::try_from((block_id.as_slice(), specs.content_hash))
+                Hash::try_from((block_id.as_slice(), specs.content_hash()))
                     .map(|h| h.into())
                     .map(|b: BlockId| {
                         if &b == zero_block_id {
@@ -785,7 +789,7 @@ impl Inventory {
                         }
                     })
             } else if let Some(cluster_id) = r.cluster_id {
-                Hash::try_from((cluster_id.as_slice(), specs.meta_hash))
+                Hash::try_from((cluster_id.as_slice(), specs.meta_hash()))
                     .map(|h| h.into())
                     .map(|c: ClusterId| {
                         if &c == zero_cluster_id {
@@ -795,7 +799,7 @@ impl Inventory {
                         }
                     })
             } else if let Some(commit_id) = r.commit_id {
-                Hash::try_from((commit_id.as_slice(), specs.meta_hash))
+                Hash::try_from((commit_id.as_slice(), specs.meta_hash()))
                     .map(|h| h.into())
                     .map(|c: CommitId| {
                         if zero_commit_ids.contains(&c) {
@@ -814,7 +818,8 @@ impl Inventory {
     async fn process_tx_details(
         tx_details: &TxDetails,
         tx: &mut SqliteConnection,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        let mut rows_affected = 0;
         let items = tx_details
             .blocks
             .iter()
@@ -842,7 +847,7 @@ impl Inventory {
                 Id::ClusterId(_) => ("C", None, Some(id_bytes), None),
                 Id::CommitId(_) => ("S", None, None, Some(id_bytes)),
             };
-            sqlx::query!(
+            rows_affected += sqlx::query!(
             "
                     INSERT INTO wal_content (wal_id, file_offset, content_type, block_id, cluster_id, commit_id)
                     VALUES (?, ?, ?, ?, ?, ?);
@@ -855,9 +860,175 @@ impl Inventory {
             commit_id
             )
                 .execute(&mut *tx)
+                .await?.rows_affected();
+        }
+        Ok(rows_affected)
+    }
+
+    #[instrument[skip_all]]
+    pub async fn sync_wal_files(&mut self) -> anyhow::Result<()> {
+        tracing::info!("syncing wal files");
+        let wal_files = self.wal_man.wal_files().await?;
+
+        let mut known_wal_files: HashMap<WalId, Etag> = HashMap::default();
+        let mut tx = self.pool.write().begin().await?;
+        for r in sqlx::query!("SELECT id, etag FROM wal_files")
+            .fetch_all(tx.as_mut())
+            .await?
+            .into_iter()
+        {
+            let wal_id = match WalId::try_from(r.id.as_slice()) {
+                Ok(wal_id) => wal_id,
+                Err(err) => {
+                    tracing::error!(wal_id = ?r.id, "invalid wal_id found in database, removing");
+                    sqlx::query!("DELETE FROM wal_files WHERE id = ?", r.id)
+                        .execute(tx.as_mut())
+                        .await?;
+                    continue;
+                }
+            };
+            known_wal_files.insert(wal_id, Etag::from(r.etag));
+        }
+
+        for (wal_id, etag) in wal_files {
+            let mut in_sync = false;
+            if let Some(known_etag) = known_wal_files.remove(&wal_id) {
+                if &known_etag == &etag {
+                    in_sync = true;
+                }
+            }
+            if !in_sync {
+                tracing::info!(wal_id = %wal_id, "wal file needs syncing");
+                self.sync_wal_file(&wal_id, &etag, tx.as_mut()).await?;
+            }
+        }
+
+        for obsolete in known_wal_files.into_keys() {
+            tracing::debug!(
+                wal_id = %obsolete,
+                "removing obsolete wal file from inventory",
+            );
+            let id = obsolete.as_bytes().as_slice();
+            sqlx::query!("DELETE FROM wal_files WHERE id = ?", id)
+                .execute(tx.as_mut())
                 .await?;
         }
+
+        tx.commit().await?;
+
         Ok(())
+    }
+
+    #[instrument(skip(self, tx), fields(wal_id = %wal_id))]
+    async fn sync_wal_file(
+        &mut self,
+        wal_id: &WalId,
+        etag: &Etag,
+        tx: &mut SqliteConnection,
+    ) -> anyhow::Result<u64> {
+        tracing::debug!("syncing wal file");
+        let mut wal_reader = self.wal_man.open_reader(wal_id).await?;
+
+        let id = wal_id.as_bytes().as_slice();
+        let etag = etag.as_ref();
+
+        let rows_affected = sqlx::query!("DELETE FROM wal_files WHERE id = ?", id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tracing::trace!(
+            rows_affected,
+            "deleted wal_file related entries from database"
+        );
+        let mut rows_affected = 0;
+        rows_affected += sqlx::query!(
+            "INSERT INTO wal_files (id, etag)
+             VALUES (?, ?)
+            ",
+            id,
+            etag
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let mut clusters = HashMap::new();
+        let mut commits = HashMap::new();
+
+        {
+            let mut stream = wal_reader.transactions(None).await?;
+            while let Some(tx_details) = stream.try_next().await? {
+                rows_affected += Self::process_tx_details(&tx_details, &mut *tx).await?;
+                tx_details.clusters.into_iter().for_each(|(id, offset)| {
+                    clusters.insert(id, offset);
+                });
+                tx_details.commits.into_iter().for_each(|(id, offset)| {
+                    commits.insert(id, offset);
+                });
+            }
+        }
+
+        let zero_block_id = self.zero_block().content_id().clone();
+        let zero_cluster_id = self.zero_cluster().content_id().clone();
+        let zero_commit_ids = {
+            self.zero_commits
+                .load()
+                .values()
+                .into_iter()
+                .map(|c| c.content_id().clone())
+                .collect::<Vec<_>>()
+        };
+
+        // find any unused content that has been in this wal file
+        for (id, offset) in Self::unused(
+            &mut *tx,
+            &self.specs,
+            &zero_block_id,
+            &zero_cluster_id,
+            &zero_commit_ids,
+        )
+        .try_filter_map(|id| {
+            let clusters = &clusters;
+            let commits = &commits;
+            async move {
+                Ok(match &id {
+                    Id::BlockId(block_id) => None,
+                    Id::ClusterId(cluster_id) => {
+                        if let Some(offset) = clusters.get(cluster_id).map(|c| *c) {
+                            Some((id, offset))
+                        } else {
+                            None
+                        }
+                    }
+                    Id::CommitId(commit_id) => {
+                        if let Some(offset) = commits.get(commit_id).map(|c| *c) {
+                            Some((id, offset))
+                        } else {
+                            None
+                        }
+                    }
+                })
+            }
+        })
+        .try_collect::<Vec<_>>()
+        .await?
+        {
+            match id {
+                Id::BlockId(_) => {}
+                Id::ClusterId(cluster_id) => {
+                    let cluster = wal_reader.cluster(&cluster_id, offset).await?;
+                    rows_affected +=
+                        Self::sync_cluster_content(&cluster, &zero_block_id, &mut *tx).await?;
+                }
+                Id::CommitId(commit_id) => {
+                    let commit = wal_reader.commit(&commit_id, offset).await?;
+                    rows_affected +=
+                        Self::sync_commit_content(&commit, &zero_cluster_id, &mut *tx).await?;
+                }
+            }
+        }
+        tracing::debug!(rows_affected, "wal file sync complete");
+        Ok(rows_affected)
     }
 
     #[instrument[skip(self, tx_details), fields(wal_file = %wal_file.as_ref().display())]]
@@ -996,11 +1167,12 @@ async fn db_init(
     if let Some(specs) = specs {
         // check config
         {
-            let vbd_id = specs.vbd_id.as_bytes().as_slice();
-            let cluster_size = *specs.cluster_size as i64;
-            let block_size = *specs.block_size as i64;
-            let content_hash = to_db_hash(specs.content_hash);
-            let meta_hash = to_db_hash(specs.meta_hash);
+            let vbd_id = specs.vbd_id();
+            let vbd_id = vbd_id.as_bytes().as_slice();
+            let cluster_size = *specs.cluster_size() as i64;
+            let block_size = *specs.block_size() as i64;
+            let content_hash = to_db_hash(specs.content_hash());
+            let meta_hash = to_db_hash(specs.meta_hash());
             sqlx::query!(
                 "
             INSERT INTO config (vbd_id, cluster_size, block_size, content_hash, meta_hash)
@@ -1027,13 +1199,13 @@ async fn db_init(
     .fetch_one(tx.as_mut())
     .await?;
 
-    let specs = FixedSpecs {
-        vbd_id: r.vbd_id.as_slice().try_into()?,
-        cluster_size: (r.cluster_size as usize).try_into()?,
-        block_size: (r.block_size as usize).try_into()?,
-        content_hash: try_from_db_hash(r.content_hash)?,
-        meta_hash: try_from_db_hash(r.meta_hash)?,
-    };
+    let specs = FixedSpecs::new(
+        r.vbd_id.as_slice().try_into()?,
+        (r.cluster_size as usize).try_into()?,
+        (r.block_size as usize).try_into()?,
+        try_from_db_hash(r.content_hash)?,
+        try_from_db_hash(r.meta_hash)?,
+    );
 
     tx.commit().await?;
 

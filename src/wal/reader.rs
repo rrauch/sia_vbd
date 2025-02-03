@@ -320,7 +320,7 @@ impl<'a, IO: WalSource + 'a> Stream for TxStream<'a, IO> {
                         frame_stream,
                         preceding_cid,
                         self.wal_id.clone(),
-                        self.specs.vbd_id.clone(),
+                        self.specs.vbd_id().clone(),
                     ));
                     continue;
                 }
@@ -356,7 +356,7 @@ impl<'a, IO: WalSource + 'a> Stream for TxStream<'a, IO> {
                             frame_stream,
                             Some(tx_details.commit_id.clone()),
                             self.wal_id.clone(),
-                            self.specs.vbd_id.clone(),
+                            self.specs.vbd_id().clone(),
                         ));
                         return Poll::Ready(Some(Ok(tx_details)));
                     }
@@ -381,13 +381,13 @@ async fn read_file_header<IO: WalSource>(
         return Err(InvalidMagicNumber)?;
     }
 
-    let dummy_specs = FixedSpecs {
-        vbd_id: Uuid::now_v7().into(),
-        cluster_size: ClusterSize::Cs256,
-        block_size: BlockSize::Bs64k,
-        content_hash: HashAlgorithm::Blake3,
-        meta_hash: HashAlgorithm::Blake3,
-    };
+    let dummy_specs = FixedSpecs::new(
+        Uuid::now_v7().into(),
+        ClusterSize::Cs256,
+        BlockSize::Bs64k,
+        HashAlgorithm::Blake3,
+        HashAlgorithm::Blake3,
+    );
     let mut stream = DecodedStream::from_reader(io, dummy_specs);
     match stream.next().await.transpose()? {
         Some(Decoded::WalInfo(frame)) => Ok((frame.header().clone(), frame.position().clone())),
