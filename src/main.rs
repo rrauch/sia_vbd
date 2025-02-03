@@ -133,13 +133,16 @@ async fn main() -> anyhow::Result<()> {
             arguments.meta_hash,
             &db_file,
             &arguments.wal_dir,
+            arguments.max_wal_size.as_u64(),
             &branch,
         )
         .await?;
 
         eprintln!(
             "new vbd created: vbd_id: {}, branch: {}, commit: {}",
-            &vbd_specs.vbd_id(), &branch, &commit
+            &vbd_specs.vbd_id(),
+            &branch,
+            &commit
         );
     }
 

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 const MAX_WAL_FILE_SIZE: u64 = 1024 * 1024 * 128;
 
-pub(crate) struct WalWriterBuilder<IO> {
+pub(super) struct WalWriterBuilder<IO> {
     io: IO,
     id: WalId,
     max_size: u64,
@@ -53,7 +53,7 @@ pub(crate) struct WalWriter<IO> {
 }
 
 impl<IO: WalSink> WalWriter<IO> {
-    pub fn builder(io: IO, id: WalId, specs: FixedSpecs) -> WalWriterBuilder<IO> {
+    pub(super) fn builder(io: IO, id: WalId, specs: FixedSpecs) -> WalWriterBuilder<IO> {
         WalWriterBuilder {
             io,
             id,
@@ -160,21 +160,13 @@ impl<IO> AsRef<IO> for WalWriter<IO> {
 }
 
 pub struct Tx<IO: WalSink> {
+    wal_id: WalId,
     initial_len: u64,
     len: u64,
     position: u64,
     writer: Option<WalWriter<IO>>,
     builder: TxDetailBuilder,
     encoder: Encoder,
-}
-
-impl<IO: WalSink> AsRef<IO> for Tx<IO> {
-    fn as_ref(&self) -> &IO {
-        self.writer
-            .as_ref()
-            .map(|w| &w.io)
-            .expect("writer to be set")
-    }
 }
 
 enum Puttable<'a> {
@@ -242,13 +234,14 @@ impl<IO: WalSink> Tx<IO> {
 
         let tx_detail_builder = TxDetailBuilder::new(
             id,
-            wal_id,
+            wal_id.clone(),
             vbd_id,
             preceding_commit.clone(),
             created.clone(),
         );
 
         let mut this = Self {
+            wal_id,
             initial_len,
             len: initial_len + max_len,
             position: initial_len,
@@ -272,6 +265,10 @@ impl<IO: WalSink> Tx<IO> {
 
     pub fn id(&self) -> TxId {
         self.builder.tx_id
+    }
+
+    pub fn wal_id(&self) -> WalId {
+        self.wal_id
     }
 
     async fn write_tx_begin(

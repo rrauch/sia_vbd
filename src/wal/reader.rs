@@ -32,7 +32,7 @@ pub struct WalReader<IO> {
 
 impl<IO: WalSource> WalReader<IO> {
     #[instrument(skip(io))]
-    pub async fn new(mut io: IO) -> Result<Self, WalError> {
+    pub(super) async fn new(mut io: IO) -> Result<Self, WalError> {
         let (header, pos) = read_file_header(&mut io).await?;
 
         Ok(Self {

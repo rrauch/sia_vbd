@@ -2,7 +2,7 @@ use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::Inventory;
 use crate::wal;
 use crate::wal::man::WalMan;
-use crate::wal::{ReadOnly, ReadWrite, RollbackError, TokioWalFile, WalError, WalId};
+use crate::wal::{ReadWrite, RollbackError, TokioWalFile, WalError, WalReader, WalWriter};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use std::cmp::min;
@@ -237,13 +237,12 @@ pub type CommitId = ContentId<Commit>;
 pub type VbdId = TypedUuid<VirtualBlockDevice>;
 
 type WalTx = wal::writer::Tx<TokioWalFile<ReadWrite>>;
-pub(crate) type WalReader = wal::reader::WalReader<TokioWalFile<ReadOnly>>;
-type WalWriter = wal::writer::WalWriter<TokioWalFile<ReadWrite>>;
 
 pub struct VirtualBlockDevice {
     config: Arc<Config>,
     state: State,
     inventory: Arc<RwLock<Inventory>>,
+    wal_man: Arc<WalMan>,
 }
 
 struct Config {
@@ -335,9 +334,14 @@ struct Committed {
 }
 
 impl Committed {
-    async fn begin(mut self, config: Arc<Config>) -> Result<Uncommitted, (BlockError, Self)> {
+    async fn begin(
+        mut self,
+        config: Arc<Config>,
+        wal_man: Arc<WalMan>,
+    ) -> Result<Uncommitted, (BlockError, Self)> {
         async fn prepare_wal(
             mut wal: Option<WalWriter>,
+            wal_man: &WalMan,
             config: &Config,
         ) -> Result<WalWriter, BlockError> {
             let mut preceding_wal_id = None;
@@ -351,30 +355,32 @@ impl Committed {
 
             if wal.is_none() {
                 // start a new wal
-                let wal_id: WalId = Uuid::now_v7().into();
-                let file = TokioWalFile::create_new(config.wal_dir.join(format!("{}.wal", wal_id)))
-                    .await?;
-
-                let mut builder = WalWriter::builder(file, wal_id, config.specs.clone())
-                    .max_file_size(config.max_wal_size);
-                if let Some(wal_id) = preceding_wal_id {
-                    builder = builder.preceding_wal_id(wal_id);
-                }
-                //todo: compressor
-                wal = Some(builder.build().await?);
+                wal = Some(
+                    wal_man
+                        .new_writer(preceding_wal_id, config.specs.clone())
+                        .await?,
+                );
             }
 
             Ok(wal.expect("wal should be Some"))
         }
 
-        let wal = match prepare_wal(self.wal.take(), &config).await {
+        let wal = match prepare_wal(self.wal.take(), &wal_man, &config).await {
             Ok(wal) => wal,
             Err(err) => {
                 return Err((err, self));
             }
         };
 
-        match Uncommitted::new(wal, self.commit.clone(), config, self.inventory.clone()).await {
+        match Uncommitted::new(
+            wal,
+            self.commit.clone(),
+            config,
+            self.inventory.clone(),
+            wal_man,
+        )
+        .await
+        {
             Ok(u) => Ok(u),
             Err((err, wal)) => {
                 let wal = wal.ok();
@@ -472,6 +478,7 @@ struct Uncommitted {
     wal_reader: Mutex<Option<WalReader>>,
     wal_blocks: HashMap<BlockId, u64>,
     inventory: Arc<RwLock<Inventory>>,
+    wal_man: Arc<WalMan>,
 }
 
 impl Uncommitted {
@@ -480,6 +487,7 @@ impl Uncommitted {
         previous_commit: Commit,
         config: Arc<Config>,
         inventory: Arc<RwLock<Inventory>>,
+        wal_man: Arc<WalMan>,
     ) -> Result<Self, (BlockError, Result<WalWriter, RollbackError>)> {
         let wal_tx = match wal
             .begin(previous_commit.content_id().clone(), config.max_tx_size)
@@ -503,6 +511,7 @@ impl Uncommitted {
             wal_blocks: HashMap::default(),
             wal_reader: Mutex::new(None),
             inventory,
+            wal_man,
         })
     }
 
@@ -523,12 +532,8 @@ impl Uncommitted {
                         if let Some(offset) = self.wal_blocks.get(&block_id) {
                             let mut lock = self.wal_reader.lock().await;
                             if lock.is_none() {
-                                *lock = Some(
-                                    WalReader::new(
-                                        TokioWalFile::open(self.wal_tx.as_ref().path()).await?,
-                                    )
-                                    .await?,
-                                );
+                                *lock =
+                                    Some(self.wal_man.open_reader(&self.wal_tx.wal_id()).await?);
                             }
 
                             let wal_reader = lock.as_mut().unwrap();
@@ -676,7 +681,7 @@ impl Uncommitted {
         match self.wal_tx.commit(new_commit.content_id()).await {
             Ok((wal, tx_details)) => {
                 tracing::debug!(commit = %new_commit.content_id(), "wal commit succeeded");
-                if let Err(err) = inventory.update_wal(&tx_details, wal.as_ref().path()).await {
+                if let Err(err) = inventory.update_wal(&tx_details, wal.id()).await {
                     tracing::error!(error = %err, commit = %new_commit.content_id(), "wal sync failed after commit");
                 }
                 Ok({
@@ -714,6 +719,7 @@ impl VirtualBlockDevice {
         meta_hash: HashAlgorithm,
         db_file: impl AsRef<Path>,
         wal_dir: impl AsRef<Path>,
+        max_wal_size: u64,
         branch: impl AsRef<str>,
     ) -> Result<(FixedSpecs, String, CommitId), anyhow::Error> {
         let vbd_id = Uuid::now_v7().into();
@@ -724,7 +730,7 @@ impl VirtualBlockDevice {
             &specs,
             num_clusters,
             branch.as_ref(),
-            Arc::new(WalMan::new(wal_dir)),
+            Arc::new(WalMan::new(wal_dir, max_wal_size)),
         )
         .await?;
         Ok((
@@ -757,10 +763,16 @@ impl VirtualBlockDevice {
             ),
         }
 
-        let wal_man = Arc::new(WalMan::new(&wal_dir));
+        let wal_man = Arc::new(WalMan::new(&wal_dir, max_wal_size));
 
         let inventory = Arc::new(RwLock::new(
-            Inventory::load(db_file.as_ref(), max_db_connections, branch, wal_man).await?,
+            Inventory::load(
+                db_file.as_ref(),
+                max_db_connections,
+                branch,
+                wal_man.clone(),
+            )
+            .await?,
         ));
 
         let lock = inventory.read().await;
@@ -793,6 +805,7 @@ impl VirtualBlockDevice {
                 inventory: inventory.clone(),
             }),
             inventory,
+            wal_man,
         })
     }
 
@@ -929,15 +942,17 @@ impl VirtualBlockDevice {
 
         if let State::Committed(_) = &self.state {
             match std::mem::replace(&mut self.state, State::Poisoned) {
-                State::Committed(state) => match state.begin(self.config.clone()).await {
-                    Ok(uncommited) => {
-                        self.state = State::Uncommitted(uncommited);
+                State::Committed(state) => {
+                    match state.begin(self.config.clone(), self.wal_man.clone()).await {
+                        Ok(uncommited) => {
+                            self.state = State::Uncommitted(uncommited);
+                        }
+                        Err((e, commited)) => {
+                            self.state = State::Committed(commited);
+                            return Err(e);
+                        }
                     }
-                    Err((e, commited)) => {
-                        self.state = State::Committed(commited);
-                        return Err(e);
-                    }
-                },
+                }
                 _ => unreachable!(),
             }
         }

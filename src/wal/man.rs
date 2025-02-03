@@ -1,19 +1,23 @@
-use crate::vbd::WalReader;
-use crate::wal::{TokioWalFile, WalId};
+use crate::vbd::FixedSpecs;
+use crate::wal::{TokioWalFile, WalId, WalReader, WalWriter};
 use crate::Etag;
 use std::path::{Path, PathBuf};
 use tracing::instrument;
+use uuid::Uuid;
 
 pub(crate) struct WalMan {
     wal_dir: PathBuf,
+    max_file_size: u64,
 }
 
 impl WalMan {
     #[instrument(skip_all)]
-    pub fn new<P: AsRef<Path>>(wal_dir: P) -> Self {
+    pub fn new<P: AsRef<Path>>(wal_dir: P, max_file_size: u64) -> Self {
+        assert!(max_file_size > 0);
         let wal_dir = wal_dir.as_ref();
         Self {
             wal_dir: wal_dir.to_path_buf(),
+            max_file_size,
         }
     }
 
@@ -53,5 +57,23 @@ impl WalMan {
         let path = self.wal_dir.join(format!("{}.wal", wal_id));
         tracing::debug!(path = %path.display(), "opening wal reader");
         Ok(WalReader::new(TokioWalFile::open(&path).await?).await?)
+    }
+
+    #[instrument(skip_all)]
+    pub(crate) async fn new_writer<T: Into<Option<WalId>>>(
+        &self,
+        preceding_wal_id: T,
+        fixed_specs: FixedSpecs,
+    ) -> anyhow::Result<WalWriter> {
+        let wal_id: WalId = Uuid::now_v7().into();
+        let path = self.wal_dir.join(format!("{}.wal", wal_id));
+        tracing::debug!(path = %path.display(), "creating new wal writer");
+        let file = TokioWalFile::create_new(self.wal_dir.join(format!("{}.wal", wal_id))).await?;
+        let mut builder =
+            WalWriter::builder(file, wal_id, fixed_specs).max_file_size(self.max_file_size);
+        if let Some(wal_id) = preceding_wal_id.into() {
+            builder = builder.preceding_wal_id(wal_id);
+        }
+        Ok(builder.build().await?)
     }
 }

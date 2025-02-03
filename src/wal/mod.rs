@@ -131,6 +131,8 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> WalSource for T {}
 
 pub struct Wal {}
 pub type WalId = TypedUuid<Wal>;
+pub type WalReader = reader::WalReader<TokioWalFile<ReadOnly>>;
+pub type WalWriter = writer::WalWriter<TokioWalFile<ReadWrite>>;
 
 pub struct TxDetails {
     pub tx_id: TxId,

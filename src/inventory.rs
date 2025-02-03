@@ -1,10 +1,9 @@
 use crate::hash::{Hash, HashAlgorithm};
 use crate::vbd::{
     Block, BlockId, Cluster, ClusterId, ClusterMut, Commit, CommitId, CommitMut, FixedSpecs,
-    WalReader,
 };
 use crate::wal::man::WalMan;
-use crate::wal::{TokioWalFile, TxDetails, WalId};
+use crate::wal::{TxDetails, WalId};
 use crate::{Etag, SqlitePool};
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwap;
@@ -880,7 +879,7 @@ impl Inventory {
             let wal_id = match WalId::try_from(r.id.as_slice()) {
                 Ok(wal_id) => wal_id,
                 Err(err) => {
-                    tracing::error!(wal_id = ?r.id, "invalid wal_id found in database, removing");
+                    tracing::error!(error = %err, wal_id = ?r.id, "invalid wal_id found in database, removing");
                     sqlx::query!("DELETE FROM wal_files WHERE id = ?", r.id)
                         .execute(tx.as_mut())
                         .await?;
@@ -992,7 +991,7 @@ impl Inventory {
             let commits = &commits;
             async move {
                 Ok(match &id {
-                    Id::BlockId(block_id) => None,
+                    Id::BlockId(_) => None,
                     Id::ClusterId(cluster_id) => {
                         if let Some(offset) = clusters.get(cluster_id).map(|c| *c) {
                             Some((id, offset))
@@ -1031,14 +1030,14 @@ impl Inventory {
         Ok(rows_affected)
     }
 
-    #[instrument[skip(self, tx_details), fields(wal_file = %wal_file.as_ref().display())]]
-    pub async fn update_wal<P: AsRef<Path>>(
+    #[instrument[skip(self, tx_details), fields(wal_id = %wal_id)]]
+    pub async fn update_wal(
         &mut self,
         tx_details: &TxDetails,
-        wal_file: P,
+        wal_id: &WalId,
     ) -> anyhow::Result<()> {
         {
-            let mut wal_reader = WalReader::new(TokioWalFile::open(wal_file).await?).await?;
+            let mut wal_reader = self.wal_man.open_reader(wal_id).await?;
             let id = tx_details.wal_id.as_bytes().as_slice();
             let etag = wal_reader.as_ref().etag().await?;
             let etag = etag.as_ref();
