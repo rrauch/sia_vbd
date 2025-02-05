@@ -19,6 +19,8 @@ fn main() -> anyhow::Result<()> {
     prost_config.extern_path(".common", "crate::serde::protos");
     prost_config.compile_protos(&["protos/wal.proto"], &[""])?;
     prost_config.extern_path(".wal", "crate::wal::protos");
+    prost_config.compile_protos(&["protos/volume.proto"], &[""])?;
+    prost_config.extern_path(".volume", "crate::repository::protos::volume");
     prost_config.compile_protos(&["protos/frame.proto"], &[""])?;
     prost_config.extern_path(".frame", "crate::serde::protos::frame");
     println!("cargo:rerun-if-changed=protos");

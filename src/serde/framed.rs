@@ -1,6 +1,6 @@
 use crate::serde::PREAMBLE_LEN;
 use crate::vbd::Position;
-use crate::{AsyncReadExtBuffered, LimitedReader, WrappedReader};
+use crate::io::{AsyncReadExtBuffered, LimitedReader, WrappedReader};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc::Crc;
 use futures::future::BoxFuture;

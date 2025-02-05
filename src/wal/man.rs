@@ -1,5 +1,6 @@
+use crate::io::TokioFile;
 use crate::vbd::FixedSpecs;
-use crate::wal::{TokioWalFile, WalId, WalReader, WalWriter};
+use crate::wal::{WalId, WalReader, WalWriter};
 use crate::Etag;
 use std::path::{Path, PathBuf};
 use tracing::instrument;
@@ -55,8 +56,8 @@ impl WalMan {
     #[instrument(skip(self))]
     pub(crate) async fn open_reader(&self, wal_id: &WalId) -> anyhow::Result<WalReader> {
         let path = self.wal_dir.join(format!("{}.wal", wal_id));
-        tracing::debug!(path = %path.display(), "opening wal reader");
-        Ok(WalReader::new(TokioWalFile::open(&path).await?).await?)
+        tracing::trace!(path = %path.display(), "opening wal reader");
+        Ok(WalReader::new(TokioFile::open(&path).await?).await?)
     }
 
     #[instrument(skip_all)]
@@ -68,7 +69,7 @@ impl WalMan {
         let wal_id: WalId = Uuid::now_v7().into();
         let path = self.wal_dir.join(format!("{}.wal", wal_id));
         tracing::debug!(path = %path.display(), "creating new wal writer");
-        let file = TokioWalFile::create_new(self.wal_dir.join(format!("{}.wal", wal_id))).await?;
+        let file = TokioFile::create_new(self.wal_dir.join(format!("{}.wal", wal_id))).await?;
         let mut builder =
             WalWriter::builder(file, wal_id, fixed_specs).max_file_size(self.max_file_size);
         if let Some(wal_id) = preceding_wal_id.into() {

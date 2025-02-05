@@ -1,6 +1,6 @@
 use crate::nbd::block_device::Result;
 use crate::nbd::block_device::{read_reply, BlockDevice, Options, RequestContext};
-use crate::AsyncReadBytesExt;
+use crate::io::AsyncReadBytesExt;
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite};
 
@@ -116,7 +116,7 @@ impl read_reply::PayloadWriter for DummyWriter {
         self: Box<Self>,
         out: &mut (dyn AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()> {
-        use crate::AsyncWriteBytesExt;
+        use crate::io::AsyncWriteBytesExt;
         out.write_zeroes(self.length).await
     }
 }

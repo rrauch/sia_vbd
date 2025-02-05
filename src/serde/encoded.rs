@@ -1,9 +1,10 @@
+use crate::io::{AsyncReadExtBuffered, WrappedReader};
+use crate::repository::{BranchInfo, VolumeInfo};
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
 use crate::serde::protos::frame;
 use crate::serde::{framed, protos, Body, BodyType, Compressed, Compression, Compressor};
+use crate::vbd::{Block, BlockId, Cluster, ClusterId, FixedSpecs, Index, IndexId, Position};
 use crate::wal::{FileHeader as WalInfo, TxBegin, TxCommit};
-use crate::vbd::{Block, BlockId, Cluster, ClusterId, Commit, CommitId, FixedSpecs, Position};
-use crate::{AsyncReadExtBuffered, WrappedReader};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::io::BufReader;
@@ -116,18 +117,18 @@ impl<'a, R: InnerReader + 'a> DecodedReadFrame<ClusterId, R, Cluster> {
     }
 }
 
-impl<'a, R: InnerReader + 'a> DecodedReadFrame<CommitId, R, Commit> {
-    pub async fn read_body(&mut self) -> Result<Commit, DecodingError> {
+impl<'a, R: InnerReader + 'a> DecodedReadFrame<IndexId, R, Index> {
+    pub async fn read_body(&mut self) -> Result<Index, DecodingError> {
         let mut bytes = self.read_body_bytes().await?;
-        let proto_commit = protos::Commit::decode(&mut bytes)?;
-        let commit: Commit = (proto_commit, self.fixed_specs.clone()).try_into()?;
-        if &self.header != commit.content_id() {
+        let proto_index = protos::Index::decode(&mut bytes)?;
+        let index: Index = (proto_index, self.fixed_specs.clone()).try_into()?;
+        if &self.header != index.content_id() {
             return Err(BodyError::CommitIdMismatch(
                 self.header.clone(),
-                commit.content_id().clone(),
+                index.content_id().clone(),
             ))?;
         }
-        Ok(commit)
+        Ok(index)
     }
 }
 
@@ -195,10 +196,10 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
             let body = header.body.map(|b| b.try_into()).transpose()?;
             if let Some(t) = header.r#type {
                 Ok(match t {
-                    frame::header::Type::Commit(commit) => {
-                        let commit_id: CommitId = commit.try_into()?;
-                        let frame = DecodedReadFrame::new(commit_id, body, frame, fixed_specs);
-                        Decoded::Commit(frame)
+                    frame::header::Type::Index(index) => {
+                        let index_id: IndexId = index.try_into()?;
+                        let frame = DecodedReadFrame::new(index_id, body, frame, fixed_specs);
+                        Decoded::Index(frame)
                     }
                     frame::header::Type::Cluster(cluster) => {
                         let cluster_id: ClusterId = cluster.try_into()?;
@@ -224,6 +225,16 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
                         let wal_info: WalInfo = wal_info.try_into()?;
                         let frame = DecodedReadFrame::new(wal_info, body, frame, fixed_specs);
                         Decoded::WalInfo(frame)
+                    }
+                    frame::header::Type::VolumeInfo(volume_info) => {
+                        let volume_info: VolumeInfo = volume_info.try_into()?;
+                        let frame = DecodedReadFrame::new(volume_info, body, frame, fixed_specs);
+                        Decoded::VolumeInfo(frame)
+                    }
+                    frame::header::Type::BranchInfo(branch_info) => {
+                        let branch_info: BranchInfo = branch_info.try_into()?;
+                        let frame = DecodedReadFrame::new(branch_info, body, frame, fixed_specs);
+                        Decoded::BranchInfo(frame)
                     }
                 })
             } else {
@@ -310,7 +321,7 @@ pub(crate) enum BodyError {
     #[error("ClusterId Mismatch: [{0}] != [{1}]")]
     ClusterIdMismatch(ClusterId, ClusterId),
     #[error("CommitId Mismatch: [{0}] != [{1}]")]
-    CommitIdMismatch(CommitId, CommitId),
+    CommitIdMismatch(IndexId, IndexId),
 }
 
 pub(crate) enum Decoded<R: InnerReader> {
@@ -318,8 +329,10 @@ pub(crate) enum Decoded<R: InnerReader> {
     TxCommit(DecodedReadFrame<TxCommit, R, ()>),
     Block(DecodedReadFrame<BlockId, R, Bytes>),
     Cluster(DecodedReadFrame<ClusterId, R, Cluster>),
-    Commit(DecodedReadFrame<CommitId, R, Commit>),
+    Index(DecodedReadFrame<IndexId, R, Index>),
     WalInfo(DecodedReadFrame<WalInfo, R, ()>),
+    VolumeInfo(DecodedReadFrame<VolumeInfo, R, ()>),
+    BranchInfo(DecodedReadFrame<BranchInfo, R, ()>),
 }
 
 impl<R: InnerReader> Decoded<R> {
@@ -329,8 +342,10 @@ impl<R: InnerReader> Decoded<R> {
             Self::TxCommit(f) => f.position(),
             Self::Block(f) => f.position(),
             Self::Cluster(f) => f.position(),
-            Self::Commit(f) => f.position(),
+            Self::Index(f) => f.position(),
             Self::WalInfo(f) => f.position(),
+            Self::VolumeInfo(f) => f.position(),
+            Self::BranchInfo(f) => f.position(),
         }
     }
 
@@ -340,8 +355,10 @@ impl<R: InnerReader> Decoded<R> {
             Self::TxCommit(f) => f.body.as_ref(),
             Self::Block(f) => f.body.as_ref(),
             Self::Cluster(f) => f.body.as_ref(),
-            Self::Commit(f) => f.body.as_ref(),
+            Self::Index(f) => f.body.as_ref(),
             Self::WalInfo(f) => f.body.as_ref(),
+            Self::VolumeInfo(f) => f.body.as_ref(),
+            Self::BranchInfo(f) => f.body.as_ref(),
         }
     }
 }
@@ -432,16 +449,16 @@ impl Converter {
                 };
                 (header, Some(bytes), compression.is_some())
             }
-            Encodable::Commit(commit) => {
+            Encodable::Index(index) => {
                 let mut buf = self.body_buf.get();
-                Into::<protos::Commit>::into(commit).encode(&mut buf)?;
+                Into::<protos::Index>::into(index).encode(&mut buf)?;
                 let bytes = buf.freeze();
                 let compression = self.compression(bytes.len() as u64);
                 let header = frame::Header {
-                    r#type: Some(frame::header::Type::Commit(commit.content_id().into())),
+                    r#type: Some(frame::header::Type::Index(index.content_id().into())),
                     body: Some(
                         (&Body {
-                            body_type: BodyType::Commit,
+                            body_type: BodyType::Index,
                             compressed: compression.as_ref().map(|c| {
                                 Compressed {
                                     compression: c.clone(),
@@ -458,6 +475,22 @@ impl Converter {
             Encodable::WalInfo(wal_info) => (
                 frame::Header {
                     r#type: Some(frame::header::Type::WalInfo(wal_info.into())),
+                    body: None,
+                },
+                None,
+                false,
+            ),
+            Encodable::VolumeInfo(volume_info) => (
+                frame::Header {
+                    r#type: Some(frame::header::Type::VolumeInfo(volume_info.into())),
+                    body: None,
+                },
+                None,
+                false,
+            ),
+            Encodable::BranchInfo(branch_info) => (
+                frame::Header {
+                    r#type: Some(frame::header::Type::BranchInfo(branch_info.into())),
                     body: None,
                 },
                 None,
@@ -493,8 +526,10 @@ pub(crate) enum Encodable<'a> {
     TxCommit(&'a TxCommit),
     Block(&'a Block),
     Cluster(&'a Cluster),
-    Commit(&'a Commit),
+    Index(&'a Index),
     WalInfo(&'a WalInfo),
+    VolumeInfo(&'a VolumeInfo),
+    BranchInfo(&'a BranchInfo),
 }
 
 impl<'a> From<&'a TxBegin> for Encodable<'a> {
@@ -521,9 +556,9 @@ impl<'a> From<&'a Cluster> for Encodable<'a> {
     }
 }
 
-impl<'a> From<&'a Commit> for Encodable<'a> {
-    fn from(value: &'a Commit) -> Self {
-        Encodable::Commit(value)
+impl<'a> From<&'a Index> for Encodable<'a> {
+    fn from(value: &'a Index) -> Self {
+        Encodable::Index(value)
     }
 }
 
@@ -533,21 +568,37 @@ impl<'a> From<&'a WalInfo> for Encodable<'a> {
     }
 }
 
+impl<'a> From<&'a VolumeInfo> for Encodable<'a> {
+    fn from(value: &'a VolumeInfo) -> Self {
+        Encodable::VolumeInfo(value)
+    }
+}
+
+impl<'a> From<&'a BranchInfo> for Encodable<'a> {
+    fn from(value: &'a BranchInfo) -> Self {
+        Encodable::BranchInfo(value)
+    }
+}
+
 impl<'a> Display for Encodable<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TxBegin(tx_begin) => {
                 write!(
                     f,
-                    "TxBegin[id={}, preceding_content_id={}, created={}]",
-                    tx_begin.transaction_id, tx_begin.preceding_content_id, tx_begin.created
+                    "TxBegin[id={}, preceding_commit={}, created={}]",
+                    tx_begin.transaction_id,
+                    tx_begin.preceding_commit.content_id(),
+                    tx_begin.created
                 )
             }
             Self::TxCommit(tx_commit) => {
                 write!(
                     f,
-                    "TxCommit[id={}, content_id={}, committed={}]",
-                    tx_commit.transaction_id, tx_commit.content_id, tx_commit.committed
+                    "TxCommit[id={}, commit={}, committed={}]",
+                    tx_commit.transaction_id,
+                    tx_commit.commit.content_id(),
+                    tx_commit.commit.committed()
                 )
             }
             Self::Block(block) => {
@@ -561,7 +612,7 @@ impl<'a> Display for Encodable<'a> {
                     cluster.len()
                 )
             }
-            Self::Commit(commit) => {
+            Self::Index(commit) => {
                 write!(
                     f,
                     "Commit[content_id={}, len={}]",
@@ -575,6 +626,18 @@ impl<'a> Display for Encodable<'a> {
                     "WalInfo[id={}, created={}, preceding_wal_id={:?}]",
                     wal_info.wal_id, wal_info.created, wal_info.preceding_wal_id
                 )
+            }
+            Self::VolumeInfo(volume_info) => {
+                write!(
+                    f,
+                    "VolumeInfo[vbid={}, created={}, name={:?}]",
+                    volume_info.specs.vbd_id(),
+                    volume_info.created,
+                    volume_info.name.as_ref()
+                )
+            }
+            Self::BranchInfo(branch_info) => {
+                write!(f, "BranchInfo[commit={}]", &branch_info.commit.content_id())
             }
         }
     }

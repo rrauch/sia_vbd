@@ -1,11 +1,15 @@
 use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::Inventory;
+use crate::io::{ReadWrite, TokioFile};
+use crate::repository::VolumeHandler;
 use crate::wal;
 use crate::wal::man::WalMan;
-use crate::wal::{ReadWrite, RollbackError, TokioWalFile, WalError, WalReader, WalWriter};
+use crate::wal::{RollbackError, WalError, WalReader, WalWriter};
 use anyhow::{anyhow, bail};
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
-use std::cmp::min;
+use chrono::{DateTime, Utc};
+use std::cmp::{min, Ordering};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hasher;
@@ -140,103 +144,9 @@ impl<T> Deref for TypedUuid<T> {
     }
 }
 
-#[derive(Clone)]
-pub struct Commit {
-    content_id: CommitId,
-    clusters: Arc<Vec<ClusterId>>,
-}
-
-impl Commit {
-    pub fn content_id(&self) -> &CommitId {
-        &self.content_id
-    }
-
-    pub fn len(&self) -> usize {
-        self.clusters.len()
-    }
-
-    pub fn cluster_ids(&self) -> impl Iterator<Item = &ClusterId> {
-        self.clusters.iter()
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct CommitMut {
-    clusters: Vec<ClusterId>,
-    specs: FixedSpecs,
-}
-
-impl CommitMut {
-    pub fn zeroed(specs: FixedSpecs, zero_cluster_id: &ClusterId, num_clusters: usize) -> Self {
-        assert!(num_clusters > 0);
-        Self {
-            clusters: (0..num_clusters).map(|_| zero_cluster_id.clone()).collect(),
-            specs,
-        }
-    }
-
-    pub fn from_commit(commit: Commit, specs: FixedSpecs) -> Self {
-        Self {
-            clusters: Arc::try_unwrap(commit.clusters)
-                .unwrap_or_else(|clusters| clusters.as_ref().clone()),
-            specs,
-        }
-    }
-
-    pub fn from_cluster_ids<I: Iterator<Item = ClusterId>>(ids: I, specs: FixedSpecs) -> Self {
-        Self {
-            clusters: ids.into_iter().collect(),
-            specs,
-        }
-    }
-
-    pub fn clusters(&mut self) -> &mut Vec<ClusterId> {
-        &mut self.clusters
-    }
-
-    fn calc_content_id(&self) -> CommitId {
-        let mut hasher = self.specs.meta_hash().new();
-        hasher.update("--sia_vbd commit hash v1 start--\n".as_bytes());
-        hasher.update("vbd_id: ".as_bytes());
-        hasher.update(&self.specs.vbd_id().as_bytes());
-        hasher.update("\nblock_size: ".as_bytes());
-        hasher.update(&self.specs.block_size().to_be_bytes());
-        hasher.update("\ncluster_size: ".as_bytes());
-        hasher.update(&self.specs.cluster_size().to_be_bytes());
-        hasher.update("number_of_clusters: ".as_bytes());
-        hasher.update(&self.clusters.len().to_be_bytes());
-        hasher.update("\ncontent: ".as_bytes());
-        self.clusters.iter().enumerate().for_each(|(i, c)| {
-            hasher.update("\n--cluster entry start--\n".as_bytes());
-            hasher.update("cluster no: ".as_bytes());
-            hasher.update(i.to_be_bytes());
-            hasher.update("\n cluster hash: ".as_bytes());
-            hasher.update(c.as_ref());
-            hasher.update("\n--cluster entry end--".as_bytes());
-        });
-        hasher.update("\n--sia_vbd commit hash v1 end--".as_bytes());
-        hasher.finalize().into()
-    }
-
-    pub fn finalize(self) -> Commit {
-        self.into()
-    }
-}
-
-impl From<CommitMut> for Commit {
-    fn from(value: CommitMut) -> Self {
-        let content_id = value.calc_content_id();
-        Commit {
-            content_id,
-            clusters: Arc::new(value.clusters),
-        }
-    }
-}
-
-pub type CommitId = ContentId<Commit>;
 pub type VbdId = TypedUuid<VirtualBlockDevice>;
 
-type WalTx = wal::writer::Tx<TokioWalFile<ReadWrite>>;
+type WalTx = wal::writer::Tx<TokioFile<ReadWrite>>;
 
 pub struct VirtualBlockDevice {
     config: Arc<Config>,
@@ -270,6 +180,36 @@ impl FixedSpecs {
         content_hash: HashAlgorithm,
         meta_hash: HashAlgorithm,
     ) -> Self {
+        let dummy = FixedSpecs {
+            inner: Arc::new(FixedSpecsInner {
+                vbd_id: vbd_id.clone(),
+                cluster_size: cluster_size.clone(),
+                block_size: block_size.clone(),
+                content_hash: content_hash.clone(),
+                meta_hash: meta_hash.clone(),
+                zero_block: None,
+                zero_cluster: None,
+                zero_indices: ArcSwap::from_pointee(HashMap::default()),
+            }),
+        };
+
+        let zero_block = Block::zeroed(&dummy);
+
+        let dummy = FixedSpecs {
+            inner: Arc::new(FixedSpecsInner {
+                vbd_id: dummy.inner.vbd_id.clone(),
+                cluster_size: dummy.inner.cluster_size.clone(),
+                block_size: dummy.inner.block_size.clone(),
+                content_hash: dummy.inner.content_hash.clone(),
+                meta_hash: dummy.inner.meta_hash.clone(),
+                zero_block: Some(zero_block.clone()),
+                zero_cluster: None,
+                zero_indices: ArcSwap::from_pointee(HashMap::default()),
+            }),
+        };
+
+        let zero_cluster = ClusterMut::zeroed(dummy).finalize();
+
         Self {
             inner: Arc::new(FixedSpecsInner {
                 vbd_id,
@@ -277,6 +217,9 @@ impl FixedSpecs {
                 block_size,
                 content_hash,
                 meta_hash,
+                zero_block: Some(zero_block),
+                zero_cluster: Some(zero_cluster),
+                zero_indices: ArcSwap::from_pointee(HashMap::default()),
             }),
         }
     }
@@ -300,15 +243,73 @@ impl FixedSpecs {
     pub fn meta_hash(&self) -> HashAlgorithm {
         self.inner.meta_hash
     }
+
+    pub fn zero_block(&self) -> Block {
+        self.inner.zero_block.as_ref().unwrap().clone()
+    }
+
+    pub fn zero_cluster(&self) -> Cluster {
+        self.inner.zero_cluster.as_ref().unwrap().clone()
+    }
+
+    pub fn zero_index(&self, num_clusters: usize) -> Index {
+        let guard = self.inner.zero_indices.load();
+        if let Some(index) = guard.get(&num_clusters) {
+            return index.clone();
+        }
+        let mut map = guard.as_ref().clone();
+        drop(guard);
+
+        let index = IndexMut::zeroed(self.clone(), num_clusters).finalize();
+        map.insert(num_clusters, index.clone());
+        self.inner.zero_indices.store(Arc::new(map));
+        index
+    }
+
+    pub fn zero_indices(&self) -> impl Iterator<Item = Index> {
+        let vec = self
+            .inner
+            .zero_indices
+            .load()
+            .values()
+            .into_iter()
+            .map(|c| c.clone())
+            .collect::<Vec<_>>();
+        vec.into_iter()
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
 struct FixedSpecsInner {
     vbd_id: VbdId,
     cluster_size: ClusterSize,
     block_size: BlockSize,
     content_hash: HashAlgorithm,
     meta_hash: HashAlgorithm,
+    zero_block: Option<Block>,
+    zero_cluster: Option<Cluster>,
+    zero_indices: ArcSwap<HashMap<usize, Index>>,
+}
+
+impl PartialEq for FixedSpecsInner {
+    fn eq(&self, other: &Self) -> bool {
+        &self.vbd_id == &other.vbd_id
+            && &self.cluster_size == &other.cluster_size
+            && &self.block_size == &other.block_size
+            && &self.content_hash == &other.content_hash
+            && &self.meta_hash == &other.meta_hash
+    }
+}
+
+impl Eq for FixedSpecsInner {}
+
+impl Debug for FixedSpecsInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}, {}, {}, {}]",
+            *self.cluster_size, *self.block_size, self.content_hash, &self.meta_hash
+        )
+    }
 }
 
 enum State {
@@ -325,10 +326,19 @@ impl State {
             State::Poisoned => unreachable!("poisoned state"),
         }
     }
+
+    fn index(&self) -> &Index {
+        match &self {
+            State::Committed(state) => &state.index,
+            State::Uncommitted(state) => &state.previous_index,
+            State::Poisoned => unreachable!("poisoned state"),
+        }
+    }
 }
 
 struct Committed {
     commit: Commit,
+    index: Index,
     inventory: Arc<RwLock<Inventory>>,
     wal: Option<WalWriter>,
 }
@@ -375,6 +385,7 @@ impl Committed {
         match Uncommitted::new(
             wal,
             self.commit.clone(),
+            self.index.clone(),
             config,
             self.inventory.clone(),
             wal_man,
@@ -388,6 +399,7 @@ impl Committed {
                     err,
                     Self {
                         commit: self.commit,
+                        index: self.index,
                         wal,
                         inventory: self.inventory,
                     },
@@ -471,6 +483,7 @@ impl ModifiedData {
 
 struct Uncommitted {
     previous_commit: Commit,
+    previous_index: Index,
     config: Arc<Config>,
     last_modified: Instant,
     data: ModifiedData,
@@ -485,14 +498,12 @@ impl Uncommitted {
     async fn new(
         wal: WalWriter,
         previous_commit: Commit,
+        previous_index: Index,
         config: Arc<Config>,
         inventory: Arc<RwLock<Inventory>>,
         wal_man: Arc<WalMan>,
     ) -> Result<Self, (BlockError, Result<WalWriter, RollbackError>)> {
-        let wal_tx = match wal
-            .begin(previous_commit.content_id().clone(), config.max_tx_size)
-            .await
-        {
+        let wal_tx = match wal.begin(previous_commit.clone(), config.max_tx_size).await {
             Ok(wal) => wal,
             Err((e, wal)) => {
                 return Err((e.into(), wal));
@@ -501,6 +512,7 @@ impl Uncommitted {
 
         Ok(Self {
             previous_commit,
+            previous_index,
             config,
             data: ModifiedData {
                 unflushed_blocks: HashMap::default(),
@@ -596,19 +608,19 @@ impl Uncommitted {
     async fn try_commit(mut self) -> Result<Committed, (BlockError, Committed)> {
         async fn apply_changes(
             mut modified_data: ModifiedData,
-            previous_commit: &Commit,
+            previous_index: &Index,
             inventory: &Inventory,
             config: &Config,
             wal: &mut WalTx,
             wal_blocks: &mut HashMap<BlockId, u64>,
-        ) -> Result<Commit, BlockError> {
+        ) -> Result<Index, BlockError> {
             modified_data.flush(config, wal, wal_blocks).await?;
-            let mut commit = CommitMut::from_commit(previous_commit.clone(), config.specs.clone());
+            let mut index = IndexMut::from_index(previous_index.clone(), config.specs.clone());
 
             let mut non_zero_clusters = 0;
 
             for (cluster_no, modified_blocks) in modified_data.clusters.drain() {
-                let cluster_id = previous_commit
+                let cluster_id = previous_index
                     .clusters
                     .get(cluster_no)
                     .expect("cluster no in bounds");
@@ -629,22 +641,22 @@ impl Uncommitted {
                     wal.put(&cluster).await?;
                     non_zero_clusters += 1;
                 }
-                commit.clusters[cluster_no] = cluster.content_id.clone();
+                index.clusters[cluster_no] = cluster.content_id.clone();
             }
 
-            let commit = commit.finalize();
+            let index = index.finalize();
             if non_zero_clusters > 0 {
-                wal.put(&commit).await?;
+                wal.put(&index).await?;
             }
 
-            Ok(commit)
+            Ok(index)
         }
         tracing::debug!("commit started");
         let mut inventory = self.inventory.write().await;
 
-        let new_commit = match apply_changes(
+        let (new_commit, new_index) = match apply_changes(
             self.data,
-            &self.previous_commit,
+            &self.previous_index,
             inventory.deref_mut(),
             &self.config,
             &mut self.wal_tx,
@@ -652,7 +664,14 @@ impl Uncommitted {
         )
         .await
         {
-            Ok(c) => c,
+            Ok(index) => {
+                let mut commit =
+                    CommitMut::from_commit(self.config.specs.clone(), &self.previous_commit);
+                commit.update_num_clusters(index.len());
+                commit.update_index(index.content_id());
+                let commit = commit.finalize();
+                (commit, index)
+            }
             Err(err) => {
                 tracing::error!(error = %err, "commit failed, beginning rollback");
                 // rolling back
@@ -671,6 +690,7 @@ impl Uncommitted {
                     err,
                     Committed {
                         commit: self.previous_commit,
+                        index: self.previous_index,
                         wal,
                         inventory: self.inventory,
                     },
@@ -678,7 +698,7 @@ impl Uncommitted {
             }
         };
 
-        match self.wal_tx.commit(new_commit.content_id()).await {
+        match self.wal_tx.commit(&new_commit).await {
             Ok((wal, tx_details)) => {
                 tracing::debug!(commit = %new_commit.content_id(), "wal commit succeeded");
                 if let Err(err) = inventory.update_wal(&tx_details, wal.id()).await {
@@ -688,6 +708,7 @@ impl Uncommitted {
                     drop(inventory);
                     Committed {
                         commit: new_commit,
+                        index: new_index,
                         wal: Some(wal),
                         inventory: self.inventory,
                     }
@@ -701,6 +722,7 @@ impl Uncommitted {
                     e.into(),
                     Committed {
                         commit: self.previous_commit,
+                        index: self.previous_index,
                         wal,
                         inventory: self.inventory,
                     },
@@ -711,36 +733,7 @@ impl Uncommitted {
 }
 
 impl VirtualBlockDevice {
-    pub async fn create_new(
-        cluster_size: ClusterSize,
-        num_clusters: usize,
-        block_size: BlockSize,
-        content_hash: HashAlgorithm,
-        meta_hash: HashAlgorithm,
-        db_file: impl AsRef<Path>,
-        wal_dir: impl AsRef<Path>,
-        max_wal_size: u64,
-        branch: impl AsRef<str>,
-    ) -> Result<(FixedSpecs, String, CommitId), anyhow::Error> {
-        let vbd_id = Uuid::now_v7().into();
-        let specs = FixedSpecs::new(vbd_id, cluster_size, block_size, content_hash, meta_hash);
-        let inventory = Inventory::create(
-            db_file.as_ref(),
-            2,
-            &specs,
-            num_clusters,
-            branch.as_ref(),
-            Arc::new(WalMan::new(wal_dir, max_wal_size)),
-        )
-        .await?;
-        Ok((
-            specs,
-            branch.as_ref().to_string(),
-            inventory.current_commit().content_id.clone(),
-        ))
-    }
-
-    pub async fn load(
+    pub async fn new(
         max_write_buffer: usize,
         wal_dir: impl AsRef<Path>,
         max_wal_size: u64,
@@ -748,6 +741,7 @@ impl VirtualBlockDevice {
         db_file: impl AsRef<Path>,
         max_db_connections: u8,
         branch: impl AsRef<str>,
+        volume: VolumeHandler,
     ) -> Result<Self, anyhow::Error> {
         let max_tx_size = min(max_tx_size, max_wal_size - 1024 * 1024 * 10);
         if max_tx_size < 1024 * 1024 * 10 {
@@ -766,19 +760,19 @@ impl VirtualBlockDevice {
         let wal_man = Arc::new(WalMan::new(&wal_dir, max_wal_size));
 
         let inventory = Arc::new(RwLock::new(
-            Inventory::load(
+            Inventory::new(
                 db_file.as_ref(),
                 max_db_connections,
                 branch,
                 wal_man.clone(),
+                volume,
             )
             .await?,
         ));
 
         let lock = inventory.read().await;
-        let zero_block = lock.zero_block().clone();
-        let zero_cluster = lock.zero_cluster().clone();
-
+        let zero_block = lock.specs().zero_block();
+        let zero_cluster = lock.specs().zero_cluster();
         let config = Config {
             specs: lock.specs().clone(),
             zero_cluster,
@@ -792,15 +786,21 @@ impl VirtualBlockDevice {
         };
 
         let commit = lock.current_commit().clone();
+        let index = lock
+            .index_by_id(commit.index())
+            .await?
+            .ok_or(anyhow!("unable to load index [{}]", commit.index()))?;
         drop(lock);
 
         eprintln!("vbd id: {}", config.specs.vbd_id());
         eprintln!("commit: {}", commit.content_id());
+        eprintln!("index: {}", index.content_id());
 
         Ok(Self {
             config: Arc::new(config),
             state: State::Committed(Committed {
                 commit,
+                index,
                 wal: None,
                 inventory: inventory.clone(),
             }),
@@ -833,7 +833,7 @@ impl VirtualBlockDevice {
             let cluster_no = block_no / cluster_size;
             let relative_block_no = block_no % cluster_size;
 
-            if cluster_no >= self.state.commit().clusters.len() || relative_block_no >= cluster_size
+            if cluster_no >= self.state.index().clusters.len() || relative_block_no >= cluster_size
             {
                 return Err(BlockError::OutOfRange { block_no });
             }
@@ -864,13 +864,7 @@ impl VirtualBlockDevice {
             }
         }
 
-        let cluster_id = self
-            .state
-            .commit()
-            .clusters
-            .get(cluster_no)
-            .unwrap()
-            .clone();
+        let cluster_id = self.state.index().clusters.get(cluster_no).unwrap().clone();
 
         if &cluster_id == self.config.zero_cluster.content_id() {
             // the whole cluster is empty
@@ -1008,7 +1002,7 @@ impl VirtualBlockDevice {
     }
 
     pub fn blocks(&self) -> usize {
-        *self.config.specs.cluster_size() * self.state.commit().clusters.len()
+        *self.config.specs.cluster_size() * self.state.index().len()
     }
 
     pub fn cluster_size(&self) -> usize {
@@ -1076,7 +1070,8 @@ pub(crate) struct ClusterMut {
 }
 
 impl ClusterMut {
-    pub fn zeroed(specs: FixedSpecs, zero_block_id: &BlockId) -> Self {
+    pub fn zeroed(specs: FixedSpecs) -> Self {
+        let zero_block_id = specs.zero_block().content_id().clone();
         Self {
             blocks: (0..*specs.cluster_size())
                 .map(|_| zero_block_id.clone())
@@ -1160,6 +1155,226 @@ impl Cluster {
 
     pub fn block_ids(&self) -> impl Iterator<Item = &BlockId> {
         self.blocks.iter()
+    }
+}
+
+#[derive(Clone)]
+pub struct Index {
+    content_id: IndexId,
+    clusters: Arc<Vec<ClusterId>>,
+}
+
+impl Index {
+    pub fn content_id(&self) -> &IndexId {
+        &self.content_id
+    }
+
+    pub fn len(&self) -> usize {
+        self.clusters.len()
+    }
+
+    pub fn cluster_ids(&self) -> impl Iterator<Item = &ClusterId> {
+        self.clusters.iter()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct IndexMut {
+    clusters: Vec<ClusterId>,
+    specs: FixedSpecs,
+}
+
+impl IndexMut {
+    pub fn zeroed(specs: FixedSpecs, num_clusters: usize) -> Self {
+        assert!(num_clusters > 0);
+        let zero_cluster_id = specs.zero_cluster().content_id().clone();
+        Self {
+            clusters: (0..num_clusters).map(|_| zero_cluster_id.clone()).collect(),
+            specs,
+        }
+    }
+
+    pub fn from_index(index: Index, specs: FixedSpecs) -> Self {
+        Self {
+            clusters: Arc::try_unwrap(index.clusters)
+                .unwrap_or_else(|clusters| clusters.as_ref().clone()),
+            specs,
+        }
+    }
+
+    pub fn from_cluster_ids<I: Iterator<Item = ClusterId>>(ids: I, specs: FixedSpecs) -> Self {
+        Self {
+            clusters: ids.into_iter().collect(),
+            specs,
+        }
+    }
+
+    pub fn clusters(&mut self) -> &mut Vec<ClusterId> {
+        &mut self.clusters
+    }
+
+    fn calc_content_id(&self) -> IndexId {
+        let mut hasher = self.specs.meta_hash().new();
+        hasher.update("--sia_vbd index hash v1 start--\n".as_bytes());
+        hasher.update("vbd_id: ".as_bytes());
+        hasher.update(&self.specs.vbd_id().as_bytes());
+        hasher.update("\nblock_size: ".as_bytes());
+        hasher.update(&self.specs.block_size().to_be_bytes());
+        hasher.update("\ncluster_size: ".as_bytes());
+        hasher.update(&self.specs.cluster_size().to_be_bytes());
+        hasher.update("number_of_clusters: ".as_bytes());
+        hasher.update(&self.clusters.len().to_be_bytes());
+        hasher.update("\ncontent: ".as_bytes());
+        self.clusters.iter().enumerate().for_each(|(i, c)| {
+            hasher.update("\n--cluster entry start--\n".as_bytes());
+            hasher.update("cluster no: ".as_bytes());
+            hasher.update(i.to_be_bytes());
+            hasher.update("\n cluster hash: ".as_bytes());
+            hasher.update(c.as_ref());
+            hasher.update("\n--cluster entry end--".as_bytes());
+        });
+        hasher.update("\n--sia_vbd index hash v1 end--".as_bytes());
+        hasher.finalize().into()
+    }
+
+    pub fn finalize(self) -> Index {
+        self.into()
+    }
+}
+
+impl From<IndexMut> for Index {
+    fn from(value: IndexMut) -> Self {
+        let content_id = value.calc_content_id();
+        Index {
+            content_id,
+            clusters: Arc::new(value.clusters),
+        }
+    }
+}
+
+pub type IndexId = ContentId<Index>;
+
+pub type CommitId = ContentId<Commit>;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub(crate) content_id: CommitId,
+    pub(crate) preceding_commit: CommitId,
+    pub(crate) committed: DateTime<Utc>,
+    pub(crate) index: IndexId,
+    pub(crate) num_clusters: usize,
+}
+
+impl Commit {
+    pub fn content_id(&self) -> &CommitId {
+        &self.content_id
+    }
+
+    pub fn preceding_commit(&self) -> &CommitId {
+        &self.preceding_commit
+    }
+
+    pub fn committed(&self) -> &DateTime<Utc> {
+        &self.committed
+    }
+
+    pub fn index(&self) -> &IndexId {
+        &self.index
+    }
+
+    pub fn num_clusters(&self) -> usize {
+        self.num_clusters
+    }
+}
+
+impl PartialOrd for Commit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.committed.partial_cmp(&other.committed)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CommitMut {
+    preceding_commit: CommitId,
+    timestamp: DateTime<Utc>,
+    index: IndexId,
+    num_clusters: usize,
+    specs: FixedSpecs,
+}
+
+impl CommitMut {
+    pub fn zeroed(specs: FixedSpecs, num_clusters: usize) -> Self {
+        let preceding_commit = specs
+            .meta_hash()
+            .hash(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .into();
+        let zero_index = specs.zero_index(num_clusters);
+
+        Self {
+            preceding_commit,
+            timestamp: Utc::now(),
+            index: zero_index.content_id,
+            num_clusters,
+            specs,
+        }
+    }
+
+    pub fn from_commit(specs: FixedSpecs, commit: &Commit) -> Self {
+        Self {
+            preceding_commit: commit.content_id.clone(),
+            timestamp: commit.committed.clone(),
+            index: commit.index.clone(),
+            num_clusters: commit.num_clusters,
+            specs,
+        }
+    }
+
+    pub fn update_index(&mut self, index: &IndexId) {
+        self.index = index.clone();
+    }
+
+    pub fn update_num_clusters(&mut self, num_clusters: usize) {
+        self.num_clusters = num_clusters;
+    }
+
+    fn calc_content_id(&self) -> CommitId {
+        let mut hasher = self.specs.meta_hash().new();
+        hasher.update("--sia_vbd commit hash v1 start--\n".as_bytes());
+        hasher.update("vbd_id: ".as_bytes());
+        hasher.update(&self.specs.vbd_id().as_bytes());
+        hasher.update("\nblock_size: ".as_bytes());
+        hasher.update(&self.specs.block_size().to_be_bytes());
+        hasher.update("\ncluster_size: ".as_bytes());
+        hasher.update(&self.specs.cluster_size().to_be_bytes());
+        hasher.update("number_of_clusters: ".as_bytes());
+        hasher.update(&self.num_clusters.to_be_bytes());
+        hasher.update("\ncontent: ".as_bytes());
+        hasher.update("\nindex hash: ".as_bytes());
+        hasher.update(self.index.as_ref());
+        hasher.update("\n preceding index hash: ".as_bytes());
+        hasher.update(self.preceding_commit.as_ref());
+        hasher.update("\n timestamp: ".as_bytes());
+        hasher.update(self.timestamp.timestamp_micros().to_be_bytes());
+        hasher.update("\n--sia_vbd commit hash v1 end--".as_bytes());
+        hasher.finalize().into()
+    }
+
+    pub fn finalize(mut self) -> Commit {
+        self.timestamp = Utc::now();
+        self.into()
+    }
+}
+
+impl From<CommitMut> for Commit {
+    fn from(value: CommitMut) -> Self {
+        let content_id = value.calc_content_id();
+        Commit {
+            content_id,
+            preceding_commit: value.preceding_commit,
+            committed: value.timestamp,
+            index: value.index,
+            num_clusters: value.num_clusters,
+        }
     }
 }
 
@@ -1294,7 +1509,8 @@ pub(crate) enum BlockError {
 
 mod protos {
     use crate::hash::Hash;
-    use crate::vbd::{BlockId, ClusterId, CommitId, VbdId};
+    use crate::vbd::{BlockId, ClusterId, Commit, CommitId, IndexId, VbdId};
+    use anyhow::anyhow;
     use uuid::Uuid;
 
     impl From<VbdId> for crate::serde::protos::Uuid {
@@ -1309,19 +1525,19 @@ mod protos {
         }
     }
 
-    impl From<CommitId> for crate::serde::protos::Hash {
-        fn from(value: CommitId) -> Self {
+    impl From<IndexId> for crate::serde::protos::Hash {
+        fn from(value: IndexId) -> Self {
             value.0.into()
         }
     }
 
-    impl From<&CommitId> for crate::serde::protos::Hash {
-        fn from(value: &CommitId) -> Self {
+    impl From<&IndexId> for crate::serde::protos::Hash {
+        fn from(value: &IndexId) -> Self {
             (&value.0).into()
         }
     }
 
-    impl TryFrom<crate::serde::protos::Hash> for CommitId {
+    impl TryFrom<crate::serde::protos::Hash> for IndexId {
         type Error = <Hash as TryFrom<crate::serde::protos::Hash>>::Error;
 
         fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
@@ -1354,6 +1570,50 @@ mod protos {
 
         fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
             TryInto::<Hash>::try_into(value).map(|h| h.into())
+        }
+    }
+
+    impl TryFrom<crate::serde::protos::Hash> for CommitId {
+        type Error = <Hash as TryFrom<crate::serde::protos::Hash>>::Error;
+
+        fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
+            TryInto::<Hash>::try_into(value).map(|h| h.into())
+        }
+    }
+
+    impl From<&CommitId> for crate::serde::protos::Hash {
+        fn from(value: &CommitId) -> Self {
+            (&value.0).into()
+        }
+    }
+
+    impl TryFrom<crate::serde::protos::Commit> for Commit {
+        type Error = anyhow::Error;
+
+        fn try_from(value: crate::serde::protos::Commit) -> Result<Self, Self::Error> {
+            Ok(Self {
+                content_id: value
+                    .cid
+                    .map(|c| c.try_into())
+                    .transpose()?
+                    .ok_or(anyhow!("Invalid commit message"))?,
+                preceding_commit: value
+                    .preceding_cid
+                    .map(|c| c.try_into())
+                    .transpose()?
+                    .ok_or(anyhow!("invalid commit message"))?,
+                committed: value
+                    .committed
+                    .map(|c| c.try_into())
+                    .transpose()?
+                    .ok_or(anyhow!("invalid commit message"))?,
+                index: value
+                    .index_id
+                    .map(|i| i.try_into())
+                    .transpose()?
+                    .ok_or(anyhow!("invalid commit message"))?,
+                num_clusters: value.clusters as usize,
+            })
         }
     }
 }

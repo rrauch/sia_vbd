@@ -3,18 +3,18 @@ syntax = "proto3";
 package frame;
 import "protos/common.proto";
 import "protos/wal.proto";
+import "protos/volume.proto";
 
 message Header {
   message TxBegin {
     common.Uuid transaction_id = 1;
-    common.Hash preceding_cid = 2;
+    common.Commit preceding_commit = 2;
     common.Timestamp created = 4;
   }
 
   message TxCommit {
     common.Uuid transaction_id = 1;
-    common.Hash cid = 2;
-    common.Timestamp committed = 3;
+    common.Commit commit = 2;
   }
 
   message Block {
@@ -25,7 +25,7 @@ message Header {
     common.Hash cid = 1;
   }
 
-  message Commit {
+  message Index {
     common.Hash cid = 1;
   }
 
@@ -36,8 +36,10 @@ message Header {
     TxCommit tx_commit = 11;
     Block block = 12;
     Cluster cluster = 13;
-    Commit commit = 14;
+    Index index = 14;
     wal.FileInfo wal_info = 15;
+    volume.VolumeInfo volume_info = 16;
+    volume.BranchInfo branch_info = 17;
   }
 }
 
@@ -45,7 +47,7 @@ message Body {
   enum Type {
     BLOCK_CONTENT = 0;
     CLUSTER_PROTO3 = 1;
-    COMMIT_PROTO3 = 2;
+    INDEX_PROTO3 = 2;
   }
 
   Type type = 1;

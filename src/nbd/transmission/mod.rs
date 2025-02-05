@@ -3,10 +3,11 @@ mod read;
 mod reply;
 mod request;
 
+use crate::io::{AsyncReadBytesExt, CountingReader, LimitedReader, WrappedReader};
 use crate::nbd::block_device::RequestContext;
 use crate::nbd::transmission::request::ReadError;
 use crate::nbd::{Export, TransmissionMode};
-use crate::{AsyncReadBytesExt, ClientEndpoint, CountingReader, LimitedReader, WrappedReader};
+use crate::ClientEndpoint;
 use futures::lock::Mutex;
 use futures::{AsyncRead, AsyncWrite};
 use std::fmt::Debug;

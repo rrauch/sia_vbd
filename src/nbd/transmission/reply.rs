@@ -2,7 +2,7 @@ use crate::nbd::block_device::read_reply::PayloadWriter;
 use crate::nbd::block_device::Error as BlockDeviceError;
 use crate::nbd::transmission::request::RequestId;
 use crate::nbd::TransmissionMode;
-use crate::{AsyncWriteBytesExt, LimitedWriter};
+use crate::io::{AsyncWriteBytesExt, LimitedWriter};
 use bitflags::bitflags;
 use bytes::BufMut;
 use compact_bytes::CompactBytes;

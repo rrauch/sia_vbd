@@ -13,12 +13,12 @@ impl TryFrom<crate::serde::protos::frame::header::TxBegin> for super::TxBegin {
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
-            preceding_content_id: value
-                .preceding_cid
-                .ok_or(ContentIdInvalid)?
-                .try_into()
-                .map_err(|_| ContentIdInvalid)?,
-
+            preceding_commit: value
+                .preceding_commit
+                .map(|c| c.try_into())
+                .transpose()
+                .map_err(|_| CommitInvalid)?
+                .ok_or(CommitInvalid)?,
             created: value
                 .created
                 .ok_or(TimestampInvalid)?
@@ -32,7 +32,7 @@ impl From<&super::TxBegin> for crate::serde::protos::frame::header::TxBegin {
     fn from(value: &super::TxBegin) -> Self {
         let mut begin = crate::serde::protos::frame::header::TxBegin::default();
         begin.transaction_id = Some(value.transaction_id.into());
-        begin.preceding_cid = Some((&value.preceding_content_id).into());
+        begin.preceding_commit = Some((&value.preceding_commit).into());
         begin.created = Some(value.created.into());
         begin
     }
@@ -46,16 +46,12 @@ impl TryFrom<crate::serde::protos::frame::header::TxCommit> for super::TxCommit 
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
-            content_id: value
-                .cid
-                .ok_or(ContentIdInvalid)?
-                .try_into()
-                .map_err(|_| ContentIdInvalid)?,
-            committed: value
-                .committed
-                .ok_or(TimestampInvalid)?
-                .try_into()
-                .map_err(|_| TimestampInvalid)?,
+            commit: value
+                .commit
+                .map(|c| c.try_into())
+                .transpose()
+                .map_err(|_| CommitInvalid)?
+                .ok_or(CommitInvalid)?,
         })
     }
 }
@@ -64,8 +60,7 @@ impl From<&super::TxCommit> for crate::serde::protos::frame::header::TxCommit {
     fn from(value: &super::TxCommit) -> Self {
         let mut commit = crate::serde::protos::frame::header::TxCommit::default();
         commit.transaction_id = Some(value.transaction_id.into());
-        commit.cid = Some((&value.content_id).into());
-        commit.committed = Some(value.committed.into());
+        commit.commit = Some((&value.commit).into());
         commit
     }
 }

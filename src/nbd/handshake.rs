@@ -1,6 +1,7 @@
 use super::transmission::TransmissionHandler;
 use super::{Export, TransmissionMode, MAX_PAYLOAD_LEN, MIN_BLOCK_SIZE};
-use crate::{highest_power_of_two, AsyncReadBytesExt, ClientEndpoint};
+use crate::io::AsyncReadBytesExt;
+use crate::{highest_power_of_two, ClientEndpoint};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

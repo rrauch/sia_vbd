@@ -1,5 +1,5 @@
 use crate::serde::encoded::{Encodable, Encoder, EncodingSinkBuilder};
-use crate::vbd::{Block, Cluster, Commit, CommitId, FixedSpecs, VbdId};
+use crate::vbd::{Block, Cluster, Commit, FixedSpecs, Index, VbdId};
 use crate::wal::{
     EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
     WalError, WalId, WalSink, MAGIC_NUMBER,
@@ -110,10 +110,10 @@ impl<IO: WalSink> WalWriter<IO> {
         Ok(self.max_size - len)
     }
 
-    #[instrument(skip(self), fields(wal_id = %self.id, preceding_commit = %preceding_commit))]
+    #[instrument(skip(self), fields(wal_id = %self.id, preceding_commit = %preceding_commit.content_id()))]
     pub async fn begin(
         self,
-        preceding_commit: CommitId,
+        preceding_commit: Commit,
         reserve_space: u64,
     ) -> Result<Tx<IO>, (WalError, Result<Self, RollbackError>)> {
         tracing::debug!("starting new transaction");
@@ -172,7 +172,7 @@ pub struct Tx<IO: WalSink> {
 enum Puttable<'a> {
     Block(&'a Block),
     Cluster(&'a Cluster),
-    Commit(&'a Commit),
+    Index(&'a Index),
 }
 
 impl<'a> From<Puttable<'a>> for Encodable<'a> {
@@ -180,7 +180,7 @@ impl<'a> From<Puttable<'a>> for Encodable<'a> {
         match value {
             Puttable::Block(block) => Encodable::Block(block),
             Puttable::Cluster(cluster) => Encodable::Cluster(cluster),
-            Puttable::Commit(commit) => Encodable::Commit(commit),
+            Puttable::Index(index) => Encodable::Index(index),
         }
     }
 }
@@ -197,19 +197,19 @@ impl<'a> From<&'a Cluster> for Puttable<'a> {
     }
 }
 
-impl<'a> From<&'a Commit> for Puttable<'a> {
-    fn from(value: &'a Commit) -> Self {
-        Puttable::Commit(value)
+impl<'a> From<&'a Index> for Puttable<'a> {
+    fn from(value: &'a Index) -> Self {
+        Puttable::Index(value)
     }
 }
 
 impl<IO: WalSink> Tx<IO> {
-    #[instrument(skip(writer, encoder))]
+    #[instrument(skip(writer, encoder, preceding_commit), fields(preceding_commit = %preceding_commit.content_id()))]
     async fn new(
         id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
-        preceding_commit: CommitId,
+        preceding_commit: Commit,
         created: DateTime<Utc>,
         max_len: u64,
         mut writer: WalWriter<IO>,
@@ -273,12 +273,12 @@ impl<IO: WalSink> Tx<IO> {
 
     async fn write_tx_begin(
         &mut self,
-        preceding_commit: CommitId,
+        preceding_commit: Commit,
         created: DateTime<Utc>,
     ) -> Result<(), WalError> {
         let tx_begin = TxBegin {
             transaction_id: self.id(),
-            preceding_content_id: preceding_commit,
+            preceding_commit,
             created,
         };
         self.write_frame(&tx_begin).await?;
@@ -307,7 +307,7 @@ impl<IO: WalSink> Tx<IO> {
                     return Ok(*offset);
                 }
                 let id = block.content_id().clone();
-                tracing::debug!("writing BLOCK [{}] to wal", &id);
+                tracing::trace!("writing BLOCK [{}] to wal", &id);
                 let pos = self.write_frame(value).await?;
                 self.builder.blocks.insert(id, pos.clone());
                 pos
@@ -317,35 +317,33 @@ impl<IO: WalSink> Tx<IO> {
                     return Ok(pos.clone());
                 }
                 let id = cluster.content_id().clone();
-                tracing::debug!("writing CLUSTER [{}] to wal", &id);
+                tracing::trace!("writing CLUSTER [{}] to wal", &id);
                 let pos = self.write_frame(value).await?;
                 self.builder.clusters.insert(id, pos.clone());
                 pos
             }
-            Puttable::Commit(commit) => {
-                if let Some(pos) = self.builder.commits.get(commit.content_id()) {
+            Puttable::Index(commit) => {
+                if let Some(pos) = self.builder.indices.get(commit.content_id()) {
                     return Ok(pos.clone());
                 }
                 let id = commit.content_id().clone();
-                tracing::debug!("writing COMMIT [{}] to wal", &id);
+                tracing::trace!("writing COMMIT [{}] to wal", &id);
                 let pos = self.write_frame(value).await?;
-                self.builder.commits.insert(id, pos.clone());
+                self.builder.indices.insert(id, pos.clone());
                 pos
             }
         })
     }
 
-    #[instrument(skip_all, fields(tx_id = %self.builder.tx_id, wal_id = %self.builder.wal_id, vbd_id = %self.builder.vbd_id, content_id = %content_id
+    #[instrument(skip_all, fields(tx_id = %self.builder.tx_id, wal_id = %self.builder.wal_id, vbd_id = %self.builder.vbd_id, commit = %commit.content_id()
     ))]
     pub async fn commit(
         mut self,
-        content_id: &CommitId,
+        commit: &Commit,
     ) -> Result<(WalWriter<IO>, TxDetails), (WalError, Result<WalWriter<IO>, RollbackError>)> {
-        let committed = Utc::now();
         let tx_commit = TxCommit {
             transaction_id: self.id(),
-            content_id: content_id.clone(),
-            committed: committed.clone(),
+            commit: commit.clone(),
         };
         tracing::trace!("starting commit");
         async fn write_commit<IO: WalSink>(
@@ -369,7 +367,7 @@ impl<IO: WalSink> Tx<IO> {
 
         Ok((
             self.writer.take().unwrap(),
-            self.builder.clone().build(content_id.clone(), committed),
+            self.builder.clone().build(commit.clone()),
         ))
     }
 

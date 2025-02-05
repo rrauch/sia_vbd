@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package volume;
+import "protos/common.proto";
+
+message VolumeInfo {
+  common.FixedSpecs specs = 1;
+  common.Timestamp created = 2;
+  optional string name = 3;
+}
+
+message BranchInfo {
+  common.Commit commit = 1;
+}

@@ -2,14 +2,14 @@ use crate::hash::HashAlgorithm;
 use crate::serde::encoded::{Decoded, DecodedStream, Decoder};
 use crate::wal::ParseError::InvalidMagicNumber;
 
+use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::vbd::{
-    BlockId, BlockSize, ClusterId, ClusterSize, Commit, CommitId, FixedSpecs, Position, VbdId,
+    BlockId, BlockSize, ClusterId, ClusterSize, Commit, FixedSpecs, Index, IndexId, Position, VbdId,
 };
 use crate::wal::{
     FileHeader, HeaderError, ParseError, TxDetailBuilder, TxDetails, WalError, WalId, WalSource,
     MAGIC_NUMBER,
 };
-use crate::{AsyncReadExtBuffered, WrappedReader};
 use anyhow::anyhow;
 use bytes::BytesMut;
 use either::Either;
@@ -45,14 +45,14 @@ impl<IO: WalSource> WalReader<IO> {
 
     pub async fn transactions(
         &mut self,
-        preceding_content_id: Option<CommitId>,
+        preceding_commit: Option<Commit>,
     ) -> Result<TxStream<&mut IO>, WalError> {
         self.io
             .seek(SeekFrom::Start(self.first_frame_offset))
             .await?;
         Ok(TxStream::new(
             &mut self.io,
-            preceding_content_id,
+            preceding_commit,
             self.header.wal_id.clone(),
             self.header.specs.clone(),
         ))
@@ -81,7 +81,7 @@ impl<IO: WalSource> WalReader<IO> {
         block_id: &BlockId,
         offset: u64,
     ) -> Result<crate::vbd::Block, WalError> {
-        tracing::debug!("reading BLOCK from WAL");
+        tracing::trace!("reading BLOCK from WAL");
         let mut frame = match self.read(offset).await? {
             Decoded::Block(frame) => frame,
             _ => {
@@ -106,7 +106,7 @@ impl<IO: WalSource> WalReader<IO> {
         cluster_id: &ClusterId,
         offset: u64,
     ) -> Result<crate::vbd::Cluster, WalError> {
-        tracing::debug!("reading CLUSTER from WAL");
+        tracing::trace!("reading CLUSTER from WAL");
         let mut frame = match self.read(offset).await? {
             Decoded::Cluster(frame) => frame,
             _ => {
@@ -126,20 +126,20 @@ impl<IO: WalSource> WalReader<IO> {
     }
 
     #[instrument(skip(self))]
-    pub async fn commit(&mut self, commit_id: &CommitId, offset: u64) -> Result<Commit, WalError> {
-        tracing::debug!("reading COMMIT from WAL");
+    pub async fn index(&mut self, index_id: &IndexId, offset: u64) -> Result<Index, WalError> {
+        tracing::trace!("reading INDEX from WAL");
         let mut frame = match self.read(offset).await? {
-            Decoded::Commit(frame) => frame,
+            Decoded::Index(frame) => frame,
             _ => {
                 return Err(WalError::IncorrectType);
             }
         };
 
-        if frame.header() != commit_id {
+        if frame.header() != index_id {
             Err(anyhow!(
-                "Commit Ids do not match: {} != {}",
+                "Index Ids do not match: {} != {}",
                 frame.header(),
-                commit_id
+                index_id
             ))?;
         }
 
@@ -166,9 +166,12 @@ pub(crate) struct TxStream<'a, IO: WalSource> {
 }
 
 impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
-    fn new(io: IO, preceding_cid: Option<CommitId>, wal_id: WalId, specs: FixedSpecs) -> Self {
+    fn new(io: IO, preceding_commit: Option<Commit>, wal_id: WalId, specs: FixedSpecs) -> Self {
         Self {
-            state: TxStreamState::New(DecodedStream::from_reader(io, specs.clone()), preceding_cid),
+            state: TxStreamState::New(
+                DecodedStream::from_reader(io, specs.clone()),
+                preceding_commit,
+            ),
             wal_id,
             specs,
         }
@@ -176,7 +179,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
 
     fn next_tx_begin(
         mut stream: DecodedStream<'a, IO>,
-        preceding_cid: Option<CommitId>,
+        preceding_commit: Option<Commit>,
         wal_id: WalId,
         vbd_id: VbdId,
     ) -> BoxFuture<
@@ -188,14 +191,16 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
     > {
         Box::pin(async move {
             let res = match stream.next().await {
-                Some(Ok(Decoded::TxBegin(tx_begin))) => match match preceding_cid {
-                    Some(preceding_cid) => {
-                        if &preceding_cid == &tx_begin.header().preceding_content_id {
+                Some(Ok(Decoded::TxBegin(tx_begin))) => match match preceding_commit {
+                    Some(preceding_commit) => {
+                        if preceding_commit.content_id()
+                            == tx_begin.header().preceding_commit.content_id()
+                        {
                             Ok(tx_begin)
                         } else {
                             Err(WalError::IncorrectPrecedingCommit {
-                                exp: preceding_cid,
-                                found: tx_begin.header().preceding_content_id.clone(),
+                                exp: preceding_commit.content_id().clone(),
+                                found: tx_begin.header().preceding_commit.content_id().clone(),
                             })
                         }
                     }
@@ -207,7 +212,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                             tx_begin.transaction_id,
                             wal_id,
                             vbd_id,
-                            tx_begin.preceding_content_id,
+                            tx_begin.preceding_commit,
                             tx_begin.created,
                         )))
                     }
@@ -246,9 +251,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                                 found: tx_commit.transaction_id,
                             })
                         } else {
-                            Ok(Either::Right(
-                                tx_builder.build(tx_commit.content_id, tx_commit.committed),
-                            ))
+                            Ok(Either::Right(tx_builder.build(tx_commit.commit)))
                         }
                     }
                     Decoded::Block(frame) => {
@@ -265,10 +268,10 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                         }
                         Ok(Either::Left(tx_builder))
                     }
-                    Decoded::Commit(frame) => {
+                    Decoded::Index(frame) => {
                         if let Some(_) = frame.body() {
                             let offset = frame.position().offset;
-                            tx_builder.commits.insert(frame.into_header(), offset);
+                            tx_builder.indices.insert(frame.into_header(), offset);
                         }
                         Ok(Either::Left(tx_builder))
                     }
@@ -287,7 +290,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
 }
 
 enum TxStreamState<'a, IO: WalSource> {
-    New(DecodedStream<'a, IO>, Option<CommitId>),
+    New(DecodedStream<'a, IO>, Option<Commit>),
     AwaitingNextTxBegin(
         BoxFuture<
             'a,
@@ -354,7 +357,7 @@ impl<'a, IO: WalSource + 'a> Stream for TxStream<'a, IO> {
                     Poll::Ready((Ok(Either::Right(tx_details)), frame_stream)) => {
                         self.state = TxStreamState::AwaitingNextTxBegin(Self::next_tx_begin(
                             frame_stream,
-                            Some(tx_details.commit_id.clone()),
+                            Some(tx_details.commit.clone()),
                             self.wal_id.clone(),
                             self.specs.vbd_id().clone(),
                         ));

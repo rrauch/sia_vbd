@@ -1,4 +1,4 @@
-use crate::vbd::{ClusterId, CommitId};
+use crate::vbd::{ClusterId, IndexId};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 
@@ -223,11 +223,23 @@ impl TryFrom<(Cluster, crate::vbd::FixedSpecs)> for crate::vbd::Cluster {
     }
 }
 
-impl TryFrom<(Commit, crate::vbd::FixedSpecs)> for crate::vbd::Commit {
+impl From<&crate::vbd::Commit> for Commit {
+    fn from(value: &crate::vbd::Commit) -> Self {
+        Self {
+            cid: Some(value.content_id().into()),
+            preceding_cid: Some(value.preceding_commit().into()),
+            committed: Some(value.committed().into()),
+            index_id: Some(value.index().into()),
+            clusters: value.num_clusters() as u64,
+        }
+    }
+}
+
+impl TryFrom<(Index, crate::vbd::FixedSpecs)> for crate::vbd::Index {
     type Error = anyhow::Error;
 
-    fn try_from((value, specs): (Commit, crate::vbd::FixedSpecs)) -> Result<Self, Self::Error> {
-        let commit_id: CommitId = value
+    fn try_from((value, specs): (Index, crate::vbd::FixedSpecs)) -> Result<Self, Self::Error> {
+        let index_id: IndexId = value
             .cid
             .map(|c| c.try_into())
             .transpose()?
@@ -240,18 +252,18 @@ impl TryFrom<(Commit, crate::vbd::FixedSpecs)> for crate::vbd::Commit {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| frame::Error::ContentIdInvalid)?;
 
-        let commit =
-            crate::vbd::CommitMut::from_cluster_ids(cluster_ids.into_iter(), specs).finalize();
+        let index =
+            crate::vbd::IndexMut::from_cluster_ids(cluster_ids.into_iter(), specs).finalize();
 
-        if commit.content_id() != &commit_id {
+        if index.content_id() != &index_id {
             Err(anyhow!(
-                "CommitIds do not match: {} != {}",
-                commit.content_id(),
-                commit_id
+                "IndexIds do not match: {} != {}",
+                index.content_id(),
+                index_id
             ))?;
         }
 
-        Ok(commit)
+        Ok(index)
     }
 }
 
@@ -264,8 +276,8 @@ impl From<&crate::vbd::Cluster> for Cluster {
     }
 }
 
-impl From<&crate::vbd::Commit> for Commit {
-    fn from(value: &crate::vbd::Commit) -> Self {
+impl From<&crate::vbd::Index> for Index {
+    fn from(value: &crate::vbd::Index) -> Self {
         Self {
             cid: Some(value.content_id().into()),
             cluster_ids: value.cluster_ids().map(|c| c.into()).collect(),
@@ -276,8 +288,8 @@ impl From<&crate::vbd::Commit> for Commit {
 pub(crate) mod frame {
     use self::Error::*;
     use crate::serde::{BodyType, Compressed};
-    use crate::vbd::{BlockId, ClusterId, CommitId};
-    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, StateFrameError};
+    use crate::vbd::{BlockId, ClusterId, IndexId};
+    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, IndexFrameError};
     use thiserror::Error;
 
     include!(concat!(env!("OUT_DIR"), "/protos/frame.rs"));
@@ -285,7 +297,7 @@ pub(crate) mod frame {
     impl From<&BodyType> for body::Type {
         fn from(value: &BodyType) -> Self {
             match value {
-                &BodyType::Commit => body::Type::CommitProto3,
+                &BodyType::Index => body::Type::IndexProto3,
                 &BodyType::BlockContent => body::Type::BlockContent,
                 &BodyType::Cluster => body::Type::ClusterProto3,
             }
@@ -298,7 +310,7 @@ pub(crate) mod frame {
         fn try_from(value: body::Type) -> Result<Self, Self::Error> {
             match value {
                 body::Type::ClusterProto3 => Ok(BodyType::Cluster),
-                body::Type::CommitProto3 => Ok(BodyType::Commit),
+                body::Type::IndexProto3 => Ok(BodyType::Index),
                 body::Type::BlockContent => Ok(BodyType::BlockContent),
             }
         }
@@ -350,18 +362,18 @@ pub(crate) mod frame {
         }
     }
 
-    impl From<&CommitId> for header::Commit {
-        fn from(value: &CommitId) -> Self {
+    impl From<&IndexId> for header::Index {
+        fn from(value: &IndexId) -> Self {
             Self {
                 cid: Some(value.into()),
             }
         }
     }
 
-    impl TryFrom<header::Commit> for CommitId {
+    impl TryFrom<header::Index> for IndexId {
         type Error = Error;
 
-        fn try_from(value: header::Commit) -> Result<Self, Self::Error> {
+        fn try_from(value: header::Index) -> Result<Self, Self::Error> {
             Ok(value
                 .cid
                 .ok_or(ContentIdInvalid)?
@@ -412,6 +424,6 @@ pub(crate) mod frame {
         ClusterFrameError(#[from] ClusterFrameError),
         /// State Frame error
         #[error(transparent)]
-        StateFrameError(#[from] StateFrameError),
+        IndexFrameError(#[from] IndexFrameError),
     }
 }

@@ -1,4 +1,4 @@
-use crate::AsyncReadExtBuffered;
+use crate::io::AsyncReadExtBuffered;
 use anyhow::anyhow;
 use async_compression::futures::bufread::ZstdEncoder;
 use async_compression::Level;
@@ -109,7 +109,7 @@ impl Compressed {
 pub(crate) enum BodyType {
     BlockContent,
     Cluster,
-    Commit,
+    Index,
 }
 
 #[derive(Clone, Debug)]

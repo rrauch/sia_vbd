@@ -9,6 +9,12 @@ pub enum HashAlgorithm {
     XXH3,
 }
 
+impl Display for HashAlgorithm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl HashAlgorithm {
     /// Performs a one-shot hash of the input data.
     pub(crate) fn hash(&self, input: impl AsRef<[u8]>) -> Hash {

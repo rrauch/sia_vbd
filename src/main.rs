@@ -1,8 +1,11 @@
 use anyhow::anyhow;
 use bytesize::ByteSize;
 use clap::Parser;
+use futures::TryStreamExt;
 use sia_vbd::hash::HashAlgorithm;
 use sia_vbd::nbd::Builder;
+use sia_vbd::repository::fs::FsRepository;
+use sia_vbd::repository::{Repository, RepositoryHandler, VolumeHandler};
 use sia_vbd::vbd::nbd_device::NbdDevice;
 use sia_vbd::vbd::{BlockSize, ClusterSize, VirtualBlockDevice};
 use std::path::PathBuf;
@@ -116,41 +119,38 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let num_clusters =
-        (arguments.size.as_u64() as usize + cluster_size_bytes - 1) / cluster_size_bytes;
-
     let db_dir = PathBuf::from("/tmp/foo/db/");
     let db_file = db_dir.join("sia_vbd.sqlite");
     let max_db_connections = 25;
-    let branch = "Main".to_string();
+    let branch = "main".to_string();
 
-    if !tokio::fs::try_exists(&db_file).await? {
-        let (vbd_specs, branch, commit) = VirtualBlockDevice::create_new(
-            arguments.cluster_size,
-            num_clusters,
-            arguments.block_size,
-            arguments.content_hash,
-            arguments.meta_hash,
-            &db_file,
-            &arguments.wal_dir,
-            arguments.max_wal_size.as_u64(),
-            &branch,
-        )
-        .await?;
+    let repository: RepositoryHandler = FsRepository::new("/tmp/foo/repo").await?.into();
 
-        eprintln!(
-            "new vbd created: vbd_id: {}, branch: {}, commit: {}",
-            &vbd_specs.vbd_id(),
-            &branch,
-            &commit
-        );
-    }
+    let volume = if let Some(vbd_id) = repository.list_volumes().await?.try_next().await? {
+        repository.open_volume(&vbd_id, &branch).await?
+    } else {
+        let vbd_id = repository
+            .create_volume(
+                None,
+                &branch,
+                arguments.size.as_u64() as usize,
+                arguments.cluster_size,
+                arguments.block_size,
+                arguments.content_hash,
+                arguments.meta_hash,
+            )
+            .await?;
+
+        eprintln!("new vbd created: vbd_id: {}", &vbd_id,);
+
+        repository.open_volume(&vbd_id, &branch).await?
+    };
 
     let runner = builder
         .with_export(
             arguments.export_name,
             NbdDevice::new(
-                VirtualBlockDevice::load(
+                VirtualBlockDevice::new(
                     arguments.max_write_buffer.as_u64() as usize,
                     arguments.wal_dir,
                     arguments.max_wal_size.as_u64(),
@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
                     &db_file,
                     max_db_connections,
                     &branch,
+                    volume,
                 )
                 .await?,
             ),

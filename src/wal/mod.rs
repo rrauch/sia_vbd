@@ -3,20 +3,15 @@ pub(crate) mod protos;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
-use crate::vbd::{BlockId, ClusterId, CommitId, FixedSpecs, TypedUuid, VbdId};
-use crate::Etag;
+use crate::io::{ReadOnly, ReadWrite, TokioFile};
+use crate::vbd::{BlockId, ClusterId, Commit, CommitId, FixedSpecs, IndexId, TypedUuid, VbdId};
 use chrono::{DateTime, Duration, Utc};
 use futures::{AsyncRead, AsyncSeek, AsyncWrite};
 use prost::DecodeError;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::{Error, SeekFrom};
-use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::io::Error;
 use thiserror::Error;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 const MAGIC_NUMBER: &'static [u8; 16] = &[
     0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x57, 0x41, 0x4C, 0x00, 0x00, 0x01,
@@ -27,129 +22,39 @@ pub(crate) trait WalSink: AsyncWrite + AsyncSeek + Unpin + Send {
     fn set_len(&mut self, len: u64) -> impl Future<Output = Result<(), std::io::Error>> + Send;
 }
 
-trait Readable {}
-trait Writable {}
-
-pub struct ReadOnly;
-impl Readable for ReadOnly {}
-
-pub struct ReadWrite;
-impl Readable for ReadWrite {}
-impl Writable for ReadWrite {}
-
-pub(crate) struct TokioWalFile<M> {
-    file: tokio_util::compat::Compat<tokio::fs::File>,
-    path: PathBuf,
-    _phantom_data: PhantomData<M>,
-}
-
-impl TokioWalFile<ReadWrite> {
-    pub async fn create_new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let file = tokio::fs::File::create_new(&path).await?;
-        Ok(Self {
-            file: file.compat_write(),
-            path,
-            _phantom_data: PhantomData::default(),
-        })
-    }
-}
-
-impl TokioWalFile<ReadOnly> {
-    pub async fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let file = tokio::fs::File::open(&path).await?;
-        Ok(Self {
-            file: file.compat_write(),
-            path,
-            _phantom_data: PhantomData::default(),
-        })
-    }
-}
-
-impl<M> TokioWalFile<M> {
-    pub async fn etag(&self) -> std::io::Result<Etag> {
-        let metadata = self.file.get_ref().metadata().await?;
-        (&metadata).try_into()
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl<M: Readable + Unpin> AsyncRead for TokioWalFile<M> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.file).poll_read(cx, buf)
-    }
-}
-
-impl<M: Writable + Unpin> AsyncWrite for TokioWalFile<M> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.file).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_flush(cx)
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_close(cx)
-    }
-}
-
-impl<M: Readable + Unpin> AsyncSeek for TokioWalFile<M> {
-    fn poll_seek(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        pos: SeekFrom,
-    ) -> Poll<std::io::Result<u64>> {
-        Pin::new(&mut self.file).poll_seek(cx, pos)
-    }
-}
-
-impl WalSink for TokioWalFile<ReadWrite> {
+impl WalSink for TokioFile<ReadWrite> {
     async fn len(&self) -> Result<u64, Error> {
-        Ok(self.file.get_ref().metadata().await?.len())
+        Ok(self.as_ref().metadata().await?.len())
     }
 
     async fn set_len(&mut self, len: u64) -> Result<(), Error> {
-        self.file.get_mut().set_len(len).await
+        self.as_mut().set_len(len).await
     }
 }
 
-pub trait WalSource: AsyncRead + AsyncSeek + Unpin + Send {}
+pub(crate) trait WalSource: AsyncRead + AsyncSeek + Unpin + Send {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send> WalSource for T {}
 
-pub struct Wal {}
-pub type WalId = TypedUuid<Wal>;
-pub type WalReader = reader::WalReader<TokioWalFile<ReadOnly>>;
-pub type WalWriter = writer::WalWriter<TokioWalFile<ReadWrite>>;
+pub(crate) struct Wal {}
+pub(crate) type WalId = TypedUuid<Wal>;
+pub(crate) type WalReader = reader::WalReader<TokioFile<ReadOnly>>;
+pub(crate) type WalWriter = writer::WalWriter<TokioFile<ReadWrite>>;
 
-pub struct TxDetails {
+pub(crate) struct TxDetails {
     pub tx_id: TxId,
     pub wal_id: WalId,
     pub vbd_id: VbdId,
-    pub commit_id: CommitId,
-    pub preceding_commit_id: CommitId,
+    pub commit: Commit,
+    pub preceding_commit: Commit,
     pub created: DateTime<Utc>,
-    pub committed: DateTime<Utc>,
     pub blocks: HashMap<BlockId, u64>,
     pub clusters: HashMap<ClusterId, u64>,
-    pub commits: HashMap<CommitId, u64>,
+    pub indices: HashMap<IndexId, u64>,
 }
 
 impl TxDetails {
     pub fn duration(&self) -> Duration {
-        self.committed - self.created
+        self.commit.committed().clone() - self.created
     }
 }
 
@@ -158,11 +63,11 @@ struct TxDetailBuilder {
     tx_id: TxId,
     wal_id: WalId,
     vbd_id: VbdId,
-    preceding_commit_id: CommitId,
+    preceding_commit: Commit,
     created: DateTime<Utc>,
     blocks: HashMap<BlockId, u64>,
     clusters: HashMap<ClusterId, u64>,
-    commits: HashMap<CommitId, u64>,
+    indices: HashMap<IndexId, u64>,
 }
 
 impl TxDetailBuilder {
@@ -170,33 +75,32 @@ impl TxDetailBuilder {
         tx_id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
-        preceding_commit_id: CommitId,
+        preceding_commit: Commit,
         created: DateTime<Utc>,
     ) -> Self {
         Self {
             tx_id,
             wal_id,
             vbd_id,
-            preceding_commit_id,
+            preceding_commit,
             created,
             blocks: HashMap::default(),
             clusters: HashMap::default(),
-            commits: HashMap::default(),
+            indices: HashMap::default(),
         }
     }
 
-    fn build(self, commit: CommitId, committed: DateTime<Utc>) -> TxDetails {
+    fn build(self, commit: Commit) -> TxDetails {
         TxDetails {
             tx_id: self.tx_id,
             wal_id: self.wal_id,
             vbd_id: self.vbd_id,
-            commit_id: commit,
-            preceding_commit_id: self.preceding_commit_id,
+            commit,
+            preceding_commit: self.preceding_commit,
             created: self.created,
-            committed,
             blocks: self.blocks,
             clusters: self.clusters,
-            commits: self.commits,
+            indices: self.indices,
         }
     }
 }
@@ -207,18 +111,17 @@ pub type TxId = TypedUuid<Tx_>;
 
 pub(crate) struct TxBegin {
     pub transaction_id: TxId,
-    pub preceding_content_id: CommitId,
+    pub preceding_commit: Commit,
     pub created: DateTime<Utc>,
 }
 
 pub(crate) struct TxCommit {
     pub transaction_id: TxId,
-    pub content_id: CommitId,
-    pub committed: DateTime<Utc>,
+    pub commit: Commit,
 }
 
 #[derive(Clone, Debug)]
-pub struct FileHeader {
+pub(crate) struct FileHeader {
     pub wal_id: WalId,
     pub specs: FixedSpecs,
     pub created: DateTime<Utc>,
@@ -313,8 +216,8 @@ pub enum HeaderError {
 #[derive(Error, Debug)]
 pub enum CommitFrameError {
     /// Content Id Invalid
-    #[error("Content Id Invalid")]
-    ContentIdInvalid,
+    #[error("Commit Invalid")]
+    CommitInvalid,
     /// Transaction Id Invalid
     #[error("Transaction Id Invalid")]
     TransactionIdInvalid,
@@ -341,7 +244,7 @@ pub enum ClusterFrameError {
 }
 
 #[derive(Error, Debug)]
-pub enum StateFrameError {
+pub enum IndexFrameError {
     /// Content Id Invalid
     #[error("Content Id Invalid")]
     ContentIdInvalid,
