@@ -1,5 +1,5 @@
 use crate::serde::encoded::{Encodable, Encoder, EncodingSinkBuilder};
-use crate::vbd::{Block, Cluster, Commit, FixedSpecs, Index, VbdId};
+use crate::vbd::{Block, BranchName, Cluster, Commit, FixedSpecs, Index, VbdId};
 use crate::wal::{
     EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
     WalError, WalId, WalSink, MAGIC_NUMBER,
@@ -113,6 +113,7 @@ impl<IO: WalSink> WalWriter<IO> {
     #[instrument(skip(self), fields(wal_id = %self.id, preceding_commit = %preceding_commit.content_id()))]
     pub async fn begin(
         self,
+        branch: BranchName,
         preceding_commit: Commit,
         reserve_space: u64,
     ) -> Result<Tx<IO>, (WalError, Result<Self, RollbackError>)> {
@@ -141,6 +142,7 @@ impl<IO: WalSink> WalWriter<IO> {
             Uuid::now_v7().into(),
             self.header.wal_id,
             self.header.specs.vbd_id(),
+            branch,
             preceding_commit,
             Utc::now(),
             reserve_space,
@@ -161,6 +163,7 @@ impl<IO> AsRef<IO> for WalWriter<IO> {
 
 pub struct Tx<IO: WalSink> {
     wal_id: WalId,
+    branch: BranchName,
     initial_len: u64,
     len: u64,
     position: u64,
@@ -204,11 +207,12 @@ impl<'a> From<&'a Index> for Puttable<'a> {
 }
 
 impl<IO: WalSink> Tx<IO> {
-    #[instrument(skip(writer, encoder, preceding_commit), fields(preceding_commit = %preceding_commit.content_id()))]
+    #[instrument(skip(writer, encoder, preceding_commit), fields(branch = %branch, preceding_commit = %preceding_commit.content_id()))]
     async fn new(
         id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
+        branch: BranchName,
         preceding_commit: Commit,
         created: DateTime<Utc>,
         max_len: u64,
@@ -236,12 +240,14 @@ impl<IO: WalSink> Tx<IO> {
             id,
             wal_id.clone(),
             vbd_id,
+            branch.clone(),
             preceding_commit.clone(),
             created.clone(),
         );
 
         let mut this = Self {
             wal_id,
+            branch,
             initial_len,
             len: initial_len + max_len,
             position: initial_len,
@@ -271,6 +277,10 @@ impl<IO: WalSink> Tx<IO> {
         self.wal_id
     }
 
+    pub fn branch(&self) -> &BranchName {
+        &self.branch
+    }
+
     async fn write_tx_begin(
         &mut self,
         preceding_commit: Commit,
@@ -278,6 +288,7 @@ impl<IO: WalSink> Tx<IO> {
     ) -> Result<(), WalError> {
         let tx_begin = TxBegin {
             transaction_id: self.id(),
+            branch: self.branch().clone(),
             preceding_commit,
             created,
         };

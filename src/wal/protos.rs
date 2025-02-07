@@ -13,6 +13,7 @@ impl TryFrom<crate::serde::protos::frame::header::TxBegin> for super::TxBegin {
 
         Ok(Self {
             transaction_id: value.transaction_id.ok_or(TransactionIdInvalid)?.into(),
+            branch: value.branch.try_into().map_err(|_| BranchInvalid)?,
             preceding_commit: value
                 .preceding_commit
                 .map(|c| c.try_into())
@@ -32,6 +33,7 @@ impl From<&super::TxBegin> for crate::serde::protos::frame::header::TxBegin {
     fn from(value: &super::TxBegin) -> Self {
         let mut begin = crate::serde::protos::frame::header::TxBegin::default();
         begin.transaction_id = Some(value.transaction_id.into());
+        begin.branch = value.branch.to_string();
         begin.preceding_commit = Some((&value.preceding_commit).into());
         begin.created = Some(value.created.into());
         begin

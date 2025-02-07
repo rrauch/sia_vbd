@@ -337,6 +337,7 @@ impl State {
 }
 
 struct Committed {
+    branch: BranchName,
     commit: Commit,
     index: Index,
     inventory: Arc<RwLock<Inventory>>,
@@ -384,6 +385,7 @@ impl Committed {
 
         match Uncommitted::new(
             wal,
+            self.branch.clone(),
             self.commit.clone(),
             self.index.clone(),
             config,
@@ -398,6 +400,7 @@ impl Committed {
                 Err((
                     err,
                     Self {
+                        branch: self.branch,
                         commit: self.commit,
                         index: self.index,
                         wal,
@@ -482,6 +485,7 @@ impl ModifiedData {
 }
 
 struct Uncommitted {
+    branch: BranchName,
     previous_commit: Commit,
     previous_index: Index,
     config: Arc<Config>,
@@ -497,13 +501,17 @@ struct Uncommitted {
 impl Uncommitted {
     async fn new(
         wal: WalWriter,
+        branch: BranchName,
         previous_commit: Commit,
         previous_index: Index,
         config: Arc<Config>,
         inventory: Arc<RwLock<Inventory>>,
         wal_man: Arc<WalMan>,
     ) -> Result<Self, (BlockError, Result<WalWriter, RollbackError>)> {
-        let wal_tx = match wal.begin(previous_commit.clone(), config.max_tx_size).await {
+        let wal_tx = match wal
+            .begin(branch.clone(), previous_commit.clone(), config.max_tx_size)
+            .await
+        {
             Ok(wal) => wal,
             Err((e, wal)) => {
                 return Err((e.into(), wal));
@@ -511,6 +519,7 @@ impl Uncommitted {
         };
 
         Ok(Self {
+            branch,
             previous_commit,
             previous_index,
             config,
@@ -689,6 +698,7 @@ impl Uncommitted {
                 return Err((
                     err,
                     Committed {
+                        branch: self.branch,
                         commit: self.previous_commit,
                         index: self.previous_index,
                         wal,
@@ -707,6 +717,7 @@ impl Uncommitted {
                 Ok({
                     drop(inventory);
                     Committed {
+                        branch: self.branch,
                         commit: new_commit,
                         index: new_index,
                         wal: Some(wal),
@@ -721,6 +732,7 @@ impl Uncommitted {
                 Err((
                     e.into(),
                     Committed {
+                        branch: self.branch,
                         commit: self.previous_commit,
                         index: self.previous_index,
                         wal,
@@ -798,11 +810,16 @@ impl VirtualBlockDevice {
         }
         eprintln!("branch: {}", branch);
         eprintln!("commit: {} @ {}", commit.content_id(), commit.committed);
-        eprintln!("index: {} @ {} clusters", index.content_id(), index.clusters.len());
+        eprintln!(
+            "index: {} @ {} clusters",
+            index.content_id(),
+            index.clusters.len()
+        );
 
         Ok(Self {
             config: Arc::new(config),
             state: State::Committed(Committed {
+                branch,
                 commit,
                 index,
                 wal: None,
@@ -1383,6 +1400,53 @@ impl From<CommitMut> for Commit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TagName(String);
+
+impl AsRef<str> for TagName {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Display for TagName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.to_string())
+    }
+}
+
+impl TryFrom<String> for TagName {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if is_valid_branch_tag_name(&value) {
+            Ok(TagName(value))
+        } else {
+            Err(anyhow!("invalid tag name"))
+        }
+    }
+}
+
+impl TryFrom<&String> for TagName {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &String) -> Result<Self, Self::Error> {
+        value.as_str().try_into()
+    }
+}
+
+impl TryFrom<&str> for TagName {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if is_valid_branch_tag_name(value) {
+            Ok(TagName(value.to_string()))
+        } else {
+            Err(anyhow!("invalid tag name"))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct BranchName(String);
 
 impl AsRef<str> for BranchName {
@@ -1401,7 +1465,7 @@ impl TryFrom<String> for BranchName {
     type Error = anyhow::Error;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if is_valid_branch_name(&value) {
+        if is_valid_branch_tag_name(&value) {
             Ok(BranchName(value))
         } else {
             Err(anyhow!("invalid branch name"))
@@ -1421,7 +1485,7 @@ impl TryFrom<&str> for BranchName {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if is_valid_branch_name(value) {
+        if is_valid_branch_tag_name(value) {
             Ok(BranchName(value.to_string()))
         } else {
             Err(anyhow!("invalid branch name"))
@@ -1429,7 +1493,7 @@ impl TryFrom<&str> for BranchName {
     }
 }
 
-fn is_valid_branch_name(s: impl AsRef<str>) -> bool {
+fn is_valid_branch_tag_name(s: impl AsRef<str>) -> bool {
     let s = s.as_ref();
     if s.is_empty() || s.len() > 255 {
         return false;

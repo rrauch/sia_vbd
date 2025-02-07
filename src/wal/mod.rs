@@ -4,7 +4,9 @@ pub(crate) mod reader;
 pub(crate) mod writer;
 
 use crate::io::{ReadOnly, ReadWrite, TokioFile};
-use crate::vbd::{BlockId, ClusterId, Commit, CommitId, FixedSpecs, IndexId, TypedUuid, VbdId};
+use crate::vbd::{
+    BlockId, BranchName, ClusterId, Commit, CommitId, FixedSpecs, IndexId, TypedUuid, VbdId,
+};
 use chrono::{DateTime, Duration, Utc};
 use futures::{AsyncRead, AsyncSeek, AsyncWrite};
 use prost::DecodeError;
@@ -44,6 +46,7 @@ pub(crate) struct TxDetails {
     pub tx_id: TxId,
     pub wal_id: WalId,
     pub vbd_id: VbdId,
+    pub branch: BranchName,
     pub commit: Commit,
     pub preceding_commit: Commit,
     pub created: DateTime<Utc>,
@@ -63,6 +66,7 @@ struct TxDetailBuilder {
     tx_id: TxId,
     wal_id: WalId,
     vbd_id: VbdId,
+    branch: BranchName,
     preceding_commit: Commit,
     created: DateTime<Utc>,
     blocks: HashMap<BlockId, u64>,
@@ -75,6 +79,7 @@ impl TxDetailBuilder {
         tx_id: TxId,
         wal_id: WalId,
         vbd_id: VbdId,
+        branch: BranchName,
         preceding_commit: Commit,
         created: DateTime<Utc>,
     ) -> Self {
@@ -82,6 +87,7 @@ impl TxDetailBuilder {
             tx_id,
             wal_id,
             vbd_id,
+            branch,
             preceding_commit,
             created,
             blocks: HashMap::default(),
@@ -95,6 +101,7 @@ impl TxDetailBuilder {
             tx_id: self.tx_id,
             wal_id: self.wal_id,
             vbd_id: self.vbd_id,
+            branch: self.branch,
             commit,
             preceding_commit: self.preceding_commit,
             created: self.created,
@@ -111,6 +118,7 @@ pub type TxId = TypedUuid<Tx_>;
 
 pub(crate) struct TxBegin {
     pub transaction_id: TxId,
+    pub branch: BranchName,
     pub preceding_commit: Commit,
     pub created: DateTime<Utc>,
 }
@@ -215,6 +223,8 @@ pub enum HeaderError {
 
 #[derive(Error, Debug)]
 pub enum CommitFrameError {
+    #[error("Branch Name Invalid")]
+    BranchInvalid,
     /// Content Id Invalid
     #[error("Commit Invalid")]
     CommitInvalid,

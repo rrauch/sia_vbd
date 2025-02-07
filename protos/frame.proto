@@ -8,7 +8,8 @@ import "protos/volume.proto";
 message Header {
   message TxBegin {
     common.Uuid transaction_id = 1;
-    common.Commit preceding_commit = 2;
+    string branch = 2;
+    common.Commit preceding_commit = 3;
     common.Timestamp created = 4;
   }
 

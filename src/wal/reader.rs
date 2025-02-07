@@ -212,6 +212,7 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                             tx_begin.transaction_id,
                             wal_id,
                             vbd_id,
+                            tx_begin.branch,
                             tx_begin.preceding_commit,
                             tx_begin.created,
                         )))

@@ -212,9 +212,9 @@ END;
 
 CREATE TABLE commits
 (
-    branch              TEXT    NOT NULL PRIMARY KEY COLLATE NOCASE CHECK (LENGTH(branch) >= 1 AND
-                                                                           LENGTH(branch) <= 255 AND
-                                                                           branch GLOB '[A-Za-z0-9_-]*'),
+    name                TEXT    NOT NULL COLLATE NOCASE CHECK (LENGTH(name) >= 1 AND
+                                                               LENGTH(name) <= 255),
+    type                TEXT    NOT NULL CHECK (type IN ('B', 'T')),
     commit_id           BLOB    NOT NULL CHECK (TYPEOF(commit_id) == 'blob' AND
                                                 LENGTH(commit_id) >= 16 AND
                                                 LENGTH(commit_id) <= 32),
@@ -227,6 +227,7 @@ CREATE TABLE commits
     committed           INTEGER NOT NULL,
     num_clusters        INTEGER NOT NULL CHECK (num_clusters > 0),
 
+    PRIMARY KEY (name, type),
     FOREIGN KEY (index_id) REFERENCES known_indices (index_id)
 );
 
@@ -376,4 +377,54 @@ BEGIN
     SET available = known_indices.available - 1
     WHERE OLD.index_id IS NOT NULL
       AND index_id = OLD.index_id;
+END;
+
+-- keeps track of the most recent commit per wal_id / branch
+CREATE TABLE wal_commits
+(
+    wal_id              BLOB    NOT NULL CHECK (TYPEOF(wal_id) == 'blob' AND
+                                                LENGTH(wal_id) == 16),
+    branch              TEXT    NOT NULL COLLATE NOCASE CHECK (LENGTH(branch) >= 1 AND
+                                                               LENGTH(branch) <= 255),
+    commit_id           BLOB    NOT NULL CHECK (TYPEOF(commit_id) == 'blob' AND
+                                                LENGTH(commit_id) >= 16 AND
+                                                LENGTH(commit_id) <= 32),
+    preceding_commit_id BLOB    NOT NULL CHECK (TYPEOF(preceding_commit_id) == 'blob' AND
+                                                LENGTH(preceding_commit_id) >= 16 AND
+                                                LENGTH(preceding_commit_id) <= 32),
+    index_id            BLOB    NOT NULL CHECK (TYPEOF(index_id) == 'blob' AND
+                                                LENGTH(index_id) >= 16 AND
+                                                LENGTH(index_id) <= 32),
+    committed           INTEGER NOT NULL,
+    num_clusters        INTEGER NOT NULL CHECK (num_clusters > 0),
+
+    UNIQUE (wal_id, branch),
+
+    FOREIGN KEY (wal_id) REFERENCES wal_files (id) ON DELETE CASCADE
+);
+
+-- Prevent Updates
+CREATE TRIGGER prevent_wal_commits_update
+    BEFORE UPDATE
+    ON wal_commits
+    FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'Updates to wal_commits are not allowed.');
+END;
+
+-- Only keep the most recent entry for a given wal_id / branch combination
+CREATE TRIGGER delete_older_wal_commit_entries
+    BEFORE INSERT
+    ON wal_commits
+    FOR EACH ROW
+    WHEN EXISTS (SELECT 1
+                 FROM wal_commits
+                 WHERE wal_id = NEW.wal_id
+                   AND branch = NEW.branch
+                   AND NEW.committed > committed)
+BEGIN
+    DELETE
+    FROM wal_commits
+    WHERE wal_id = NEW.wal_id
+      AND branch = NEW.branch;
 END;

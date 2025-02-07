@@ -1,6 +1,9 @@
 use crate::hash::{Hash, HashAlgorithm};
 use crate::repository::{BranchInfo, VolumeHandler};
-use crate::vbd::{Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit, FixedSpecs, Index, IndexId, IndexMut, VbdId};
+use crate::vbd::{
+    Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit,
+    FixedSpecs, Index, IndexId, IndexMut, VbdId,
+};
 use crate::wal::man::WalMan;
 use crate::wal::{TxDetails, WalId};
 use crate::{Etag, SqlitePool};
@@ -139,30 +142,8 @@ impl Inventory {
             .unwrap()
             .clone();
 
-        let local_commit = {
-            let branch = current_branch.as_ref();
-            let r = sqlx::query!(
-                "
-                SELECT commit_id, preceding_commit_id, index_id, committed, num_clusters
-                FROM commits WHERE branch = ?
-                ",
-                branch
-            )
-            .fetch_one(pool.read())
-            .await?;
-            Commit {
-                content_id: Hash::try_from((r.commit_id.as_slice(), specs.meta_hash()))?.into(),
-                preceding_commit: Hash::try_from((
-                    r.preceding_commit_id.as_slice(),
-                    specs.meta_hash(),
-                ))?
-                .into(),
-                index: Hash::try_from((r.index_id.as_slice(), specs.meta_hash()))?.into(),
-                committed: DateTime::from_timestamp_micros(r.committed)
-                    .ok_or(anyhow!("invalid timestamp"))?,
-                num_clusters: r.num_clusters as usize,
-            }
-        };
+        let local_commit =
+            commit_from_db(&current_branch, &specs, &mut *pool.read().acquire().await?).await?;
 
         let commit = if remote_commit > local_commit {
             tracing::info!(remote = %remote_commit.content_id(), local = %local_commit.content_id(), "remote branch is further ahead, updating local branch");
@@ -184,8 +165,6 @@ impl Inventory {
         };
 
         this.sync_wal_files().await?;
-
-        this.current_commit = this.current_commit.clone();
 
         tracing::debug!("inventory loaded");
 
@@ -708,6 +687,27 @@ impl Inventory {
             );
 
         let wal_id = tx_details.wal_id.as_bytes().as_slice();
+        {
+            let branch = tx_details.branch.as_ref();
+            let commit_id = tx_details.commit.content_id.as_ref();
+            let preceding_commit_id = tx_details.commit.preceding_commit.as_ref();
+            let index_id = tx_details.commit.index.as_ref();
+            let committed = tx_details.commit.committed.timestamp_micros();
+            let num_clusters = tx_details.commit.num_clusters as i64;
+            sqlx::query!(
+                "
+                INSERT INTO wal_commits (wal_id, branch, commit_id, preceding_commit_id, index_id, committed, num_clusters)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ",
+                wal_id,
+                branch,
+                commit_id,
+                preceding_commit_id,
+                index_id,
+                committed,
+                num_clusters
+            ).execute(&mut *tx).await?;
+        }
 
         for (id, offset) in items.into_iter() {
             let file_offset = offset as i64;
@@ -732,6 +732,7 @@ impl Inventory {
                 .execute(&mut *tx)
                 .await?.rows_affected();
         }
+
         Ok(rows_affected)
     }
 
@@ -782,6 +783,54 @@ impl Inventory {
             sqlx::query!("DELETE FROM wal_files WHERE id = ?", id)
                 .execute(tx.as_mut())
                 .await?;
+        }
+
+        // sync commits
+        // this updates all branch commits where the wal commits contain newer commits
+        if sqlx::query!(
+            "
+            WITH branches AS (
+                SELECT name
+                FROM commits
+                WHERE type = 'B'
+            ),
+            latest_wc AS (
+                SELECT wc.branch,
+                    wc.commit_id,
+                    wc.preceding_commit_id,
+                    wc.index_id,
+                    wc.committed,
+                    wc.num_clusters
+                FROM wal_commits wc
+                JOIN branches b ON wc.branch = b.name
+                WHERE wc.committed = (
+                    SELECT MAX(committed)
+                    FROM wal_commits
+                    WHERE branch = wc.branch
+                )
+            )
+            UPDATE commits
+            SET commit_id = latest_wc.commit_id,
+                preceding_commit_id = latest_wc.preceding_commit_id,
+                index_id = latest_wc.index_id,
+                committed = latest_wc.committed,
+                num_clusters = latest_wc.num_clusters
+            FROM latest_wc
+            WHERE commits.name = latest_wc.branch
+              AND commits.type = 'B'
+              AND latest_wc.committed > commits.committed;
+            "
+        )
+        .execute(tx.as_mut())
+        .await?
+        .rows_affected()
+            > 0
+        {
+            let commit = commit_from_db(&self.branch, &self.specs, tx.as_mut()).await?;
+            if &commit > &self.current_commit {
+                tracing::info!(wal = %commit.content_id(), local = %self.current_commit.content_id(), "latest wal commit is further ahead, updating local branch");
+                self.current_commit = commit;
+            }
         }
 
         tx.commit().await?;
@@ -1002,7 +1051,7 @@ async fn update_commit<S: AsRef<str>>(
         "
         UPDATE commits SET
         commit_id = ?, preceding_commit_id = ?, index_id = ?, committed = ?, num_clusters = ?
-        WHERE branch = ?
+        WHERE name = ? and type = 'B'
         ",
         commit_id,
         preceding_commit_id,
@@ -1014,6 +1063,32 @@ async fn update_commit<S: AsRef<str>>(
     .execute(&mut *tx)
     .await?;
     Ok(())
+}
+
+async fn commit_from_db(
+    branch: &BranchName,
+    specs: &FixedSpecs,
+    tx: &mut SqliteConnection,
+) -> anyhow::Result<Commit> {
+    let branch = branch.as_ref();
+    let r = sqlx::query!(
+        "
+        SELECT commit_id, preceding_commit_id, index_id, committed, num_clusters
+        FROM commits WHERE name = ? AND type = 'B'
+        ",
+        branch
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    Ok(Commit {
+        content_id: Hash::try_from((r.commit_id.as_slice(), specs.meta_hash()))?.into(),
+        preceding_commit: Hash::try_from((r.preceding_commit_id.as_slice(), specs.meta_hash()))?
+            .into(),
+        index: Hash::try_from((r.index_id.as_slice(), specs.meta_hash()))?.into(),
+        committed: DateTime::from_timestamp_micros(r.committed)
+            .ok_or(anyhow!("invalid timestamp"))?,
+        num_clusters: r.num_clusters as usize,
+    })
 }
 
 #[instrument[skip_all, fields(db_file = %db_file.display())]]
@@ -1139,16 +1214,14 @@ async fn db_init(
         .await?;
     }
 
-    let to_delete = sqlx::query!("SELECT branch FROM commits;")
-        .map(|r| r.branch)
+    let to_delete = sqlx::query!("SELECT name FROM commits where type = 'B';")
+        .map(|r| r.name)
         .fetch_all(tx.as_mut())
         .await?
         .into_iter()
         .filter(|b| {
             match TryInto::<BranchName>::try_into(b) {
-                Ok(b) => {
-                    !branches.contains_key(&b)
-                }
+                Ok(b) => !branches.contains_key(&b),
                 Err(_) => {
                     // invalid branch name, delete
                     true
@@ -1158,7 +1231,7 @@ async fn db_init(
         .collect::<Vec<_>>();
 
     for branch in to_delete {
-        sqlx::query!("DELETE FROM commits WHERE branch = ?;", branch)
+        sqlx::query!("DELETE FROM commits WHERE name = ? AND type = 'B';", branch)
             .execute(tx.as_mut())
             .await?;
     }
@@ -1172,10 +1245,10 @@ async fn db_init(
         let branch = branch.as_ref();
         sqlx::query!(
             "
-            INSERT INTO commits (branch, commit_id, preceding_commit_id, index_id, committed, num_clusters)
-            SELECT ?, ?, ?, ?, ?, ?
+            INSERT INTO commits (name, type, commit_id, preceding_commit_id, index_id, committed, num_clusters)
+            SELECT ?, 'B', ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
-                SELECT 1 FROM commits WHERE branch = ?
+                SELECT 1 FROM commits WHERE name = ? and type = 'B'
             )
             ",
             branch,
