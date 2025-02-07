@@ -1,6 +1,6 @@
 use crate::io::{AsyncReadExtBuffered, ReadWrite, TokioFile};
 use crate::repository::{Chunk, ChunkId, Reader, Repository, Stream, Volume, Writer};
-use crate::vbd::VbdId;
+use crate::vbd::{BranchName, VbdId};
 use crate::Etag;
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
@@ -63,10 +63,10 @@ impl Repository for FsRepository {
         Ok(FsVolume::new(volume_dir))
     }
 
-    async fn create<B: AsRef<str> + Send>(
+    async fn create(
         &self,
         vbd_id: &VbdId,
-        branch: B,
+        branch: &BranchName,
         volume_info: Bytes,
         initial_commit: Bytes,
     ) -> Result<(), Self::Error> {
@@ -252,7 +252,7 @@ impl Volume for FsVolume {
 
     async fn branches(
         &self,
-    ) -> Result<impl Stream<Item = Result<String, Self::Error>> + 'static, Self::Error> {
+    ) -> Result<impl Stream<Item = Result<BranchName, Self::Error>> + 'static, Self::Error> {
         let stream = tokio_stream::wrappers::ReadDirStream::new(
             tokio::fs::read_dir(&self.commits_dir).await?,
         );
@@ -262,7 +262,10 @@ impl Volume for FsVolume {
                     Ok(e) => {
                         if let Some(file_name) = e.file_name().to_str() {
                             if let Some(branch) = file_name.strip_suffix(".branch") {
-                                Ok(Some(branch.to_string()))
+                                Ok(match branch.try_into() {
+                                    Ok(branch) => Some(branch),
+                                    Err(_) => None,
+                                })
                             } else {
                                 Ok(None)
                             }
@@ -278,18 +281,13 @@ impl Volume for FsVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn write_commit<B: AsRef<str> + Send>(
-        &self,
-        branch: B,
-        commit: Bytes,
-    ) -> Result<(), Self::Error> {
-        let branch = branch.as_ref();
-        let path = self.commits_dir.join(format!("{}.branch", branch));
+    async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
+        let path = self.commits_dir.join(format!("{}.branch", branch.as_ref()));
         write_bak(&path, commit.as_ref()).await?;
         Ok(())
     }
 
-    async fn read_commit<B: AsRef<str> + Send>(&self, branch: B) -> Result<Bytes, Self::Error> {
+    async fn read_commit(&self, branch: &BranchName) -> Result<Bytes, Self::Error> {
         let path = self.commits_dir.join(format!("{}.branch", branch.as_ref()));
         read_file(&path, MAX_COMMIT_FILE_SIZE).await
     }

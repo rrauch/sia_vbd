@@ -1,9 +1,6 @@
 use crate::hash::{Hash, HashAlgorithm};
 use crate::repository::{BranchInfo, VolumeHandler};
-use crate::vbd::{
-    Block, BlockId, BlockSize, Cluster, ClusterId, ClusterMut, ClusterSize, Commit, FixedSpecs,
-    Index, IndexId, IndexMut, VbdId,
-};
+use crate::vbd::{Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit, FixedSpecs, Index, IndexId, IndexMut, VbdId};
 use crate::wal::man::WalMan;
 use crate::wal::{TxDetails, WalId};
 use crate::{Etag, SqlitePool};
@@ -24,7 +21,7 @@ use tracing::{instrument, Instrument};
 pub(crate) struct Inventory {
     specs: FixedSpecs,
     pool: SqlitePool,
-    branch: String,
+    branch: BranchName,
     current_commit: Commit,
     wal_man: Arc<WalMan>,
     volume: VolumeHandler,
@@ -123,11 +120,10 @@ impl Inventory {
     pub(super) async fn new(
         db_file: &Path,
         max_db_connections: u8,
-        current_branch: impl AsRef<str>,
+        current_branch: BranchName,
         wal_man: Arc<WalMan>,
         volume: VolumeHandler,
     ) -> Result<Self, anyhow::Error> {
-        let current_branch = current_branch.as_ref().to_string();
         let specs = volume.volume_info().specs.clone();
         let branches = volume.list_branches().await?.collect::<HashMap<_, _>>();
         if !branches.contains_key(&current_branch) {
@@ -144,7 +140,7 @@ impl Inventory {
             .clone();
 
         let local_commit = {
-            let branch = current_branch.as_str();
+            let branch = current_branch.as_ref();
             let r = sqlx::query!(
                 "
                 SELECT commit_id, preceding_commit_id, index_id, committed, num_clusters
@@ -162,7 +158,7 @@ impl Inventory {
                 ))?
                 .into(),
                 index: Hash::try_from((r.index_id.as_slice(), specs.meta_hash()))?.into(),
-                committed: DateTime::from_timestamp_millis(r.committed)
+                committed: DateTime::from_timestamp_micros(r.committed)
                     .ok_or(anyhow!("invalid timestamp"))?,
                 num_clusters: r.num_clusters as usize,
             }
@@ -204,7 +200,7 @@ impl Inventory {
         &self.current_commit
     }
 
-    pub fn branch(&self) -> &String {
+    pub fn branch(&self) -> &BranchName {
         &self.branch
     }
 
@@ -270,7 +266,7 @@ impl Inventory {
 
     #[instrument[skip(self)]]
     async fn index_from_wal(&self, index_id: &IndexId) -> anyhow::Result<Option<Index>> {
-        tracing::debug!("reading index from wal");
+        tracing::trace!("reading index from wal");
         for (wal_id, offsets) in {
             let mut conn = self.pool.read().acquire().await?;
             self.wal_offsets_for_id(index_id, conn.as_mut()).await?
@@ -1025,7 +1021,7 @@ async fn db_init(
     db_file: &Path,
     max_connections: u8,
     specs: &FixedSpecs,
-    branches: &HashMap<String, BranchInfo>,
+    branches: &HashMap<BranchName, BranchInfo>,
 ) -> anyhow::Result<SqlitePool> {
     let writer = SqlitePoolOptions::new()
         .max_connections(1)
@@ -1148,7 +1144,17 @@ async fn db_init(
         .fetch_all(tx.as_mut())
         .await?
         .into_iter()
-        .filter(|b| !branches.contains_key(b))
+        .filter(|b| {
+            match TryInto::<BranchName>::try_into(b) {
+                Ok(b) => {
+                    !branches.contains_key(&b)
+                }
+                Err(_) => {
+                    // invalid branch name, delete
+                    true
+                }
+            }
+        })
         .collect::<Vec<_>>();
 
     for branch in to_delete {
@@ -1163,6 +1169,7 @@ async fn db_init(
         let index_id = commit.index().as_ref();
         let committed = commit.committed().timestamp_micros();
         let num_clusters = commit.num_clusters() as i64;
+        let branch = branch.as_ref();
         sqlx::query!(
             "
             INSERT INTO commits (branch, commit_id, preceding_commit_id, index_id, committed, num_clusters)

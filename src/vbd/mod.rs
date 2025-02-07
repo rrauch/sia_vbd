@@ -740,7 +740,7 @@ impl VirtualBlockDevice {
         max_tx_size: u64,
         db_file: impl AsRef<Path>,
         max_db_connections: u8,
-        branch: impl AsRef<str>,
+        branch: BranchName,
         volume: VolumeHandler,
     ) -> Result<Self, anyhow::Error> {
         let max_tx_size = min(max_tx_size, max_wal_size - 1024 * 1024 * 10);
@@ -758,12 +758,12 @@ impl VirtualBlockDevice {
         }
 
         let wal_man = Arc::new(WalMan::new(&wal_dir, max_wal_size));
-
+        let name = volume.volume_info().name.clone();
         let inventory = Arc::new(RwLock::new(
             Inventory::new(
                 db_file.as_ref(),
                 max_db_connections,
-                branch,
+                branch.clone(),
                 wal_man.clone(),
                 volume,
             )
@@ -793,8 +793,12 @@ impl VirtualBlockDevice {
         drop(lock);
 
         eprintln!("vbd id: {}", config.specs.vbd_id());
-        eprintln!("commit: {}", commit.content_id());
-        eprintln!("index: {}", index.content_id());
+        if let Some(name) = name {
+            eprintln!("vbd name: {}", name);
+        }
+        eprintln!("branch: {}", branch);
+        eprintln!("commit: {} @ {}", commit.content_id(), commit.committed);
+        eprintln!("index: {} @ {} clusters", index.content_id(), index.clusters.len());
 
         Ok(Self {
             config: Arc::new(config),
@@ -1376,6 +1380,68 @@ impl From<CommitMut> for Commit {
             num_clusters: value.num_clusters,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct BranchName(String);
+
+impl AsRef<str> for BranchName {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Display for BranchName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.to_string())
+    }
+}
+
+impl TryFrom<String> for BranchName {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if is_valid_branch_name(&value) {
+            Ok(BranchName(value))
+        } else {
+            Err(anyhow!("invalid branch name"))
+        }
+    }
+}
+
+impl TryFrom<&String> for BranchName {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &String) -> Result<Self, Self::Error> {
+        value.as_str().try_into()
+    }
+}
+
+impl TryFrom<&str> for BranchName {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if is_valid_branch_name(value) {
+            Ok(BranchName(value.to_string()))
+        } else {
+            Err(anyhow!("invalid branch name"))
+        }
+    }
+}
+
+fn is_valid_branch_name(s: impl AsRef<str>) -> bool {
+    let s = s.as_ref();
+    if s.is_empty() || s.len() > 255 {
+        return false;
+    }
+    if s.starts_with('.') || s.ends_with('.') {
+        return false;
+    }
+    if s.contains("..") {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_')
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

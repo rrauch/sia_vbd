@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let db_dir = PathBuf::from("/tmp/foo/db/");
     let db_file = db_dir.join("sia_vbd.sqlite");
     let max_db_connections = 25;
-    let branch = "main".to_string();
+    let branch = "main".try_into()?;
 
     let repository: RepositoryHandler = FsRepository::new("/tmp/foo/repo").await?.into();
 
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
                     arguments.max_tx_size.as_u64(),
                     &db_file,
                     max_db_connections,
-                    &branch,
+                    branch,
                     volume,
                 )
                 .await?,

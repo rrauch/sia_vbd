@@ -6,7 +6,8 @@ use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::fs::{FsRepository, FsVolume};
 use crate::serde::encoded::{Decoded, Decoder, EncodingSinkBuilder};
 use crate::vbd::{
-    Block, BlockSize, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Index, TypedUuid, VbdId,
+    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Index,
+    TypedUuid, VbdId,
 };
 use crate::Etag;
 use anyhow::{anyhow, bail};
@@ -17,7 +18,7 @@ use futures::lock::OwnedMutexGuard;
 use futures::{
     AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SinkExt, TryStreamExt,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::io::{ErrorKind, SeekFrom};
@@ -46,10 +47,10 @@ pub trait Repository: Send {
         &self,
         vbd_id: &VbdId,
     ) -> impl Future<Output = Result<Self::Volume, Self::Error>> + Send;
-    fn create<B: AsRef<str> + Send>(
+    fn create(
         &self,
         vbd_id: &VbdId,
-        branch: B,
+        branch: &BranchName,
         volume_info: Bytes,
         initial_commit: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -91,18 +92,18 @@ pub(crate) trait Volume: Send {
     fn branches(
         &self,
     ) -> impl Future<
-        Output = Result<impl Stream<Item = Result<String, Self::Error>> + 'static, Self::Error>,
+        Output = Result<impl Stream<Item = Result<BranchName, Self::Error>> + 'static, Self::Error>,
     > + Send;
 
-    fn write_commit<B: AsRef<str> + Send>(
+    fn write_commit(
         &self,
-        branch: B,
+        branch: &BranchName,
         commit: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn read_commit<B: AsRef<str> + Send>(
+    fn read_commit(
         &self,
-        branch: B,
+        branch: &BranchName,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send;
 }
 
@@ -139,7 +140,7 @@ impl Chunk {
 pub(crate) enum ChunkContent {
     Block(Block),
     Cluster(Cluster),
-    Commit(Index),
+    Index(Index),
 }
 
 pub(crate) type ChunkId = TypedUuid<Chunk>;
@@ -174,12 +175,12 @@ impl RepositoryHandler {
     pub async fn open_volume(
         &self,
         vbd_id: &VbdId,
-        branch: impl AsRef<str> + Send,
+        branch: &BranchName,
     ) -> anyhow::Result<VolumeHandler> {
         match self {
             Self::FsRepo(fs) => {
                 let fs_volume = fs.open(vbd_id).await?;
-                Ok(VolumeHandler::new(fs_volume, branch).await?)
+                Ok(VolumeHandler::new(fs_volume, branch.clone()).await?)
             }
         }
     }
@@ -193,7 +194,7 @@ impl RepositoryHandler {
     pub async fn create_volume(
         &self,
         name: impl Into<Option<&str>>,
-        default_branch_name: &str,
+        default_branch_name: &BranchName,
         size: usize,
         cluster_size: ClusterSize,
         block_size: BlockSize,
@@ -254,21 +255,20 @@ impl From<FsRepository> for RepositoryHandler {
 pub struct VolumeHandler {
     wrapper: WrappedVolume,
     volume_info: VolumeInfo,
-    branch_name: String,
+    branch_name: BranchName,
     branch_info: BranchInfo,
     chunk_reader: Option<(ChunkId, Box<dyn Reader + 'static>)>,
 }
 
 impl VolumeHandler {
-    async fn new<V: Into<WrappedVolume>, B: AsRef<str>>(
+    async fn new<V: Into<WrappedVolume>>(
         volume: V,
-        branch: B,
+        branch_name: BranchName,
     ) -> anyhow::Result<Self> {
         let wrapper = volume.into();
         let volume_info = read_volume(wrapper.read_volume().await?).await?;
-        let branch_name = branch.as_ref().to_string();
         let branch_info = read_branch(
-            wrapper.read_branch(branch_name.as_str()).await?,
+            wrapper.read_branch(&branch_name).await?,
             volume_info.specs.clone(),
         )
         .await?;
@@ -283,8 +283,8 @@ impl VolumeHandler {
 
     pub async fn list_branches(
         &self,
-    ) -> anyhow::Result<impl Iterator<Item = (String, BranchInfo)> + 'static> {
-        let mut map = BTreeMap::new();
+    ) -> anyhow::Result<impl Iterator<Item = (BranchName, BranchInfo)> + 'static> {
+        let mut map = HashMap::new();
         for name in self.wrapper.list_branches().await? {
             let info = read_branch(
                 self.wrapper.read_branch(&name).await?,
@@ -300,7 +300,7 @@ impl VolumeHandler {
         &self.volume_info
     }
 
-    pub fn branch_info(&self) -> (&String, &BranchInfo) {
+    pub fn branch_info(&self) -> (&BranchName, &BranchInfo) {
         (&self.branch_name, &self.branch_info)
     }
 
@@ -326,11 +326,11 @@ impl VolumeHandler {
         bail!("unexpected content found in chunk, expected cluster");
     }
 
-    pub async fn commit(&mut self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Index> {
-        if let ChunkContent::Commit(commit) = self.read_chunk_content(chunk_id, offset).await? {
-            return Ok(commit);
+    pub async fn index(&mut self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Index> {
+        if let ChunkContent::Index(index) = self.read_chunk_content(chunk_id, offset).await? {
+            return Ok(index);
         }
-        bail!("unexpected content found in chunk, expected commit");
+        bail!("unexpected content found in chunk, expected index");
     }
 
     async fn read_chunk_content(
@@ -396,7 +396,7 @@ async fn try_convert_chunk<IO: Reader>(
         }
         Decoded::Index(mut frame) => {
             let commit = frame.read_body().await?;
-            Ok(ChunkContent::Commit(commit))
+            Ok(ChunkContent::Index(commit))
         }
         _ => {
             bail!("invalid content in chunk");
@@ -484,7 +484,7 @@ impl WrappedVolume {
         })
     }
 
-    async fn list_branches(&self) -> anyhow::Result<impl Iterator<Item = String> + 'static> {
+    async fn list_branches(&self) -> anyhow::Result<impl Iterator<Item = BranchName> + 'static> {
         Ok(match &self {
             Self::FsVolume(fs) => {
                 let stream = fs.branches().await?;
@@ -494,8 +494,7 @@ impl WrappedVolume {
         })
     }
 
-    async fn read_branch(&self, branch: impl AsRef<str> + Send) -> anyhow::Result<Bytes> {
-        let branch = branch.as_ref().to_string();
+    async fn read_branch(&self, branch: &BranchName) -> anyhow::Result<Bytes> {
         Ok(match &self {
             Self::FsVolume(fs) => fs.read_commit(branch).await?,
         })
