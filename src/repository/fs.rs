@@ -76,9 +76,11 @@ impl Repository for FsRepository {
         let mut file = TokioFile::create_new(&file).await?;
         file.write_all(volume_info.as_ref()).await?;
         file.close().await?;
-        let dir = dir.join("commits");
-        tokio::fs::create_dir(&dir).await?;
-        let file = dir.join(format!("{}.branch", branch.as_ref()));
+        let chunk_dir = dir.join("chunks");
+        tokio::fs::create_dir(&chunk_dir).await?;
+        let commit_dir = dir.join("commits");
+        tokio::fs::create_dir(&commit_dir).await?;
+        let file = commit_dir.join(format!("{}.branch", branch.as_ref()));
         let mut file = TokioFile::create_new(&file).await?;
         file.write_all(initial_commit.as_ref()).await?;
         Ok(())

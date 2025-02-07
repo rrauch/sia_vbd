@@ -275,10 +275,12 @@ END;
 
 CREATE TABLE wal_files
 (
-    id   BLOB NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
-                                          LENGTH(id) == 16),
-    etag BLOB NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
-                              LENGTH(etag) >= 8)
+    id            BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                                      LENGTH(id) == 16),
+    etag          BLOB    NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                                          LENGTH(etag) >= 8),
+    created       INTEGER NOT NULL,
+    active        BOOLEAN NOT NULL CHECK (active IN (0, 1))
 );
 
 -- Prevent Id changes
@@ -289,6 +291,25 @@ CREATE TRIGGER prevent_wal_files_id_update
     WHEN NEW.id != OLD.id
 BEGIN
     SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
+END;
+
+CREATE TRIGGER ensure_only_one_wal_file_active_before_update
+    BEFORE UPDATE
+    ON wal_files
+    FOR EACH ROW
+    WHEN NEW.active != OLD.active
+        AND NEW.active = 1
+BEGIN
+    UPDATE wal_files SET active = 0 WHERE id != NEW.id;
+END;
+
+CREATE TRIGGER ensure_only_one_wal_file_active_before_insert
+    BEFORE INSERT
+    ON wal_files
+    FOR EACH ROW
+    WHEN NEW.active = 1
+BEGIN
+    UPDATE wal_files SET active = 0 WHERE id != NEW.id;
 END;
 
 CREATE TABLE chunks

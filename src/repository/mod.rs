@@ -5,10 +5,7 @@ use crate::hash::HashAlgorithm;
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::fs::{FsRepository, FsVolume};
 use crate::serde::encoded::{Decoded, Decoder, EncodingSinkBuilder};
-use crate::vbd::{
-    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Index,
-    TypedUuid, VbdId,
-};
+use crate::vbd::{Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterSize, Commit, CommitMut, FixedSpecs, Index, IndexId, TypedUuid, VbdId};
 use crate::{now, Etag};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
@@ -124,7 +121,7 @@ pub(crate) trait Writer: AsyncWrite + Send + Unpin {
 
 pub(crate) struct Chunk {
     id: ChunkId,
-    content: BTreeMap<u64, ChunkContent>,
+    content: BTreeMap<u64, ChunkEntry>,
 }
 
 impl Chunk {
@@ -132,9 +129,15 @@ impl Chunk {
         &self.id
     }
 
-    pub fn content(&self) -> impl Iterator<Item = (u64, &ChunkContent)> {
+    pub fn content(&self) -> impl Iterator<Item = (u64, &ChunkEntry)> {
         self.content.iter().map(|(id, content)| (*id, content))
     }
+}
+
+pub(crate) enum ChunkEntry {
+    BlockId(BlockId),
+    ClusterId(ClusterId),
+    IndexId(IndexId),
 }
 
 pub(crate) enum ChunkContent {
@@ -294,6 +297,12 @@ impl VolumeHandler {
             map.insert(name, info);
         }
         Ok(map.into_iter())
+    }
+
+    pub async fn list_chunks(
+        &self,
+    ) -> anyhow::Result<impl Iterator<Item = (ChunkId, Etag)> + 'static> {
+        self.wrapper.list_chunks().await
     }
 
     pub fn volume_info(&self) -> &VolumeInfo {
@@ -488,6 +497,16 @@ impl WrappedVolume {
         Ok(match &self {
             Self::FsVolume(fs) => {
                 let stream = fs.branches().await?;
+                let res: Result<Vec<_>, <FsVolume as Volume>::Error> = stream.try_collect().await;
+                res?.into_iter()
+            }
+        })
+    }
+
+    async fn list_chunks(&self) -> anyhow::Result<impl Iterator<Item = (ChunkId, Etag)> + 'static> {
+        Ok(match &self {
+            Self::FsVolume(fs) => {
+                let stream = fs.chunks().await?;
                 let res: Result<Vec<_>, <FsVolume as Volume>::Error> = stream.try_collect().await;
                 res?.into_iter()
             }

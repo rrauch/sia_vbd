@@ -1,5 +1,5 @@
 use crate::hash::{Hash, HashAlgorithm};
-use crate::repository::{BranchInfo, VolumeHandler};
+use crate::repository::{BranchInfo, ChunkEntry, ChunkId, VolumeHandler};
 use crate::vbd::{
     Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit,
     FixedSpecs, Index, IndexId, IndexMut, VbdId,
@@ -164,6 +164,7 @@ impl Inventory {
             volume,
         };
 
+        this.sync_chunks().await?;
         this.sync_wal_files().await?;
 
         tracing::debug!("inventory loaded");
@@ -740,12 +741,69 @@ impl Inventory {
     }
 
     #[instrument[skip_all]]
-    pub async fn sync_wal_files(&mut self) -> anyhow::Result<()> {
+    pub async fn sync_chunks(&mut self) -> anyhow::Result<()> {
+        tracing::info!("syncing chunks");
+        let available_chunks = self.volume.list_chunks().await?.collect::<HashMap<_, _>>();
+        let mut tx = self.pool.write().begin().await?;
+
+        let mut known_chunks: HashMap<ChunkId, Etag> = HashMap::default();
+        for r in sqlx::query!("SELECT id, etag FROM chunks")
+            .fetch_all(tx.as_mut())
+            .await?
+            .into_iter()
+        {
+            let chunk_id = match ChunkId::try_from(r.id.as_slice()) {
+                Ok(chunk_id) => chunk_id,
+                Err(err) => {
+                    tracing::error!(error = %err, chunk_id = ?r.id, "invalid chunk_id found in database, removing");
+                    sqlx::query!("DELETE FROM chunks WHERE id = ?", r.id)
+                        .execute(tx.as_mut())
+                        .await?;
+                    continue;
+                }
+            };
+            known_chunks.insert(chunk_id, Etag::from(r.etag));
+        }
+
+        for (chunk_id, etag) in available_chunks {
+            let mut in_sync = false;
+            if let Some(known_etag) = known_chunks.remove(&chunk_id) {
+                if &known_etag == &etag {
+                    in_sync = true;
+                }
+            }
+            if !in_sync {
+                tracing::info!(chunk_id = %chunk_id, "chunk needs syncing");
+                self.sync_chunk(&chunk_id, &etag, tx.as_mut()).await?;
+            }
+        }
+
+        for obsolete in known_chunks.into_keys() {
+            tracing::debug!(
+                chunk_id = %obsolete,
+                "removing obsolete chunk from inventory",
+            );
+            let id = obsolete.as_bytes().as_slice();
+            sqlx::query!("DELETE FROM chunks WHERE id = ?", id)
+                .execute(tx.as_mut())
+                .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    #[instrument[skip_all]]
+    async fn sync_wal_files(&mut self) -> anyhow::Result<()> {
         tracing::info!("syncing wal files");
         let wal_files = self.wal_man.wal_files().await?;
 
         let mut known_wal_files: HashMap<WalId, Etag> = HashMap::default();
         let mut tx = self.pool.write().begin().await?;
+        sqlx::query!("UPDATE wal_files SET active = 0")
+            .execute(tx.as_mut())
+            .await?;
         for r in sqlx::query!("SELECT id, etag FROM wal_files")
             .fetch_all(tx.as_mut())
             .await?
@@ -841,6 +899,62 @@ impl Inventory {
         Ok(())
     }
 
+    #[instrument(skip(self, tx), fields(chunk_id = %chunk_id))]
+    async fn sync_chunk(
+        &mut self,
+        chunk_id: &ChunkId,
+        etag: &Etag,
+        tx: &mut SqliteConnection,
+    ) -> anyhow::Result<()> {
+        tracing::debug!(chunk_id = %chunk_id, "syncing chunk");
+
+        let id = chunk_id.as_bytes().as_slice();
+        let etag = etag.as_ref();
+
+        let rows_affected = sqlx::query!("DELETE FROM chunks WHERE id = ?", id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tracing::trace!(rows_affected, "deleted chunk related entries from database");
+
+        sqlx::query!(
+            "INSERT INTO chunks (id, etag)
+             VALUES (?, ?)
+            ",
+            id,
+            etag
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        let chunk = self.volume.chunk_details(&chunk_id).await?;
+        let id = chunk_id.as_bytes().as_slice();
+
+        for (offset, content) in chunk.content().into_iter() {
+            let offset = offset as i64;
+            let (content_type, block_id, cluster_id, index_id) = match content {
+                ChunkEntry::BlockId(block_id) => ("B", Some(block_id.as_ref()), None, None),
+                ChunkEntry::ClusterId(cluster_id) => ("C", None, Some(cluster_id.as_ref()), None),
+                ChunkEntry::IndexId(index_id) => ("I", None, None, Some(index_id.as_ref())),
+            };
+
+            sqlx::query!(
+                "
+                INSERT INTO content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
+                VALUES ('C', ?, ?, ?, ?, ?, ?)
+                ",
+                id,
+                offset,
+                content_type,
+                block_id,
+                cluster_id,
+                index_id,
+            ).execute(&mut *tx).await?;
+        }
+
+        Ok(())
+    }
+
     #[instrument(skip(self, tx), fields(wal_id = %wal_id))]
     async fn sync_wal_file(
         &mut self,
@@ -848,11 +962,12 @@ impl Inventory {
         etag: &Etag,
         tx: &mut SqliteConnection,
     ) -> anyhow::Result<u64> {
-        tracing::debug!("syncing wal file");
+        tracing::debug!(wal_id = %wal_id, "syncing wal file");
         let mut wal_reader = self.wal_man.open_reader(wal_id).await?;
 
         let id = wal_id.as_bytes().as_slice();
         let etag = etag.as_ref();
+        let created = wal_reader.header().created.timestamp_micros();
 
         let rows_affected = sqlx::query!("DELETE FROM wal_files WHERE id = ?", id)
             .execute(&mut *tx)
@@ -864,11 +979,12 @@ impl Inventory {
         );
         let mut rows_affected = 0;
         rows_affected += sqlx::query!(
-            "INSERT INTO wal_files (id, etag)
-             VALUES (?, ?)
+            "INSERT INTO wal_files (id, etag, created, active)
+             VALUES (?, ?, ?, 0)
             ",
             id,
-            etag
+            etag,
+            created,
         )
         .execute(&mut *tx)
         .await?
@@ -962,16 +1078,20 @@ impl Inventory {
             let id = tx_details.wal_id.as_bytes().as_slice();
             let etag = wal_reader.as_ref().etag().await?;
             let etag = etag.as_ref();
+            let created = wal_reader.header().created.timestamp_micros();
             let mut tx = self.pool.writer.begin().await?;
             sqlx::query!(
                 "
-                INSERT INTO wal_files (id, etag)
-                VALUES (?, ?)
+                INSERT INTO wal_files (id, etag, created, active)
+                VALUES (?, ?, ?, 1)
                 ON CONFLICT(id) DO UPDATE SET
-                    etag = excluded.etag;
+                    etag = excluded.etag,
+                    created = excluded.created,
+                    active = 1;
                 ",
                 id,
                 etag,
+                created
             )
             .execute(tx.as_mut())
             .await?;
