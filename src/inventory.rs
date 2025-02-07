@@ -327,12 +327,15 @@ impl Inventory {
     ) -> anyhow::Result<impl Iterator<Item = (WalId, Vec<u64>)>> {
         #[derive(Debug)]
         struct Row {
-            wal_id: Vec<u8>,
-            file_offset: i64,
+            wal_id: Option<Vec<u8>>,
+            offset: i64,
         }
 
         fn try_convert(row: Row) -> anyhow::Result<(WalId, u64)> {
-            Ok(WalId::try_from(row.wal_id.as_slice()).map(|w| (w, row.file_offset as u64))?)
+            Ok(
+                WalId::try_from(row.wal_id.ok_or(anyhow!("wal_id is NULL"))?.as_slice())
+                    .map(|w| (w, row.offset as u64))?,
+            )
         }
 
         let id = id.into();
@@ -342,8 +345,8 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, file_offset FROM wal_content
-                    WHERE content_type = 'B' AND block_id = ? AND index_id IS NULL AND cluster_id IS NULL
+                    SELECT wal_id, offset FROM content
+                    WHERE source_type = 'W' AND content_type = 'B' AND block_id = ? AND index_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -352,8 +355,8 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, file_offset FROM wal_content
-                    WHERE content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND index_id IS NULL
+                    SELECT wal_id, offset FROM content
+                    WHERE source_type = 'W' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND index_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -362,8 +365,8 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, file_offset FROM wal_content
-                    WHERE content_type = 'I' AND index_id = ? AND block_id IS NULL AND cluster_id IS NULL
+                    SELECT wal_id, offset FROM content
+                    WHERE source_type = 'W' AND content_type = 'I' AND index_id = ? AND block_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -710,7 +713,7 @@ impl Inventory {
         }
 
         for (id, offset) in items.into_iter() {
-            let file_offset = offset as i64;
+            let offset = offset as i64;
             let id_bytes = id.as_bytes();
             let (content_type, block_id, cluster_id, index_id) = match &id {
                 Id::BlockId(_) => ("B", Some(id_bytes), None, None),
@@ -719,11 +722,11 @@ impl Inventory {
             };
             rows_affected += sqlx::query!(
             "
-                    INSERT INTO wal_content (wal_id, file_offset, content_type, block_id, cluster_id, index_id)
-                    VALUES (?, ?, ?, ?, ?, ?);
+                    INSERT INTO content (source_type, wal_id, offset, content_type, block_id, cluster_id, index_id)
+                    VALUES ('W', ?, ?, ?, ?, ?, ?);
                     ",
             wal_id,
-            file_offset,
+            offset,
             content_type,
             block_id,
             cluster_id,

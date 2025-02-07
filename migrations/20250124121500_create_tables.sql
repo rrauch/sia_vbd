@@ -291,11 +291,32 @@ BEGIN
     SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
 END;
 
-CREATE TABLE wal_content
+CREATE TABLE chunks
 (
-    wal_id       BLOB    NOT NULL CHECK (TYPEOF(wal_id) == 'blob' AND
-                                         LENGTH(wal_id) == 16),
-    file_offset  INTEGER NOT NULL CHECK (file_offset > 0),
+    id   BLOB NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                          LENGTH(id) == 16),
+    etag BLOB NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                              LENGTH(etag) >= 8)
+);
+
+-- Prevent Id changes
+CREATE TRIGGER prevent_chunks_id_update
+    BEFORE UPDATE
+    ON chunks
+    FOR EACH ROW
+    WHEN NEW.id != OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
+END;
+
+CREATE TABLE content
+(
+    source_type  TEXT    NOT NULL CHECK (source_type IN ('W', 'C')),
+    wal_id       BLOB CHECK (wal_id IS NULL OR (TYPEOF(wal_id) == 'blob' AND
+                                                LENGTH(wal_id) == 16)),
+    chunk_id     BLOB CHECK (chunk_id IS NULL OR (TYPEOF(chunk_id) == 'blob' AND
+                                                  LENGTH(chunk_id) == 16)),
+    offset       INTEGER NOT NULL CHECK (offset > 0),
     content_type TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'I')),
 
     block_id     BLOB,
@@ -303,11 +324,18 @@ CREATE TABLE wal_content
     index_id     BLOB,
 
     FOREIGN KEY (wal_id) REFERENCES wal_files (id) ON DELETE CASCADE,
+    FOREIGN KEY (chunk_id) REFERENCES chunks (id) ON DELETE CASCADE,
     FOREIGN KEY (block_id) REFERENCES known_blocks (block_id),
     FOREIGN KEY (cluster_id) REFERENCES known_clusters (cluster_id),
     FOREIGN KEY (index_id) REFERENCES known_indices (index_id),
 
-    UNIQUE (wal_id, file_offset),
+    UNIQUE (wal_id, offset),
+    UNIQUE (chunk_id, offset),
+
+    CHECK (
+        (source_type = 'W' AND wal_id IS NOT NULL AND chunk_id IS NULL) OR
+        (source_type = 'C' AND wal_id IS NULL AND chunk_id IS NOT NULL)
+        ),
 
     CHECK (
         (content_type = 'B' AND block_id IS NOT NULL AND cluster_id IS NULL AND index_id IS NULL) OR
@@ -317,18 +345,18 @@ CREATE TABLE wal_content
 );
 
 -- Prevent Updates
-CREATE TRIGGER prevent_wal_content_update
+CREATE TRIGGER prevent_content_update
     BEFORE UPDATE
-    ON wal_content
+    ON content
     FOR EACH ROW
 BEGIN
-    SELECT RAISE(ABORT, 'Updates to wal_content are not allowed.');
+    SELECT RAISE(ABORT, 'Updates to content are not allowed.');
 END;
 
 -- Reference Counting
-CREATE TRIGGER increment_available_counter_before_wal_content_block_insert
+CREATE TRIGGER increment_available_counter_before_content_block_insert
     BEFORE INSERT
-    ON wal_content
+    ON content
     WHEN NEW.block_id IS NOT NULL
 BEGIN
     -- Upsert known_blocks
@@ -337,9 +365,9 @@ BEGIN
     ON CONFLICT(block_id) DO UPDATE SET available = known_blocks.available + 1;
 END;
 
-CREATE TRIGGER increment_available_counter_before_wal_content_cluster_insert
+CREATE TRIGGER increment_available_counter_before_content_cluster_insert
     BEFORE INSERT
-    ON wal_content
+    ON content
     WHEN NEW.cluster_id IS NOT NULL
 BEGIN
     -- Upsert known_clusters
@@ -348,9 +376,9 @@ BEGIN
     ON CONFLICT(cluster_id) DO UPDATE SET available = available + 1;
 END;
 
-CREATE TRIGGER increment_available_counter_before_wal_content_index_insert
+CREATE TRIGGER increment_available_counter_before_content_index_insert
     BEFORE INSERT
-    ON wal_content
+    ON content
     WHEN NEW.index_id IS NOT NULL
 BEGIN
     -- Upsert known_indices
@@ -359,9 +387,9 @@ BEGIN
     ON CONFLICT(index_id) DO UPDATE SET available = available + 1;
 END;
 
-CREATE TRIGGER decrement_available_counters_after_wal_content_delete
+CREATE TRIGGER decrement_available_counters_after_content_delete
     AFTER DELETE
-    ON wal_content
+    ON content
 BEGIN
     UPDATE known_blocks
     SET available = known_blocks.available - 1
