@@ -9,7 +9,7 @@ use crate::vbd::{
     Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Index,
     TypedUuid, VbdId,
 };
-use crate::Etag;
+use crate::{now, Etag};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -214,7 +214,7 @@ impl RepositoryHandler {
         );
         let volume_info = VolumeInfo {
             specs: fixed_specs,
-            created: Utc::now(),
+            created: now(),
             name,
         };
         let mut buf = BytesMut::zeroed(4096);

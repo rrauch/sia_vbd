@@ -1,5 +1,6 @@
 use crate::hash::HashAlgorithm;
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use sqlx::{Pool, Sqlite};
 use std::fmt::{Debug, Display, Formatter};
@@ -136,6 +137,11 @@ impl TryFrom<&Metadata> for Etag {
         let hash = hasher.finalize();
         Ok(Etag::copy_from(hash.as_ref()))
     }
+}
+
+pub(crate) fn now() -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("timestamp from micros should work")
 }
 
 #[cfg(unix)]

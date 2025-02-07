@@ -10,6 +10,7 @@ use futures::{AsyncSeekExt, AsyncWriteExt, SinkExt};
 use std::io::SeekFrom;
 use tracing::instrument;
 use uuid::Uuid;
+use crate::now;
 
 const MAX_WAL_FILE_SIZE: u64 = 1024 * 1024 * 128;
 
@@ -74,7 +75,7 @@ impl<IO: WalSink> WalWriter<IO> {
         let header = FileHeader {
             wal_id,
             preceding_wal_id,
-            created: Utc::now(),
+            created: now(),
             specs,
         };
 
@@ -144,7 +145,7 @@ impl<IO: WalSink> WalWriter<IO> {
             self.header.specs.vbd_id(),
             branch,
             preceding_commit,
-            Utc::now(),
+            now(),
             reserve_space,
             self,
             Encoder::new(None),

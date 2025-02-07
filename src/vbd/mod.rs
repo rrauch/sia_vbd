@@ -2,9 +2,9 @@ use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::Inventory;
 use crate::io::{ReadWrite, TokioFile};
 use crate::repository::VolumeHandler;
-use crate::wal;
 use crate::wal::man::WalMan;
 use crate::wal::{RollbackError, WalError, WalReader, WalWriter};
+use crate::{now, wal};
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
@@ -1333,7 +1333,7 @@ impl CommitMut {
 
         Self {
             preceding_commit,
-            timestamp: Utc::now(),
+            timestamp: now(),
             index: zero_index.content_id,
             num_clusters,
             specs,
@@ -1381,7 +1381,7 @@ impl CommitMut {
     }
 
     pub fn finalize(mut self) -> Commit {
-        self.timestamp = Utc::now();
+        self.timestamp = now();
         self.into()
     }
 }
