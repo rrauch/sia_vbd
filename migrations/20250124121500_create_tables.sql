@@ -44,6 +44,8 @@ CREATE TABLE known_blocks
     available INTEGER NOT NULL CHECK (available >= 0)
 );
 
+CREATE INDEX idx_known_blocks_block_id ON known_blocks (block_id);
+
 -- Prevent Id changes
 CREATE TRIGGER prevent_known_blocks_id_update
     BEFORE UPDATE
@@ -72,6 +74,8 @@ CREATE TABLE known_clusters
     available  INTEGER NOT NULL CHECK (available >= 0)
 );
 
+CREATE INDEX idx_known_clusters_cluster_id ON known_clusters (cluster_id);
+
 -- Prevent Id changes
 CREATE TRIGGER prevent_known_cluster_id_update
     BEFORE UPDATE
@@ -99,6 +103,8 @@ CREATE TABLE known_indices
     used      INTEGER NOT NULL CHECK (used >= 0),
     available INTEGER NOT NULL CHECK (available >= 0)
 );
+
+CREATE INDEX idx_known_indices_index_id ON known_indices (index_id);
 
 -- Prevent Id changes
 CREATE TRIGGER prevent_known_indices_id_update
@@ -275,12 +281,12 @@ END;
 
 CREATE TABLE wal_files
 (
-    id            BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
-                                                      LENGTH(id) == 16),
-    etag          BLOB    NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
-                                          LENGTH(etag) >= 8),
-    created       INTEGER NOT NULL,
-    active        BOOLEAN NOT NULL CHECK (active IN (0, 1))
+    id      BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                                LENGTH(id) == 16),
+    etag    BLOB    NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                                    LENGTH(etag) >= 8),
+    created INTEGER NOT NULL,
+    active  BOOLEAN NOT NULL CHECK (active IN (0, 1))
 );
 
 -- Prevent Id changes
@@ -364,6 +370,12 @@ CREATE TABLE content
         (content_type = 'I' AND index_id IS NOT NULL AND block_id IS NULL AND cluster_id IS NULL)
         )
 );
+
+CREATE INDEX idx_content_source_type ON content (source_type);
+CREATE INDEX idx_content_content_type ON content (content_type);
+CREATE INDEX idx_content_block_id ON content (block_id);
+CREATE INDEX idx_content_cluster_id ON content (cluster_id);
+CREATE INDEX idx_content_index_id ON content (index_id);
 
 -- Prevent Updates
 CREATE TRIGGER prevent_content_update

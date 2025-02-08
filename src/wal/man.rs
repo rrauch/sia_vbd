@@ -77,4 +77,13 @@ impl WalMan {
         }
         Ok(builder.build().await?)
     }
+
+    pub(crate) async fn delete(&self, wal_id: &WalId) -> anyhow::Result<()> {
+        let path = self.wal_dir.join(format!("{}.wal", wal_id));
+        if tokio::fs::try_exists(&path).await? {
+            tracing::info!(path = %path.display(), "deleting wal file");
+            tokio::fs::remove_file(&path).await?;
+        }
+        Ok(())
+    }
 }

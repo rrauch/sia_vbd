@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail};
 use chrono::DateTime;
 use futures::{Stream, TryStreamExt};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{ConnectOptions, SqliteConnection};
+use sqlx::{Acquire, ConnectOptions, SqliteConnection};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Deref;
@@ -27,7 +27,7 @@ pub(crate) struct Inventory {
     branch: BranchName,
     current_commit: Commit,
     wal_man: Arc<WalMan>,
-    volume: VolumeHandler,
+    volume: Arc<VolumeHandler>,
 }
 
 enum Id<'a> {
@@ -127,6 +127,7 @@ impl Inventory {
         wal_man: Arc<WalMan>,
         volume: VolumeHandler,
     ) -> Result<Self, anyhow::Error> {
+        let volume = Arc::new(volume);
         let specs = volume.volume_info().specs.clone();
         let branches = volume.list_branches().await?.collect::<HashMap<_, _>>();
         if !branches.contains_key(&current_branch) {
@@ -166,6 +167,8 @@ impl Inventory {
 
         this.sync_chunks().await?;
         this.sync_wal_files().await?;
+        //delete_obsolete_wal_files(&this.pool, &this.wal_man).await?;
+        pack_chunks(&this.pool, &this.wal_man, &this.volume, &this.specs).await?;
 
         tracing::debug!("inventory loaded");
 
@@ -1422,4 +1425,168 @@ fn try_from_db_hash(value: String) -> anyhow::Result<HashAlgorithm> {
         "XXH3_128" => Ok(HashAlgorithm::XXH3),
         _ => bail!("invalid hash algorithm value: {}", value),
     }
+}
+
+async fn delete_obsolete_wal_files(pool: &SqlitePool, wal_man: &WalMan) -> anyhow::Result<()> {
+    let mut deleted = 0;
+    // all wal_files with only inactive content
+    let obsolete = sqlx::query!(
+        "SELECT wf.id AS wal_id
+        FROM wal_files wf
+        WHERE wf.active = 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM content c
+              LEFT JOIN known_blocks kb ON c.block_id = kb.block_id
+              LEFT JOIN known_clusters kc ON c.cluster_id = kc.cluster_id
+              LEFT JOIN known_indices ki ON c.index_id = ki.index_id
+              WHERE c.source_type = 'W'
+              AND c.wal_id = wf.id
+              AND (
+                  (c.content_type = 'B' AND kb.used > 0) OR
+                  (c.content_type = 'C' AND kc.used > 0) OR
+                  (c.content_type = 'I' AND ki.used > 0)
+              )
+          );
+          "
+    )
+    .fetch_all(pool.read())
+    .await?
+    .into_iter()
+    .map(|r| TryInto::<WalId>::try_into(r.wal_id.as_slice()))
+    .collect::<Result<Vec<_>, _>>()?;
+
+    for wal_id in obsolete {
+        let mut tx = pool.write().begin().await?;
+        let id = wal_id.as_bytes().as_slice();
+        if sqlx::query!("DELETE FROM wal_files WHERE id = ? AND active = 0", id)
+            .execute(tx.as_mut())
+            .await?
+            .rows_affected()
+            > 0
+        {
+            wal_man.delete(&wal_id).await?;
+            deleted += 1;
+        }
+        tx.commit().await?;
+    }
+
+    if deleted > 0 {
+        tracing::info!(deleted_wal_files = deleted, "obsolete wal files deleted");
+    }
+
+    Ok(())
+}
+
+async fn pack_chunks(
+    pool: &SqlitePool,
+    wal_man: &WalMan,
+    volume: &VolumeHandler,
+    specs: &FixedSpecs,
+) -> anyhow::Result<()> {
+    let mut offset = 0;
+    let mut tx = pool.read().begin().await?;
+    let content = find_packable_content(offset, 100, tx.as_mut(), specs).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn find_packable_content(
+    offset: usize,
+    limit: usize,
+    conn: &mut SqliteConnection,
+    specs: &FixedSpecs,
+) -> anyhow::Result<Vec<(WalId, u64, ChunkEntry, usize)>> {
+    let offset = offset as i64;
+    let limit = limit as i64;
+
+    let content_hash = specs.content_hash();
+    let meta_hash = specs.meta_hash();
+
+    #[derive(Debug)]
+    struct Row {
+        wal_id: Option<Vec<u8>>,
+        block_id: Option<Vec<u8>>,
+        cluster_id: Option<Vec<u8>>,
+        index_id: Option<Vec<u8>>,
+        offset: i64,
+        used_count: i64,
+    }
+
+    let try_convert = |row: Row| -> anyhow::Result<(WalId, u64, ChunkEntry, usize)> {
+        let wal_id = WalId::try_from(row.wal_id.ok_or(anyhow!("wal_id is NULL"))?.as_slice())?;
+        let offset = row.offset as u64;
+        let used_count = row.used_count as usize;
+        let entry = if row.block_id.is_some() {
+            ChunkEntry::BlockId(
+                Hash::try_from((row.block_id.unwrap().as_slice(), content_hash))?.into(),
+            )
+        } else if row.cluster_id.is_some() {
+            ChunkEntry::ClusterId(
+                Hash::try_from((row.cluster_id.unwrap().as_slice(), meta_hash))?.into(),
+            )
+        } else if row.index_id.is_some() {
+            ChunkEntry::IndexId(
+                Hash::try_from((row.index_id.unwrap().as_slice(), meta_hash))?.into(),
+            )
+        } else {
+            bail!("invalid row returned, no content id found");
+        };
+        Ok((wal_id, offset, entry, used_count))
+    };
+
+    Ok(sqlx::query_as!(
+        Row,
+        "
+SELECT cw.wal_id, cw.block_id, cw.cluster_id, cw.index_id, cw.offset, kb.used AS used_count
+FROM content cw
+         JOIN known_blocks kb ON cw.block_id = kb.block_id
+WHERE cw.source_type = 'W'
+  AND cw.content_type = 'B'
+  AND kb.used > 0
+  AND NOT EXISTS (SELECT 1
+                  FROM content cc
+                  WHERE cc.content_type = 'B'
+                    AND cc.block_id = cw.block_id
+                    AND cc.source_type = 'C')
+
+UNION ALL
+
+SELECT cw.wal_id, cw.block_id, cw.cluster_id, cw.index_id, cw.offset, kc.used AS used_count
+FROM content cw
+         JOIN known_clusters kc ON cw.cluster_id = kc.cluster_id
+WHERE cw.source_type = 'W'
+  AND cw.content_type = 'C'
+  AND kc.used > 0
+  AND NOT EXISTS (SELECT 1
+                  FROM content cc
+                  WHERE cc.content_type = 'C'
+                    AND cc.cluster_id = cw.cluster_id
+                    AND cc.source_type = 'C')
+
+UNION ALL
+
+SELECT cw.wal_id, cw.block_id, cw.cluster_id, cw.index_id, cw.offset, ki.used AS used_count
+FROM content cw
+         JOIN known_indices ki ON cw.index_id = ki.index_id
+WHERE cw.source_type = 'W'
+  AND cw.content_type = 'I'
+  AND ki.used > 0
+  AND NOT EXISTS (SELECT 1
+                  FROM content cc
+                  WHERE cc.content_type = 'I'
+                    AND cc.index_id = cw.index_id
+                    AND cc.source_type = 'C')
+
+ORDER BY used_count DESC
+LIMIT ? OFFSET ?;
+        ",
+        limit,
+        offset
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(|r| try_convert(r))
+    .collect::<Result<Vec<_>, _>>()?)
 }
