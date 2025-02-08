@@ -168,7 +168,7 @@ impl Inventory {
         this.sync_chunks().await?;
         this.sync_wal_files().await?;
         //delete_obsolete_wal_files(&this.pool, &this.wal_man).await?;
-        pack_chunks(&this.pool, &this.wal_man, &this.volume, &this.specs).await?;
+        //pack_chunks(&this.pool, &this.wal_man, &this.volume, &this.specs).await?;
 
         tracing::debug!("inventory loaded");
 
@@ -349,7 +349,7 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, offset FROM content
+                    SELECT wal_id, offset FROM available_content
                     WHERE source_type = 'W' AND content_type = 'B' AND block_id = ? AND index_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
@@ -359,7 +359,7 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, offset FROM content
+                    SELECT wal_id, offset FROM available_content
                     WHERE source_type = 'W' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND index_id IS NULL
                     ",
                     id_slice
@@ -369,7 +369,7 @@ impl Inventory {
                 sqlx::query_as!(
                     Row,
                     "
-                    SELECT wal_id, offset FROM content
+                    SELECT wal_id, offset FROM available_content
                     WHERE source_type = 'W' AND content_type = 'I' AND index_id = ? AND block_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
@@ -621,13 +621,7 @@ impl Inventory {
     ) -> impl Stream<Item = Result<Id<'static>, anyhow::Error>> + use<'a> {
         sqlx::query!(
             "
-            SELECT block_id, NULL AS cluster_id, NULL AS index_id FROM known_blocks
-                WHERE used = 0 AND available > 0
-                UNION ALL
-            SELECT NULL, cluster_id, NULL FROM known_clusters
-                WHERE used = 0 AND available > 0
-                UNION ALL
-            SELECT NULL, NULL, index_id FROM known_indices
+            SELECT block_id, cluster_id, index_id FROM known_content
                 WHERE used = 0 AND available > 0;
             "
         )
@@ -726,7 +720,7 @@ impl Inventory {
             };
             rows_affected += sqlx::query!(
             "
-                    INSERT INTO content (source_type, wal_id, offset, content_type, block_id, cluster_id, index_id)
+                    INSERT INTO available_content (source_type, wal_id, offset, content_type, block_id, cluster_id, index_id)
                     VALUES ('W', ?, ?, ?, ?, ?, ?);
                     ",
             wal_id,
@@ -943,7 +937,7 @@ impl Inventory {
 
             sqlx::query!(
                 "
-                INSERT INTO content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
+                INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
                 VALUES ('C', ?, ?, ?, ?, ?, ?)
                 ",
                 id,
@@ -1303,8 +1297,8 @@ async fn db_init(
     let block_id = zero_block.content_id().as_ref();
     sqlx::query!(
         "
-        INSERT INTO known_blocks (block_id, used, available)
-        VALUES (?, 0, 1)
+        INSERT INTO known_content (content_type, block_id, used, available)
+        VALUES ('B', ?, 0, 1)
         ON CONFLICT(block_id) DO UPDATE SET available = 1;
         ",
         block_id,
@@ -1316,8 +1310,8 @@ async fn db_init(
     let cluster_id = zero_cluster.content_id().as_ref();
     sqlx::query!(
         "
-        INSERT INTO known_clusters (cluster_id, used, available)
-        VALUES (?, 0, 1)
+        INSERT INTO known_content (content_type, cluster_id, used, available)
+        VALUES ('C', ?, 0, 1)
         ON CONFLICT(cluster_id) DO UPDATE SET available = 1;
                 ",
         cluster_id
@@ -1330,8 +1324,8 @@ async fn db_init(
         let index_id = zero_index.content_id().as_ref();
         sqlx::query!(
             "
-            INSERT INTO known_indices (index_id, used, available)
-            VALUES (?, 0, 1)
+            INSERT INTO known_content (content_type, index_id, used, available)
+            VALUES ('I', ?, 0, 1)
             ON CONFLICT(index_id) DO UPDATE SET available = 1;
             ",
             index_id
@@ -1431,24 +1425,23 @@ async fn delete_obsolete_wal_files(pool: &SqlitePool, wal_man: &WalMan) -> anyho
     let mut deleted = 0;
     // all wal_files with only inactive content
     let obsolete = sqlx::query!(
-        "SELECT wf.id AS wal_id
-        FROM wal_files wf
-        WHERE wf.active = 0
-          AND NOT EXISTS (
-              SELECT 1
-              FROM content c
-              LEFT JOIN known_blocks kb ON c.block_id = kb.block_id
-              LEFT JOIN known_clusters kc ON c.cluster_id = kc.cluster_id
-              LEFT JOIN known_indices ki ON c.index_id = ki.index_id
-              WHERE c.source_type = 'W'
-              AND c.wal_id = wf.id
-              AND (
-                  (c.content_type = 'B' AND kb.used > 0) OR
-                  (c.content_type = 'C' AND kc.used > 0) OR
-                  (c.content_type = 'I' AND ki.used > 0)
-              )
-          );
-          "
+        "
+SELECT wf.id AS wal_id
+FROM wal_files wf
+WHERE wf.active = 0
+  AND NOT EXISTS (
+      SELECT 1
+      FROM available_content ac
+      JOIN known_content kc ON (
+          (ac.content_type = 'B' AND ac.block_id = kc.block_id) OR
+          (ac.content_type = 'C' AND ac.cluster_id = kc.cluster_id) OR
+          (ac.content_type = 'I' AND ac.index_id = kc.index_id)
+      )
+      WHERE ac.source_type = 'W'
+        AND ac.wal_id = wf.id
+        AND kc.used > 0
+  );
+        "
     )
     .fetch_all(pool.read())
     .await?
@@ -1538,47 +1531,24 @@ async fn find_packable_content(
     Ok(sqlx::query_as!(
         Row,
         "
-SELECT cw.wal_id, cw.block_id, cw.cluster_id, cw.index_id, cw.offset, kb.used AS used_count
-FROM content cw
-         JOIN known_blocks kb ON cw.block_id = kb.block_id
-WHERE cw.source_type = 'W'
-  AND cw.content_type = 'B'
-  AND kb.used > 0
-  AND NOT EXISTS (SELECT 1
-                  FROM content cc
-                  WHERE cc.content_type = 'B'
-                    AND cc.block_id = cw.block_id
-                    AND cc.source_type = 'C')
-
-UNION ALL
-
-SELECT cw.wal_id, cw.block_id, cw.cluster_id, cw.index_id, cw.offset, kc.used AS used_count
-FROM content cw
-         JOIN known_clusters kc ON cw.cluster_id = kc.cluster_id
-WHERE cw.source_type = 'W'
-  AND cw.content_type = 'C'
+SELECT wc.wal_id, wc.block_id, wc.cluster_id, wc.index_id, wc.offset, kc.used AS used_count
+FROM available_content wc
+         JOIN known_content kc ON (
+    (wc.block_id IS NOT NULL AND wc.block_id = kc.block_id) OR
+    (wc.cluster_id IS NOT NULL AND wc.cluster_id = kc.cluster_id) OR
+    (wc.index_id IS NOT NULL AND wc.index_id = kc.index_id)
+    )
+WHERE wc.source_type = 'W'
   AND kc.used > 0
   AND NOT EXISTS (SELECT 1
-                  FROM content cc
-                  WHERE cc.content_type = 'C'
-                    AND cc.cluster_id = cw.cluster_id
-                    AND cc.source_type = 'C')
-
-UNION ALL
-
-SELECT cw.wal_id, cw.block_id, cw.cluster_id, cw.index_id, cw.offset, ki.used AS used_count
-FROM content cw
-         JOIN known_indices ki ON cw.index_id = ki.index_id
-WHERE cw.source_type = 'W'
-  AND cw.content_type = 'I'
-  AND ki.used > 0
-  AND NOT EXISTS (SELECT 1
-                  FROM content cc
-                  WHERE cc.content_type = 'I'
-                    AND cc.index_id = cw.index_id
-                    AND cc.source_type = 'C')
-
-ORDER BY used_count DESC
+                  FROM available_content cc
+                  WHERE cc.source_type = 'C'
+                    AND (
+                      (wc.block_id IS NOT NULL AND wc.block_id = cc.block_id) OR
+                      (wc.cluster_id IS NOT NULL AND wc.cluster_id = cc.cluster_id) OR
+                      (wc.index_id IS NOT NULL AND wc.index_id = cc.index_id)
+                      ))
+ORDER BY kc.used DESC
 LIMIT ? OFFSET ?;
         ",
         limit,
