@@ -18,7 +18,7 @@ use std::ops::{Deref, DerefMut, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::instrument;
@@ -750,10 +750,13 @@ impl VirtualBlockDevice {
         wal_dir: impl AsRef<Path>,
         max_wal_size: u64,
         max_tx_size: u64,
+        max_chunk_size: u64,
         db_file: impl AsRef<Path>,
         max_db_connections: u8,
         branch: BranchName,
         volume: VolumeHandler,
+        initial_sync_delay: Duration,
+        sync_interval: Duration,
     ) -> Result<Self, anyhow::Error> {
         let max_tx_size = min(max_tx_size, max_wal_size - 1024 * 1024 * 10);
         if max_tx_size < 1024 * 1024 * 10 {
@@ -775,9 +778,12 @@ impl VirtualBlockDevice {
             Inventory::new(
                 db_file.as_ref(),
                 max_db_connections,
+                max_chunk_size,
                 branch.clone(),
                 wal_man.clone(),
                 volume,
+                initial_sync_delay,
+                sync_interval,
             )
             .await?,
         ));
@@ -1032,6 +1038,20 @@ impl VirtualBlockDevice {
 
     pub fn total_size(&self) -> usize {
         self.blocks() * *self.config.specs.block_size()
+    }
+
+    pub async fn close(mut self) -> anyhow::Result<()> {
+        self.commit().await?;
+        match std::mem::replace(&mut self.state, State::Poisoned) {
+            State::Committed(_) => {}
+            _ => unreachable!("invalid internal state"),
+        }
+        let inventory = Arc::into_inner(self.inventory)
+            .expect("self.inventory to be the only reference to Inventory at this point")
+            .into_inner();
+
+        inventory.close().await?;
+        Ok(())
     }
 }
 

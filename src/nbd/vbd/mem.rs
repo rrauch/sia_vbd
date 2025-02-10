@@ -189,6 +189,10 @@ impl BlockDevice for MemDevice {
         self.write_zeroes(offset, length, false, ctx).await?;
         Ok(())
     }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct AffectedBlocks {

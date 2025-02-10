@@ -328,6 +328,10 @@ impl BlockDevice for DedupDevice {
         self.write_zeroes(offset, length, false, ctx).await?;
         Ok(())
     }
+
+    async fn close(&mut self) -> crate::nbd::block_device::Result<()> {
+        Ok(())
+    }
 }
 
 struct AffectedBlocks {

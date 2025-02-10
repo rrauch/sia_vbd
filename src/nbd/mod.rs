@@ -5,15 +5,20 @@ mod transmission;
 pub mod vbd;
 
 use crate::{is_power_of_two, ClientEndpoint, ListenEndpoint};
+use anyhow::bail;
 use block_device::{BlockDevice, Options};
 use connection::tcp::TcpListener;
 use connection::{Connection, Listener};
 use futures::{AsyncRead, AsyncWrite};
 use handshake::Handshaker;
+use std::cmp::min;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Semaphore;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 const MAX_PAYLOAD_LEN: u32 = 32 * 1024 * 1024; // 32 MiB
 
@@ -123,6 +128,10 @@ impl Export {
         *lock = lock.saturating_sub(1);
         *lock
     }
+
+    fn into_inner(self) -> Arc<dyn BlockDevice + Send + Sync + 'static> {
+        self.block_device
+    }
 }
 
 #[derive(Error, Debug)]
@@ -137,6 +146,7 @@ pub struct Builder {
     default_export: Option<String>,
     structured_replies_disabled: bool,
     extended_headers_disabled: bool,
+    max_simultaneous_connections: u32,
 }
 
 impl Builder {
@@ -147,6 +157,7 @@ impl Builder {
             default_export: None,
             structured_replies_disabled: false,
             extended_headers_disabled: false,
+            max_simultaneous_connections: u32::MAX,
         }
     }
 
@@ -158,6 +169,7 @@ impl Builder {
             default_export: None,
             structured_replies_disabled: false,
             extended_headers_disabled: false,
+            max_simultaneous_connections: u32::MAX,
         }
     }
 
@@ -193,58 +205,145 @@ impl Builder {
         self
     }
 
-    pub fn build(self) -> Runner {
+    pub fn max_connections(mut self, max_simultaneous_connections: u32) -> Self {
+        self.max_simultaneous_connections = max_simultaneous_connections;
+        self
+    }
+
+    pub fn build(self) -> (Runner, RunGuard) {
+        let shutdown_ct = CancellationToken::new();
+        let guard = shutdown_ct.clone().drop_guard();
         let handshaker = Handshaker::new(
             self.exports,
             self.default_export,
             self.structured_replies_disabled,
             self.extended_headers_disabled,
+            shutdown_ct.clone(),
         );
-        Runner {
-            listen_endpoint: self.listen_endpoint,
-            handshaker: Arc::new(handshaker),
-        }
+        (
+            Runner {
+                listen_endpoint: self.listen_endpoint,
+                handshaker: Some(Arc::new(handshaker)),
+                shutdown_ct,
+                max_connections: self.max_simultaneous_connections,
+                conn_permits: Arc::new(Semaphore::new(self.max_simultaneous_connections as usize)),
+            },
+            guard,
+        )
     }
 }
 
+pub type RunGuard = DropGuard;
+
 pub struct Runner {
     listen_endpoint: ListenEndpoint,
-    handshaker: Arc<Handshaker>,
+    handshaker: Option<Arc<Handshaker>>,
+    shutdown_ct: CancellationToken,
+    max_connections: u32,
+    conn_permits: Arc<Semaphore>,
 }
 
 impl Runner {
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        let res = self._run().await;
+        self.shutdown_ct.cancel();
+        // waiting for shutdown to complete
+        let _ = self.conn_permits.acquire_many(self.max_connections).await?;
+        println!("all connections closed");
+        let mut handshaker = match self.handshaker.take() {
+            Some(handshaker) => handshaker,
+            None => {
+                bail!("handshaker gone");
+            }
+        };
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        println!("waiting for all tasks to finish");
+        let mut hs = None;
+        loop {
+            match Arc::try_unwrap(handshaker) {
+                Ok(success) => {
+                    hs = Some(success);
+                    break;
+                }
+                Err(hs) => {
+                    handshaker = hs;
+                }
+            }
+            let now = Instant::now();
+            if now >= wait_deadline {
+                break;
+            }
+            let wait_duration =
+                Duration::from_millis(min((wait_deadline - now).as_millis() as u64, 100));
+            tokio::time::sleep(wait_duration).await;
+        }
+        if hs.is_none() {
+            bail!("waiting for tasks timed out");
+        }
+        let hs = hs.unwrap();
+        println!("closing all exports");
+        hs.close().await;
+        println!("shutdown complete");
+        res
+    }
+
+    async fn _run(&mut self) -> anyhow::Result<()> {
         match &self.listen_endpoint {
             ListenEndpoint::Tcp(addr) => {
-                self._run(TcpListener::bind(addr.to_string()).await?)
+                self.accept(TcpListener::bind(addr.to_string()).await?)
                     .await?
             }
             #[cfg(unix)]
             ListenEndpoint::Unix(path) => {
-                self._run(connection::unix::UnixListener::bind(path.to_path_buf()).await?)
+                self.accept(connection::unix::UnixListener::bind(path.to_path_buf()).await?)
                     .await?
             }
         };
         Ok(())
     }
 
-    async fn _run<T: Listener>(&self, listener: T) -> anyhow::Result<()> {
+    async fn accept<T: Listener>(&mut self, listener: T) -> anyhow::Result<()> {
         println!("Listening on {}", listener.addr());
+        let ct = self.shutdown_ct.clone();
         loop {
-            let conn = listener.accept().await?;
+            let permit = tokio::select! {
+                permit = self.conn_permits.clone().acquire_owned () => {
+                    permit
+                }
+                _ = ct.cancelled() => {
+                    println!("not accepting any more connections");
+                    return Ok(());
+                }
+            }?;
+
+            let conn = tokio::select! {
+                res = listener.accept() => {
+                    res
+                }
+                _ = ct.cancelled() => {
+                    println!("not accepting any more connections");
+                    return Ok(());
+                }
+            }?;
+
             println!("New connection from {}", conn.client_endpoint());
 
             let handshaker = self.handshaker.clone();
             let client_endpoint = conn.client_endpoint().clone();
             let (rx, tx) = conn.into_split();
-
             tokio::spawn(async move {
-                if let Err(error) =
-                    new_connection(&handshaker, rx, tx, client_endpoint.clone()).await
+                if let Err(error) = new_connection(
+                    handshaker.as_ref().unwrap(),
+                    rx,
+                    tx,
+                    client_endpoint.clone(),
+                )
+                .await
                 {
                     eprintln!("error {:?}, client endpoint {}", error, client_endpoint);
                 }
                 println!("connection closed for {}", client_endpoint);
+                drop(permit);
             });
         }
     }

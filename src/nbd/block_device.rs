@@ -208,6 +208,8 @@ pub trait BlockDevice {
     async fn resize(&self, new_size: u64, _ctx: &RequestContext) -> Result<()> {
         unimplemented!("resize")
     }
+
+    async fn close(&mut self) -> Result<()>;
 }
 
 pub type Result<T> = result::Result<T, Error>;

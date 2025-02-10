@@ -9,7 +9,7 @@ use std::ops::Range;
 use tokio::sync::RwLock;
 
 pub struct NbdDevice {
-    vbd: RwLock<VirtualBlockDevice>,
+    vbd: Option<RwLock<VirtualBlockDevice>>,
     block_size: u64,
     zero_block: Bytes,
     block_calc: BlockCalc,
@@ -20,7 +20,7 @@ impl NbdDevice {
         let block_size = vbd.block_size() as u64;
         let num_blocks = vbd.blocks() as u64;
         Self {
-            vbd: tokio::sync::RwLock::new(vbd),
+            vbd: Some(RwLock::new(vbd)),
             block_size,
             zero_block: BytesMut::zeroed(block_size as usize).freeze(),
             block_calc: BlockCalc {
@@ -34,7 +34,7 @@ impl NbdDevice {
 #[async_trait]
 impl BlockDevice for NbdDevice {
     async fn options(&self) -> Options {
-        let vbd = self.vbd.read().await;
+        let vbd = self.vbd.as_ref().unwrap().read().await;
 
         Options {
             block_size: vbd.block_size() as u32,
@@ -66,7 +66,7 @@ impl BlockDevice for NbdDevice {
             assert!(length > 0 && length <= self.block_size);
 
             let bytes = {
-                let lock = self.vbd.read().await;
+                let lock = self.vbd.as_ref().unwrap().read().await;
 
                 lock.get(block.block_no as usize).await?.map(|b| {
                     if block.partial {
@@ -108,7 +108,7 @@ impl BlockDevice for NbdDevice {
                 None
             } else {
                 // partial block, get from backend first
-                let lock = self.vbd.read().await;
+                let lock = self.vbd.as_ref().unwrap().read().await;
                 lock.get(block.block_no as usize)
                     .await?
                     .map(|b| BytesMut::from(b))
@@ -122,13 +122,13 @@ impl BlockDevice for NbdDevice {
 
             let bytes = buf.freeze();
 
-            let mut lock = self.vbd.write().await;
+            let mut lock = self.vbd.as_ref().unwrap().write().await;
             lock.put(block.block_no as usize, bytes).await?;
             data_written = true;
         }
 
         if data_written && fua {
-            let mut lock = self.vbd.write().await;
+            let mut lock = self.vbd.as_ref().unwrap().write().await;
             lock.flush().await?;
         }
 
@@ -146,7 +146,7 @@ impl BlockDevice for NbdDevice {
 
         if !blocks.full.is_empty() {
             // full blocks can be deleted
-            let mut lock = self.vbd.write().await;
+            let mut lock = self.vbd.as_ref().unwrap().write().await;
             lock.delete((blocks.full.start as usize)..(blocks.full.end as usize))
                 .await?;
 
@@ -156,7 +156,7 @@ impl BlockDevice for NbdDevice {
 
         for block in blocks.into_iter() {
             let mut buf = {
-                let lock = self.vbd.read().await;
+                let lock = self.vbd.as_ref().unwrap().read().await;
                 lock.get(block.block_no as usize)
                     .await?
                     .map(|b| BytesMut::from(b))
@@ -166,7 +166,7 @@ impl BlockDevice for NbdDevice {
             let range = (block.range.start as usize)..(block.range.end as usize);
             let to_zero = &mut buf[range];
             to_zero.copy_from_slice(&self.zero_block.as_ref()[..to_zero.len()]);
-            let mut lock = self.vbd.write().await;
+            let mut lock = self.vbd.as_ref().unwrap().write().await;
             lock.put(block.block_no as usize, buf.freeze()).await?;
         }
 
@@ -174,7 +174,7 @@ impl BlockDevice for NbdDevice {
     }
 
     async fn flush(&self, _ctx: &RequestContext) -> crate::nbd::block_device::Result<()> {
-        let mut state = self.vbd.write().await;
+        let mut state = self.vbd.as_ref().unwrap().write().await;
         state.flush().await?;
         Ok(())
     }
@@ -186,6 +186,16 @@ impl BlockDevice for NbdDevice {
         ctx: &RequestContext,
     ) -> crate::nbd::block_device::Result<()> {
         self.write_zeroes(offset, length, true, ctx).await
+    }
+
+    async fn close(&mut self) -> crate::nbd::block_device::Result<()> {
+        if let Some(vbd) = self.vbd.take() {
+            vbd.into_inner()
+                .close()
+                .await
+                .map_err(|e| BlockError::Other(e))?;
+        }
+        Ok(())
     }
 }
 

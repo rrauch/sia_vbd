@@ -110,6 +110,7 @@ pub(crate) enum BodyType {
     BlockContent,
     Cluster,
     Index,
+    ChunkIndex,
 }
 
 #[derive(Clone, Debug)]

@@ -2,10 +2,13 @@ pub mod fs;
 pub(crate) mod protos;
 
 use crate::hash::HashAlgorithm;
+use crate::inventory::chunk::{Chunk, ChunkContent, ChunkId};
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::fs::{FsRepository, FsVolume};
 use crate::serde::encoded::{Decoded, Decoder, EncodingSinkBuilder};
-use crate::vbd::{Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterSize, Commit, CommitMut, FixedSpecs, Index, IndexId, TypedUuid, VbdId};
+use crate::vbd::{
+    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Index, VbdId,
+};
 use crate::{now, Etag};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
@@ -15,10 +18,11 @@ use futures::lock::OwnedMutexGuard;
 use futures::{
     AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SinkExt, TryStreamExt,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::io::{ErrorKind, SeekFrom};
+use std::sync::Mutex;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -80,7 +84,8 @@ pub(crate) trait Volume: Send {
     fn write_chunk(
         &self,
         chunk: &Chunk,
-    ) -> impl Future<Output = Result<impl Writer<Ok = Etag> + 'static, Self::Error>> + Send;
+        content: impl Reader + 'static,
+    ) -> impl Future<Output = Result<Etag, Self::Error>> + Send;
     fn delete_chunk(
         &self,
         chunk_id: &ChunkId,
@@ -109,44 +114,6 @@ impl<T> Stream for T where T: futures::Stream + Send + Unpin {}
 
 pub(crate) trait Reader: AsyncRead + AsyncSeek + Send + Sync + Unpin {}
 impl<T> Reader for T where T: AsyncRead + AsyncSeek + Send + Sync + Unpin {}
-
-pub(crate) trait Writer: AsyncWrite + Send + Unpin {
-    type Ok: Send;
-    //type Error: std::error::Error + Send + Sync;
-    type Error: Send + Sync + Display + Debug;
-
-    fn finalize(self) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send;
-    fn cancel(self) -> impl Future<Output = Result<(), Self::Error>> + Send;
-}
-
-pub(crate) struct Chunk {
-    id: ChunkId,
-    content: BTreeMap<u64, ChunkEntry>,
-}
-
-impl Chunk {
-    pub fn id(&self) -> &ChunkId {
-        &self.id
-    }
-
-    pub fn content(&self) -> impl Iterator<Item = (u64, &ChunkEntry)> {
-        self.content.iter().map(|(id, content)| (*id, content))
-    }
-}
-
-pub(crate) enum ChunkEntry {
-    BlockId(BlockId),
-    ClusterId(ClusterId),
-    IndexId(IndexId),
-}
-
-pub(crate) enum ChunkContent {
-    Block(Block),
-    Cluster(Cluster),
-    Index(Index),
-}
-
-pub(crate) type ChunkId = TypedUuid<Chunk>;
 
 pub enum RepositoryHandler {
     FsRepo(FsRepository),
@@ -260,7 +227,7 @@ pub struct VolumeHandler {
     volume_info: VolumeInfo,
     branch_name: BranchName,
     branch_info: BranchInfo,
-    chunk_reader: Option<(ChunkId, Box<dyn Reader + 'static>)>,
+    chunk_reader: Mutex<Option<(ChunkId, Box<dyn Reader + 'static>)>>,
 }
 
 impl VolumeHandler {
@@ -280,7 +247,7 @@ impl VolumeHandler {
             volume_info,
             branch_name,
             branch_info,
-            chunk_reader: None,
+            chunk_reader: Mutex::new(None),
         })
     }
 
@@ -313,6 +280,25 @@ impl VolumeHandler {
         (&self.branch_name, &self.branch_info)
     }
 
+    pub async fn update_branch_commit(&self, commit: &Commit) -> anyhow::Result<()> {
+        let info = BranchInfo {
+            commit: commit.clone(),
+        };
+
+        let mut buf = BytesMut::zeroed(4096);
+        let mut cursor = Cursor::new(buf.as_mut());
+        write_branch(&mut cursor, &info).await?;
+        let len = cursor.position() as usize;
+        drop(cursor);
+        buf.truncate(len);
+        let branch_bytes = buf.freeze();
+
+        self.wrapper
+            .write_branch(&self.branch_name, branch_bytes)
+            .await?;
+        Ok(())
+    }
+
     pub async fn chunk_details(&self, chunk_id: &ChunkId) -> anyhow::Result<Chunk> {
         self.wrapper.chunk_details(chunk_id).await
     }
@@ -321,29 +307,40 @@ impl VolumeHandler {
         self.wrapper.delete_chunk(chunk_id).await
     }
 
-    pub async fn block(&mut self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Block> {
+    pub async fn block(&self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Block> {
         if let ChunkContent::Block(block) = self.read_chunk_content(chunk_id, offset).await? {
             return Ok(block);
         }
         bail!("unexpected content found in chunk, expected block");
     }
 
-    pub async fn cluster(&mut self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Cluster> {
+    pub async fn cluster(&self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Cluster> {
         if let ChunkContent::Cluster(cluster) = self.read_chunk_content(chunk_id, offset).await? {
             return Ok(cluster);
         }
         bail!("unexpected content found in chunk, expected cluster");
     }
 
-    pub async fn index(&mut self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Index> {
+    pub async fn index(&self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Index> {
         if let ChunkContent::Index(index) = self.read_chunk_content(chunk_id, offset).await? {
             return Ok(index);
         }
         bail!("unexpected content found in chunk, expected index");
     }
 
+    #[instrument(skip_all, fields(chunk_id = %chunk.id(), num_entries = chunk.len(), len = _len))]
+    pub async fn put_chunk(
+        &self,
+        chunk: &Chunk,
+        _len: u64,
+        reader: impl Reader + 'static,
+    ) -> anyhow::Result<Etag> {
+        tracing::debug!("writing chunk to volume");
+        Ok(self.wrapper.write_chunk(chunk, reader).await?)
+    }
+
     async fn read_chunk_content(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         offset: u64,
     ) -> anyhow::Result<ChunkContent> {
@@ -353,17 +350,23 @@ impl VolumeHandler {
             let decoded = read_chunk(specs, &mut reader).await?;
             try_convert_chunk(decoded).await?
         };
-        self.chunk_reader = Some((chunk_id.clone(), reader));
+        {
+            let mut lock = self.chunk_reader.lock().unwrap();
+            *lock = Some((chunk_id.clone(), reader));
+        }
         Ok(content)
     }
 
     async fn chunk_reader(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         offset: u64,
     ) -> anyhow::Result<Box<dyn Reader + 'static>> {
         let mut reader = None;
-        if let Some((c, mut r)) = self.chunk_reader.take() {
+        if let Some((c, mut r)) = {
+            let mut lock = self.chunk_reader.lock().unwrap();
+            lock.take()
+        } {
             if &c == chunk_id {
                 if let Ok(_) = r.seek(SeekFrom::Start(offset)).await {
                     // still alive
@@ -519,6 +522,12 @@ impl WrappedVolume {
         })
     }
 
+    async fn write_branch(&self, branch: &BranchName, content: Bytes) -> anyhow::Result<()> {
+        Ok(match &self {
+            Self::FsVolume(fs) => fs.write_commit(branch, content).await?,
+        })
+    }
+
     async fn chunk_details(&self, chunk_id: &ChunkId) -> anyhow::Result<Chunk> {
         Ok(match &self {
             Self::FsVolume(fs) => fs.chunk_details(chunk_id).await?,
@@ -538,6 +547,16 @@ impl WrappedVolume {
     ) -> anyhow::Result<Box<dyn Reader + 'static>> {
         Ok(match &self {
             Self::FsVolume(fs) => Box::new(fs.read_chunk(chunk_id, offset).await?),
+        })
+    }
+
+    async fn write_chunk(
+        &self,
+        chunk: &Chunk,
+        content: impl Reader + 'static,
+    ) -> anyhow::Result<Etag> {
+        Ok(match &self {
+            Self::FsVolume(fs) => fs.write_chunk(chunk, content).await?,
         })
     }
 }

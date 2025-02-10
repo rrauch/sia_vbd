@@ -300,6 +300,7 @@ pub(crate) mod frame {
                 &BodyType::Index => body::Type::IndexProto3,
                 &BodyType::BlockContent => body::Type::BlockContent,
                 &BodyType::Cluster => body::Type::ClusterProto3,
+                &BodyType::ChunkIndex => body::Type::ChunkIndexProto3,
             }
         }
     }
@@ -312,6 +313,7 @@ pub(crate) mod frame {
                 body::Type::ClusterProto3 => Ok(BodyType::Cluster),
                 body::Type::IndexProto3 => Ok(BodyType::Index),
                 body::Type::BlockContent => Ok(BodyType::BlockContent),
+                body::Type::ChunkIndexProto3 => Ok(BodyType::ChunkIndex),
             }
         }
     }

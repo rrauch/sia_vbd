@@ -1,3 +1,4 @@
+use crate::inventory::chunk::{Chunk, ChunkId};
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::{BranchInfo, VolumeInfo};
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
@@ -5,6 +6,7 @@ use crate::serde::protos::frame;
 use crate::serde::{framed, protos, Body, BodyType, Compressed, Compression, Compressor};
 use crate::vbd::{Block, BlockId, Cluster, ClusterId, FixedSpecs, Index, IndexId, Position};
 use crate::wal::{FileHeader as WalInfo, TxBegin, TxCommit};
+use anyhow::anyhow;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::io::BufReader;
@@ -132,6 +134,23 @@ impl<'a, R: InnerReader + 'a> DecodedReadFrame<IndexId, R, Index> {
     }
 }
 
+impl<'a, R: InnerReader + 'a> DecodedReadFrame<ChunkId, R, Chunk> {
+    pub async fn read_body(&mut self) -> Result<Chunk, DecodingError> {
+        let mut bytes = self.read_body_bytes().await?;
+        let proto_index = crate::repository::protos::volume::ChunkIndex::decode(&mut bytes)?;
+        let chunk: Chunk = proto_index
+            .try_into()
+            .map_err(|e| DecodingError::Other(e))?;
+        if &self.header != chunk.id() {
+            return Err(BodyError::ChunkIdMismatch(
+                self.header.clone(),
+                chunk.id().clone(),
+            ))?;
+        }
+        Ok(chunk)
+    }
+}
+
 pub(crate) struct Decoder {
     fixed_specs: FixedSpecs,
 }
@@ -236,6 +255,14 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
                         let frame = DecodedReadFrame::new(branch_info, body, frame, fixed_specs);
                         Decoded::BranchInfo(frame)
                     }
+                    frame::header::Type::ChunkInfo(chunk_info) => {
+                        let chunk_id: ChunkId = chunk_info
+                            .chunk_id
+                            .map(|id| id.into())
+                            .ok_or(DecodingError::Other(anyhow!("chunk id missing")))?;
+                        let frame = DecodedReadFrame::new(chunk_id, body, frame, fixed_specs);
+                        Decoded::ChunkInfo(frame)
+                    }
                 })
             } else {
                 Err(DecodingError::MissingHeader)
@@ -322,6 +349,8 @@ pub(crate) enum BodyError {
     ClusterIdMismatch(ClusterId, ClusterId),
     #[error("CommitId Mismatch: [{0}] != [{1}]")]
     CommitIdMismatch(IndexId, IndexId),
+    #[error("ChunkId Mismatch: [{0}] != [{1}]")]
+    ChunkIdMismatch(ChunkId, ChunkId),
 }
 
 pub(crate) enum Decoded<R: InnerReader> {
@@ -333,6 +362,7 @@ pub(crate) enum Decoded<R: InnerReader> {
     WalInfo(DecodedReadFrame<WalInfo, R, ()>),
     VolumeInfo(DecodedReadFrame<VolumeInfo, R, ()>),
     BranchInfo(DecodedReadFrame<BranchInfo, R, ()>),
+    ChunkInfo(DecodedReadFrame<ChunkId, R, Chunk>),
 }
 
 impl<R: InnerReader> Decoded<R> {
@@ -346,6 +376,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::WalInfo(f) => f.position(),
             Self::VolumeInfo(f) => f.position(),
             Self::BranchInfo(f) => f.position(),
+            Self::ChunkInfo(f) => f.position(),
         }
     }
 
@@ -359,6 +390,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::WalInfo(f) => f.body.as_ref(),
             Self::VolumeInfo(f) => f.body.as_ref(),
             Self::BranchInfo(f) => f.body.as_ref(),
+            Self::ChunkInfo(f) => f.body.as_ref(),
         }
     }
 }
@@ -505,12 +537,7 @@ impl Converter {
             if let Some(compressor) = self.compressor.as_ref() {
                 let uncompressed_body = body.take().unwrap();
                 let compressed_body = compressor.compress(&uncompressed_body);
-
-                body = Some(if compressed_body.len() < uncompressed_body.len() {
-                    compressed_body
-                } else {
-                    uncompressed_body
-                });
+                body = Some(compressed_body);
             }
         }
 
@@ -718,6 +745,18 @@ pin_project! {
 impl<T> EncodingSink<T> {
     pub fn into_inner(self) -> T {
         self.inner
+    }
+}
+
+impl<T> AsRef<T> for EncodingSink<T> {
+    fn as_ref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T> AsMut<T> for EncodingSink<T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
 }
 

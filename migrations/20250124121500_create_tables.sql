@@ -48,7 +48,8 @@ CREATE TABLE known_content
                                                          LENGTH(index_id) >= 16 AND
                                                          LENGTH(index_id) <= 32)),
     used         INTEGER NOT NULL CHECK (used >= 0),
-    available    INTEGER NOT NULL CHECK (available >= 0),
+    chunk_avail  INTEGER NOT NULL CHECK (chunk_avail >= 0),
+    wal_avail    INTEGER NOT NULL CHECK (wal_avail >= 0),
 
     CHECK (
         (content_type = 'B' AND block_id IS NOT NULL AND cluster_id IS NULL AND index_id IS NULL) OR
@@ -94,9 +95,70 @@ END;
 CREATE TRIGGER delete_obsolete_known_content
     AFTER UPDATE
     ON known_content
-    WHEN NEW.used = 0 AND NEW.available = 0
+    WHEN NEW.used = 0 AND NEW.chunk_avail = 0 AND NEW.wal_avail = 0
 BEGIN
     DELETE FROM known_content WHERE ROWID = NEW.ROWID;
+END;
+
+CREATE TRIGGER adjust_wal_critical_after_insert
+    AFTER INSERT
+    ON known_content
+    FOR EACH ROW
+    WHEN (NEW.used > 0 AND NEW.chunk_avail = 0 AND NEW.wal_avail > 0)
+BEGIN
+    UPDATE wal_files
+    SET critical = critical + 1
+    WHERE id IN (SELECT DISTINCT ac.wal_id
+                 FROM available_content ac
+                 WHERE (
+                           (ac.block_id = NEW.block_id) OR
+                           (ac.cluster_id = NEW.cluster_id) OR
+                           (ac.index_id = NEW.index_id)
+                           ));
+END;
+
+CREATE TRIGGER adjust_wal_critical_after_update_activated
+    AFTER UPDATE
+    ON known_content
+    FOR EACH ROW
+    WHEN (
+        NEW.used > 0 AND
+        NEW.chunk_avail = 0 AND
+        NEW.wal_avail > 0 AND
+        (OLD.used IS NULL OR OLD.used = 0 OR OLD.chunk_avail > 0)
+        )
+BEGIN
+    UPDATE wal_files
+    SET critical = critical + 1
+    WHERE id IN (SELECT DISTINCT ac.wal_id
+                 FROM available_content ac
+                 WHERE (
+                           (ac.block_id = NEW.block_id) OR
+                           (ac.cluster_id = NEW.cluster_id) OR
+                           (ac.index_id = NEW.index_id)
+                           ));
+END;
+
+CREATE TRIGGER adjust_wal_critical_after_update_deactivated
+    AFTER UPDATE
+    ON known_content
+    FOR EACH ROW
+    WHEN (
+        (NEW.used = 0 OR
+         NEW.chunk_avail > 0) AND
+        NEW.wal_avail > 0 AND
+        (OLD.used > 0 AND OLD.chunk_avail = 0)
+        )
+BEGIN
+    UPDATE wal_files
+    SET critical = critical - 1
+    WHERE id IN (SELECT DISTINCT ac.wal_id
+                 FROM available_content ac
+                 WHERE (
+                           (ac.block_id = NEW.block_id) OR
+                           (ac.cluster_id = NEW.cluster_id) OR
+                           (ac.index_id = NEW.index_id)
+                           ));
 END;
 
 
@@ -131,8 +193,8 @@ CREATE TRIGGER increment_used_counters_before_cluster_content_block_insert
     ON cluster_content
 BEGIN
     -- Upsert known blocks
-    INSERT INTO known_content (content_type, block_id, used, available)
-    VALUES ('B', NEW.block_id, 1, 0)
+    INSERT INTO known_content (content_type, block_id, used, chunk_avail, wal_avail)
+    VALUES ('B', NEW.block_id, 1, 0, 0)
     ON CONFLICT(block_id) DO UPDATE SET used = used + 1;
 END;
 
@@ -177,8 +239,8 @@ CREATE TRIGGER increment_used_counters_before_index_content_cluster_insert
     ON index_content
 BEGIN
     -- Upsert known clusters
-    INSERT INTO known_content (content_type, cluster_id, used, available)
-    VALUES ('C', NEW.cluster_id, 1, 0)
+    INSERT INTO known_content (content_type, cluster_id, used, chunk_avail, wal_avail)
+    VALUES ('C', NEW.cluster_id, 1, 0, 0)
     ON CONFLICT(cluster_id) DO UPDATE SET used = used + 1;
 END;
 
@@ -195,7 +257,7 @@ CREATE TABLE commits
 (
     name                TEXT    NOT NULL COLLATE NOCASE CHECK (LENGTH(name) >= 1 AND
                                                                LENGTH(name) <= 255),
-    type                TEXT    NOT NULL CHECK (type IN ('B', 'T')),
+    type                TEXT    NOT NULL CHECK (type IN ('B', 'T', 'LB')),
     commit_id           BLOB    NOT NULL CHECK (TYPEOF(commit_id) == 'blob' AND
                                                 LENGTH(commit_id) >= 16 AND
                                                 LENGTH(commit_id) <= 32),
@@ -218,8 +280,8 @@ CREATE TRIGGER increment_used_counters_before_commit_insert
     ON commits
 BEGIN
     -- Upsert known indices
-    INSERT INTO known_content (content_type, index_id, used, available)
-    VALUES ('I', NEW.index_id, 1, 0)
+    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
+    VALUES ('I', NEW.index_id, 1, 0, 0)
     ON CONFLICT(index_id) DO UPDATE SET used = used + 1;
 END;
 
@@ -229,8 +291,8 @@ CREATE TRIGGER increment_used_counters_before_commit_update
     WHEN NEW.index_id != OLD.index_id
 BEGIN
     -- Upsert new index_id
-    INSERT INTO known_content (content_type, index_id, used, available)
-    VALUES ('I', NEW.index_id, 1, 0)
+    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
+    VALUES ('I', NEW.index_id, 1, 0, 0)
     ON CONFLICT(index_id) DO UPDATE SET used = used + 1;
 END;
 
@@ -256,12 +318,14 @@ END;
 
 CREATE TABLE wal_files
 (
-    id      BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
-                                                LENGTH(id) == 16),
-    etag    BLOB    NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
-                                    LENGTH(etag) >= 8),
-    created INTEGER NOT NULL,
-    active  BOOLEAN NOT NULL CHECK (active IN (0, 1))
+    id       BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                                 LENGTH(id) == 16),
+    etag     BLOB    NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                                     LENGTH(etag) >= 8),
+    created  INTEGER NOT NULL,
+    active   BOOLEAN NOT NULL CHECK (active IN (0, 1)),
+    entries  INTEGER NOT NULL DEFAULT 0 CHECK (entries >= 0),
+    critical INTEGER NOT NULL DEFAULT 0 CHECK (critical >= 0)
 );
 
 -- Prevent Id changes
@@ -362,55 +426,132 @@ BEGIN
 END;
 
 -- Reference Counting
-CREATE TRIGGER increment_available_counter_before_available_content_block_insert
+CREATE TRIGGER increment_chunk_avail_counter_before_available_content_block_insert
     BEFORE INSERT
     ON available_content
-    WHEN NEW.block_id IS NOT NULL
+    WHEN NEW.chunk_id IS NOT NULL
+        AND NEW.block_id IS NOT NULL
 BEGIN
     -- Upsert known blocks
-    INSERT INTO known_content (content_type, block_id, used, available)
-    VALUES ('B', NEW.block_id, 0, 1)
-    ON CONFLICT(block_id) DO UPDATE SET available = known_content.available + 1;
+    INSERT INTO known_content (content_type, block_id, used, chunk_avail, wal_avail)
+    VALUES ('B', NEW.block_id, 0, 1, 0)
+    ON CONFLICT(block_id) DO UPDATE SET chunk_avail = chunk_avail + 1;
 END;
 
-CREATE TRIGGER increment_available_counter_before_available_content_cluster_insert
+CREATE TRIGGER increment_chunk_avail_counter_before_available_content_cluster_insert
     BEFORE INSERT
     ON available_content
-    WHEN NEW.cluster_id IS NOT NULL
+    WHEN NEW.chunk_id IS NOT NULL
+        AND NEW.cluster_id IS NOT NULL
 BEGIN
     -- Upsert known clusters
-    INSERT INTO known_content (content_type, cluster_id, used, available)
-    VALUES ('C', NEW.cluster_id, 0, 1)
-    ON CONFLICT(cluster_id) DO UPDATE SET available = available + 1;
+    INSERT INTO known_content (content_type, cluster_id, used, chunk_avail, wal_avail)
+    VALUES ('C', NEW.cluster_id, 0, 1, 0)
+    ON CONFLICT(cluster_id) DO UPDATE SET chunk_avail = chunk_avail + 1;
 END;
 
-CREATE TRIGGER increment_available_counter_before_available_content_index_insert
+CREATE TRIGGER increment_chunk_avail_counter_before_available_content_index_insert
     BEFORE INSERT
     ON available_content
-    WHEN NEW.index_id IS NOT NULL
+    WHEN NEW.chunk_id IS NOT NULL
+        AND NEW.index_id IS NOT NULL
 BEGIN
     -- Upsert known indices
-    INSERT INTO known_content (content_type, index_id, used, available)
-    VALUES ('I', NEW.index_id, 0, 1)
-    ON CONFLICT(index_id) DO UPDATE SET available = available + 1;
+    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
+    VALUES ('I', NEW.index_id, 0, 1, 0)
+    ON CONFLICT(index_id) DO UPDATE SET chunk_avail = chunk_avail + 1;
 END;
 
-CREATE TRIGGER decrement_available_counters_after_available_content_delete
+CREATE TRIGGER increment_wal_avail_counter_before_available_content_block_insert
+    BEFORE INSERT
+    ON available_content
+    WHEN NEW.wal_id IS NOT NULL
+        AND NEW.block_id IS NOT NULL
+BEGIN
+    -- Upsert known blocks
+    INSERT INTO known_content (content_type, block_id, used, chunk_avail, wal_avail)
+    VALUES ('B', NEW.block_id, 0, 0, 1)
+    ON CONFLICT(block_id) DO UPDATE SET wal_avail = wal_avail + 1;
+
+    UPDATE wal_files
+    SET entries = entries + 1
+    WHERE id = NEW.wal_id;
+END;
+
+CREATE TRIGGER increment_wal_avail_counter_before_available_content_cluster_insert
+    BEFORE INSERT
+    ON available_content
+    WHEN NEW.wal_id IS NOT NULL
+        AND NEW.cluster_id IS NOT NULL
+BEGIN
+    -- Upsert known clusters
+    INSERT INTO known_content (content_type, cluster_id, used, chunk_avail, wal_avail)
+    VALUES ('C', NEW.cluster_id, 0, 0, 1)
+    ON CONFLICT(cluster_id) DO UPDATE SET wal_avail = wal_avail + 1;
+
+    UPDATE wal_files
+    SET entries = entries + 1
+    WHERE id = NEW.wal_id;
+END;
+
+CREATE TRIGGER increment_wal_avail_counter_before_available_content_index_insert
+    BEFORE INSERT
+    ON available_content
+    WHEN NEW.wal_id IS NOT NULL
+        AND NEW.index_id IS NOT NULL
+BEGIN
+    -- Upsert known indices
+    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
+    VALUES ('I', NEW.index_id, 0, 0, 1)
+    ON CONFLICT(index_id) DO UPDATE SET wal_avail = wal_avail + 1;
+
+    UPDATE wal_files
+    SET entries = entries + 1
+    WHERE id = NEW.wal_id;
+END;
+
+CREATE TRIGGER decrement_chunk_avail_counters_after_available_content_delete
     AFTER DELETE
     ON available_content
+    WHEN OLD.chunk_id IS NOT NULL
 BEGIN
     UPDATE known_content
-    SET available = known_content.available - 1
+    SET chunk_avail = known_content.chunk_avail - 1
     WHERE OLD.block_id IS NOT NULL
       AND block_id = OLD.block_id;
 
     UPDATE known_content
-    SET available = known_content.available - 1
+    SET chunk_avail = known_content.chunk_avail - 1
     WHERE OLD.cluster_id IS NOT NULL
       AND cluster_id = OLD.cluster_id;
 
     UPDATE known_content
-    SET available = known_content.available - 1
+    SET chunk_avail = known_content.chunk_avail - 1
+    WHERE OLD.index_id IS NOT NULL
+      AND index_id = OLD.index_id;
+END;
+
+CREATE TRIGGER decrement_wal_avail_counters_after_available_content_delete
+    AFTER DELETE
+    ON available_content
+    WHEN OLD.wal_id IS NOT NULL
+BEGIN
+    UPDATE wal_files
+    SET entries = entries - 1
+    WHERE id = OLD.wal_id;
+
+    UPDATE known_content
+    SET wal_avail = known_content.wal_avail - 1
+    WHERE OLD.block_id IS NOT NULL
+      AND block_id = OLD.block_id;
+
+    UPDATE known_content
+    SET wal_avail = known_content.wal_avail - 1
+    WHERE OLD.cluster_id IS NOT NULL
+      AND cluster_id = OLD.cluster_id;
+
+    UPDATE known_content
+    SET wal_avail = known_content.wal_avail - 1
     WHERE OLD.index_id IS NOT NULL
       AND index_id = OLD.index_id;
 END;

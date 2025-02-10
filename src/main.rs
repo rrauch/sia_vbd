@@ -3,12 +3,14 @@ use bytesize::ByteSize;
 use clap::Parser;
 use futures::TryStreamExt;
 use sia_vbd::hash::HashAlgorithm;
-use sia_vbd::nbd::Builder;
+use sia_vbd::nbd::{Builder, RunGuard};
 use sia_vbd::repository::fs::FsRepository;
-use sia_vbd::repository::{Repository, RepositoryHandler, VolumeHandler};
+use sia_vbd::repository::RepositoryHandler;
 use sia_vbd::vbd::nbd_device::NbdDevice;
 use sia_vbd::vbd::{BlockSize, ClusterSize, VirtualBlockDevice};
+use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -146,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         repository.open_volume(&vbd_id, &branch).await?
     };
 
-    let runner = builder
+    let (mut runner, guard) = builder
         .with_export(
             arguments.export_name,
             NbdDevice::new(
@@ -155,10 +157,13 @@ async fn main() -> anyhow::Result<()> {
                     arguments.wal_dir,
                     arguments.max_wal_size.as_u64(),
                     arguments.max_tx_size.as_u64(),
+                    1024 * 1024 * 30,
                     &db_file,
                     max_db_connections,
                     branch,
                     volume,
+                    Duration::from_secs(10),
+                    Duration::from_secs(30),
                 )
                 .await?,
             ),
@@ -166,8 +171,58 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?
         .build();
-    runner.run().await?;
+
+    let shutdown = tokio::spawn(shutdown_listener(guard));
+    let res = runner.run().await;
+    shutdown.abort();
+    res?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn shutdown_listener(guard: RunGuard) -> impl Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+
+    async move {
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received, shutting down")
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, shutting down")
+            }
+        }
+        drop(guard);
+    }
+}
+
+#[cfg(windows)]
+fn shutdown_listener(_guard: RunGuard) -> impl Future<Output = ()> {
+    use tokio::signal::windows::ctrl_break;
+    use tokio::signal::windows::ctrl_c;
+    use tokio::signal::windows::ctrl_close;
+
+    let mut ctrl_c = ctrl_c()?;
+    let mut ctrl_close = ctrl_close()?;
+    let mut ctrl_break = ctrl_break()?;
+
+    async move {
+        tokio::select! {
+            _ = ctrl_c.recv() => {
+                tracing::info!("CTRL_C received, shutting down")
+            }
+            _ = ctrl_close.recv() => {
+                tracing::info!("CTRL_CLOSE received, shutting down")
+            }
+            _ = ctrl_break.recv() => {
+                tracing::info!("CTRL_BREAK received, shutting down")
+            }
+        }
+        drop(guard);
+    }
 }
 
 #[cfg(unix)]

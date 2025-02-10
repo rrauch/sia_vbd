@@ -1,5 +1,7 @@
 pub(crate) mod volume {
     use anyhow::anyhow;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     include!(concat!(env!("OUT_DIR"), "/protos/volume.rs"));
 
@@ -52,6 +54,99 @@ pub(crate) mod volume {
                     .transpose()?
                     .ok_or(anyhow!("commit is missing"))?,
             })
+        }
+    }
+
+    impl From<&crate::inventory::chunk::ChunkEntry> for ChunkContent {
+        fn from(value: &crate::inventory::chunk::ChunkEntry) -> Self {
+            match value {
+                crate::inventory::chunk::ChunkEntry::BlockId(id) => ChunkContent {
+                    r#type: Some(chunk_content::Type::Block(chunk_content::Block {
+                        cid: Some(id.into()),
+                    })),
+                },
+                crate::inventory::chunk::ChunkEntry::ClusterId(id) => ChunkContent {
+                    r#type: Some(chunk_content::Type::Cluster(chunk_content::Cluster {
+                        cid: Some(id.into()),
+                    })),
+                },
+                crate::inventory::chunk::ChunkEntry::IndexId(id) => ChunkContent {
+                    r#type: Some(chunk_content::Type::Index(chunk_content::Index {
+                        cid: Some(id.into()),
+                    })),
+                },
+            }
+        }
+    }
+
+    impl TryFrom<ChunkContent> for crate::inventory::chunk::ChunkEntry {
+        type Error = anyhow::Error;
+
+        fn try_from(value: ChunkContent) -> Result<Self, Self::Error> {
+            Ok(match value.r#type.ok_or(anyhow!("type is none"))? {
+                chunk_content::Type::Block(block) => crate::inventory::chunk::ChunkEntry::BlockId(
+                    block
+                        .cid
+                        .map(|h| h.try_into())
+                        .transpose()?
+                        .ok_or(anyhow!("block id is missing"))?,
+                ),
+                chunk_content::Type::Cluster(cluster) => {
+                    crate::inventory::chunk::ChunkEntry::ClusterId(
+                        cluster
+                            .cid
+                            .map(|h| h.try_into())
+                            .transpose()?
+                            .ok_or(anyhow!("cluster id is missing"))?,
+                    )
+                }
+                chunk_content::Type::Index(index) => crate::inventory::chunk::ChunkEntry::IndexId(
+                    index
+                        .cid
+                        .map(|h| h.try_into())
+                        .transpose()?
+                        .ok_or(anyhow!("index id is missing"))?,
+                ),
+            })
+        }
+    }
+
+    impl TryFrom<ChunkIndex> for crate::inventory::chunk::Chunk {
+        type Error = anyhow::Error;
+
+        fn try_from(index: ChunkIndex) -> Result<Self, Self::Error> {
+            let id = index
+                .chunk_id
+                .map(|id| id.into())
+                .ok_or(anyhow!("chunk_id is missing"))?;
+
+            let content = index
+                .content
+                .into_iter()
+                .map(|(offset, content)| {
+                    Ok((
+                        offset,
+                        content
+                            .try_into()
+                            .map_err(|_| anyhow!("invalid content id"))?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<u64, crate::inventory::chunk::ChunkEntry>, Self::Error>>(
+                )?;
+
+            Ok(crate::inventory::chunk::Chunk::new(id, content.into_iter()))
+        }
+    }
+
+    impl From<crate::serde::protos::Uuid> for super::super::ChunkId {
+        fn from(value: crate::serde::protos::Uuid) -> Self {
+            Into::<Uuid>::into(value).into()
+        }
+    }
+
+    impl From<super::super::ChunkId> for crate::serde::protos::Uuid {
+        fn from(value: super::super::ChunkId) -> Self {
+            Into::<crate::serde::protos::Uuid>::into(value.as_ref()).into()
         }
     }
 }

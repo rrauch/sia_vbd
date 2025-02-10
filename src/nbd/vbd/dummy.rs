@@ -104,6 +104,10 @@ impl BlockDevice for DummyBlockDevice {
         eprintln!("trim called for offset {} and length {}", offset, length);
         Ok(())
     }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct DummyWriter {

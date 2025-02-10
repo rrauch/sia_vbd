@@ -1,15 +1,14 @@
-use crate::io::{AsyncReadExtBuffered, ReadWrite, TokioFile};
-use crate::repository::{Chunk, ChunkId, Reader, Repository, Stream, Volume, Writer};
+use crate::inventory::chunk::read_chunk_header;
+use crate::io::{AsyncReadExtBuffered, TokioFile};
+use crate::repository::{Chunk, ChunkId, Reader, Repository, Stream, Volume};
 use crate::vbd::{BranchName, VbdId};
 use crate::Etag;
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
-use futures::{AsyncSeekExt, AsyncWrite, AsyncWriteExt, StreamExt};
+use futures::{AsyncSeekExt, AsyncWriteExt, StreamExt};
 use std::future;
-use std::io::{ErrorKind, SeekFrom};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 pub struct FsRepository {
     root_dir: PathBuf,
@@ -135,18 +134,18 @@ impl Repository for FsRepository {
     }
 }
 
-async fn etag(path: impl AsRef<Path>) -> Result<Etag, anyhow::Error> {
+async fn etag(path: impl AsRef<Path>) -> Result<Etag, std::io::Error> {
     let metadata = tokio::fs::metadata(path.as_ref()).await?;
     let etag = (&metadata).try_into()?;
     Ok(etag)
 }
 
-async fn is_dir(path: impl AsRef<Path>) -> Result<bool, anyhow::Error> {
+async fn is_dir(path: impl AsRef<Path>) -> Result<bool, std::io::Error> {
     let metadata = tokio::fs::metadata(path.as_ref()).await?;
     Ok(metadata.is_dir())
 }
 
-async fn is_file(path: impl AsRef<Path>) -> Result<bool, anyhow::Error> {
+async fn is_file(path: impl AsRef<Path>) -> Result<bool, std::io::Error> {
     let metadata = tokio::fs::metadata(path.as_ref()).await?;
     Ok(metadata.is_file())
 }
@@ -221,7 +220,8 @@ impl Volume for FsVolume {
 
     async fn chunk_details(&self, chunk_id: &ChunkId) -> Result<Chunk, Self::Error> {
         let path = self.chunk_path(chunk_id);
-        todo!()
+        let mut file = TokioFile::open(&path).await?;
+        Ok(read_chunk_header(&mut file).await?)
     }
 
     async fn read_chunk(
@@ -238,9 +238,22 @@ impl Volume for FsVolume {
     async fn write_chunk(
         &self,
         chunk: &Chunk,
-    ) -> Result<impl Writer<Ok = Etag> + 'static, Self::Error> {
+        content: impl Reader + 'static,
+    ) -> Result<Etag, Self::Error> {
         let path = self.chunk_path(chunk.id());
-        Ok(ChunkWriter::new(TokioFile::create_new(&path).await?))
+        let mut writer = TokioFile::create_new(&path).await?;
+        match futures::io::copy(content, &mut writer).await {
+            Ok(_) => {
+                writer.close().await?;
+                let etag = etag(&path).await?;
+                Ok(etag)
+            }
+            Err(err) => {
+                writer.close().await?;
+                tokio::fs::remove_file(&path).await?;
+                Err(err)?
+            }
+        }
     }
 
     async fn delete_chunk(&self, chunk_id: &ChunkId) -> Result<(), Self::Error> {
@@ -334,52 +347,4 @@ async fn read_file(path: &Path, max_file_size: u64) -> Result<Bytes, anyhow::Err
     let mut file = TokioFile::open(path).await?;
     file.read_all_buffered(&mut buf).await?;
     Ok(buf.freeze())
-}
-
-pub(crate) struct ChunkWriter {
-    file: TokioFile<ReadWrite>,
-}
-
-impl ChunkWriter {
-    fn new(file: TokioFile<ReadWrite>) -> Self {
-        Self { file }
-    }
-}
-
-impl Writer for ChunkWriter {
-    type Ok = Etag;
-    type Error = anyhow::Error;
-
-    async fn finalize(mut self) -> Result<Etag, Self::Error> {
-        self.file.close().await?;
-        let etag = etag(self.file.path()).await?;
-        Ok(etag)
-    }
-
-    async fn cancel(mut self) -> Result<(), Self::Error> {
-        self.file.close().await?;
-        tokio::fs::remove_file(self.file.path()).await?;
-        Ok(())
-    }
-}
-
-impl AsyncWrite for ChunkWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.file).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Err(std::io::Error::new(
-            ErrorKind::Unsupported,
-            "writer must be closed via call to 'finalize' or 'cancel'",
-        )))
-    }
 }

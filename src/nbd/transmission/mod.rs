@@ -5,12 +5,13 @@ mod request;
 
 use crate::io::{AsyncReadBytesExt, CountingReader, LimitedReader, WrappedReader};
 use crate::nbd::block_device::RequestContext;
-use crate::nbd::transmission::request::ReadError;
+use crate::nbd::transmission::reply::ErrorType;
+use crate::nbd::transmission::request::{ReadError, RequestId};
 use crate::nbd::{Export, TransmissionMode};
 use crate::ClientEndpoint;
 use futures::lock::Mutex;
 use futures::{AsyncRead, AsyncWrite};
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -53,6 +54,7 @@ pub(super) struct TransmissionHandler {
     export: Export,
     transmission_mode: TransmissionMode,
     client_endpoint: ClientEndpoint,
+    shutdown_ct: CancellationToken,
 }
 
 impl TransmissionHandler {
@@ -60,11 +62,13 @@ impl TransmissionHandler {
         export: Export,
         transmission_mode: TransmissionMode,
         client_endpoint: ClientEndpoint,
+        shutdown_ct: CancellationToken,
     ) -> Self {
         Self {
             export,
             transmission_mode,
             client_endpoint,
+            shutdown_ct,
         }
     }
 
@@ -95,6 +99,7 @@ impl TransmissionHandler {
         mut rx: RX,
         tx: TX,
     ) -> Result<(), NbdError> {
+        let shutdown_ct = self.shutdown_ct.clone();
         let ct = CancellationToken::new();
         let _drop_guard = ct.clone().drop_guard();
 
@@ -117,6 +122,18 @@ impl TransmissionHandler {
                 },
                 _ = ct.cancelled() => {
                     eprintln!("connection cancelled");
+                    break;
+                },
+                _ = shutdown_ct.cancelled() => {
+                    eprintln!("shutdown signal received, prepare shutdown");
+                    writer.io_error(
+                        ServerShutdown,
+                        //todo: clarify what request id should be sent
+                        RequestId {
+                            cookie: 0,
+                            offset: 0,
+                        }
+                    ).await?;
                     break;
                 }
             };
@@ -287,6 +304,20 @@ impl TransmissionHandler {
         writer.shutdown().await;
 
         Ok(())
+    }
+}
+
+struct ServerShutdown;
+
+impl From<ServerShutdown> for ErrorType {
+    fn from(_: ServerShutdown) -> Self {
+        ErrorType::Shutdown
+    }
+}
+
+impl Display for ServerShutdown {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server shutdown imminent")
     }
 }
 

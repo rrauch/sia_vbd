@@ -1,6 +1,6 @@
+use crate::io::{AsyncReadExtBuffered, LimitedReader, WrappedReader};
 use crate::serde::PREAMBLE_LEN;
 use crate::vbd::Position;
-use crate::io::{AsyncReadExtBuffered, LimitedReader, WrappedReader};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crc::Crc;
 use futures::future::BoxFuture;
@@ -341,6 +341,18 @@ pin_project! {
 impl<T> FramingSink<'_, T> {
     pub fn into_inner(self) -> T {
         self.writer
+    }
+}
+
+impl<T> AsRef<T> for FramingSink<'_, T> {
+    fn as_ref(&self) -> &T {
+        &self.writer
+    }
+}
+
+impl<T> AsMut<T> for FramingSink<'_, T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.writer
     }
 }
 

@@ -1,5 +1,10 @@
+pub(crate) mod chunk;
+mod syncer;
+
 use crate::hash::{Hash, HashAlgorithm};
-use crate::repository::{BranchInfo, ChunkEntry, ChunkId, VolumeHandler};
+use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId};
+use crate::inventory::syncer::Syncer;
+use crate::repository::{BranchInfo, VolumeHandler};
 use crate::vbd::{
     Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit,
     FixedSpecs, Index, IndexId, IndexMut, VbdId,
@@ -8,10 +13,11 @@ use crate::wal::man::WalMan;
 use crate::wal::{TxDetails, WalId};
 use crate::{Etag, SqlitePool};
 use anyhow::{anyhow, bail};
+use async_tempfile::TempDir;
 use chrono::DateTime;
-use futures::{Stream, TryStreamExt};
+use futures::TryStreamExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Acquire, ConnectOptions, SqliteConnection};
+use sqlx::{ConnectOptions, SqliteConnection};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Deref;
@@ -20,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::log::LevelFilter;
 use tracing::{instrument, Instrument};
+use uuid::Uuid;
 
 pub(crate) struct Inventory {
     specs: FixedSpecs,
@@ -28,6 +35,7 @@ pub(crate) struct Inventory {
     current_commit: Commit,
     wal_man: Arc<WalMan>,
     volume: Arc<VolumeHandler>,
+    syncer: Option<Syncer>,
 }
 
 enum Id<'a> {
@@ -123,10 +131,15 @@ impl Inventory {
     pub(super) async fn new(
         db_file: &Path,
         max_db_connections: u8,
+        max_chunk_size: u64,
         current_branch: BranchName,
         wal_man: Arc<WalMan>,
         volume: VolumeHandler,
+        initial_sync_delay: Duration,
+        sync_interval: Duration,
     ) -> Result<Self, anyhow::Error> {
+        let temp_dir = TempDir::new_with_uuid(Uuid::now_v7()).await?;
+
         let volume = Arc::new(volume);
         let specs = volume.volume_info().specs.clone();
         let branches = volume.list_branches().await?.collect::<HashMap<_, _>>();
@@ -163,16 +176,34 @@ impl Inventory {
             current_commit: commit,
             wal_man,
             volume,
+            syncer: None,
         };
 
         this.sync_chunks().await?;
         this.sync_wal_files().await?;
-        //delete_obsolete_wal_files(&this.pool, &this.wal_man).await?;
-        //pack_chunks(&this.pool, &this.wal_man, &this.volume, &this.specs).await?;
+        this.sync_commits().await?;
+        this.syncer = Some(Syncer::new(
+            this.pool.clone(),
+            this.wal_man.clone(),
+            this.volume.clone(),
+            this.specs.clone(),
+            initial_sync_delay,
+            sync_interval,
+            this.branch.clone(),
+            temp_dir,
+            max_chunk_size,
+        ));
 
         tracing::debug!("inventory loaded");
 
         Ok(this)
+    }
+
+    pub async fn close(mut self) -> anyhow::Result<()> {
+        if let Some(syncer) = self.syncer.take() {
+            syncer.close().await?;
+        }
+        Ok(())
     }
 
     pub fn specs(&self) -> &FixedSpecs {
@@ -198,25 +229,55 @@ impl Inventory {
             return Ok(Some(block));
         }
 
+        // get from chunk
+        if let Ok(Some(block)) = self.block_from_chunk(block_id).await {
+            return Ok(Some(block));
+        }
+
         Ok(None)
     }
 
     #[instrument[skip(self)]]
     pub async fn cluster_by_id(&self, cluster_id: &ClusterId) -> anyhow::Result<Option<Cluster>> {
-        if cluster_id == self.specs().zero_cluster().content_id() {
-            return Ok(Some(self.specs().zero_cluster().clone()));
+        let mut conn = self.pool.read().acquire().await?;
+        let res = Self::_cluster_by_id(
+            &self.specs,
+            &self.wal_man,
+            &self.volume,
+            cluster_id,
+            conn.as_mut(),
+        )
+        .await?;
+        conn.close().await?;
+        Ok(res)
+    }
+
+    #[instrument[skip_all]]
+    async fn _cluster_by_id(
+        specs: &FixedSpecs,
+        wal_man: &WalMan,
+        volume: &VolumeHandler,
+        cluster_id: &ClusterId,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<Option<Cluster>> {
+        if cluster_id == specs.zero_cluster().content_id() {
+            return Ok(Some(specs.zero_cluster().clone()));
         }
 
         // try to load directly from database
         {
-            let mut conn = self.pool.read().acquire().await?;
-            if let Ok(Some(cluster)) = self.cluster_from_db(cluster_id, conn.as_mut()).await {
+            if let Ok(Some(cluster)) = Self::cluster_from_db(specs, cluster_id, &mut *conn).await {
                 return Ok(Some(cluster));
             }
         }
 
         // check the local WALs
-        if let Ok(Some(cluster)) = self.cluster_from_wal(cluster_id).await {
+        if let Ok(Some(cluster)) = Self::cluster_from_wal(wal_man, cluster_id, &mut *conn).await {
+            return Ok(Some(cluster));
+        }
+
+        // get from chunk
+        if let Ok(Some(cluster)) = Self::cluster_from_chunk(volume, cluster_id, &mut *conn).await {
             return Ok(Some(cluster));
         }
 
@@ -225,7 +286,28 @@ impl Inventory {
 
     #[instrument[skip(self)]]
     pub async fn index_by_id(&self, index_id: &IndexId) -> anyhow::Result<Option<Index>> {
-        for index in self.specs.zero_indices() {
+        let mut conn = self.pool.read().acquire().await?;
+        let res = Self::_index_by_id(
+            &self.specs,
+            &self.wal_man,
+            &self.volume,
+            index_id,
+            conn.as_mut(),
+        )
+        .await?;
+        conn.close().await?;
+        Ok(res)
+    }
+
+    #[instrument[skip_all]]
+    async fn _index_by_id(
+        specs: &FixedSpecs,
+        wal_man: &WalMan,
+        volume: &VolumeHandler,
+        index_id: &IndexId,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<Option<Index>> {
+        for index in specs.zero_indices() {
             if index.content_id() == index_id {
                 return Ok(Some(index.clone()));
             }
@@ -233,28 +315,33 @@ impl Inventory {
 
         // try to load directly from database
         {
-            let mut conn = self.pool.read().acquire().await?;
-            if let Ok(Some(index)) = self.index_from_db(index_id, conn.as_mut()).await {
+            if let Ok(Some(index)) = Self::index_from_db(specs, index_id, &mut *conn).await {
                 return Ok(Some(index));
             }
         }
 
         // check the local WALs
-        if let Ok(Some(index)) = self.index_from_wal(index_id).await {
+        if let Ok(Some(index)) = Self::index_from_wal(wal_man, index_id, &mut *conn).await {
+            return Ok(Some(index));
+        }
+
+        // get from chunk
+        if let Ok(Some(index)) = Self::index_from_chunk(volume, index_id, &mut *conn).await {
             return Ok(Some(index));
         }
 
         Ok(None)
     }
 
-    #[instrument[skip(self)]]
-    async fn index_from_wal(&self, index_id: &IndexId) -> anyhow::Result<Option<Index>> {
+    #[instrument[skip_all]]
+    async fn index_from_wal(
+        wal_man: &WalMan,
+        index_id: &IndexId,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<Option<Index>> {
         tracing::trace!("reading index from wal");
-        for (wal_id, offsets) in {
-            let mut conn = self.pool.read().acquire().await?;
-            self.wal_offsets_for_id(index_id, conn.as_mut()).await?
-        } {
-            let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
+        for (wal_id, offsets) in Self::wal_offsets_for_id(index_id, &mut *conn).await? {
+            let mut wal_reader = match wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
                     tracing::error!(error = %err, wal_id = %wal_id, "opening wal reader failed");
@@ -265,7 +352,7 @@ impl Inventory {
                 match wal_reader.index(index_id, offset).await {
                     Ok(index) => return Ok(Some(index)),
                     Err(err) => {
-                        tracing::error!(error = %err, wal_id = %wal_id, "reading index failed");
+                        tracing::error!(error = %err, wal_id = %wal_id, offset, "reading index failed");
                     }
                 }
             }
@@ -273,14 +360,42 @@ impl Inventory {
         Ok(None)
     }
 
-    #[instrument[skip(self)]]
-    async fn cluster_from_wal(&self, cluster_id: &ClusterId) -> anyhow::Result<Option<Cluster>> {
-        tracing::debug!("reading cluster from wal");
-        for (wal_id, offsets) in {
-            let mut conn = self.pool.read().acquire().await?;
-            self.wal_offsets_for_id(cluster_id, conn.as_mut()).await?
-        } {
-            let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
+    #[instrument[skip_all]]
+    async fn index_from_chunk(
+        volume: &VolumeHandler,
+        index_id: &IndexId,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<Option<Index>> {
+        tracing::trace!("reading index from chunk");
+        let mut last_error = None;
+
+        for (chunk_id, offsets) in Self::chunk_offsets_for_id(index_id, &mut *conn).await? {
+            for offset in offsets {
+                match volume.index(&chunk_id, offset).await {
+                    Ok(index) => return Ok(Some(index)),
+                    Err(err) => {
+                        tracing::error!(error = %err, chunk_id = %chunk_id, offset, "reading index failed");
+                        last_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[instrument[skip_all]]
+    async fn cluster_from_wal(
+        wal_man: &WalMan,
+        cluster_id: &ClusterId,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<Option<Cluster>> {
+        tracing::trace!("reading cluster from wal");
+        for (wal_id, offsets) in Self::wal_offsets_for_id(cluster_id, &mut *conn).await? {
+            let mut wal_reader = match wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
                     tracing::error!(error = %err, wal_id = %wal_id, "opening wal reader failed");
@@ -291,7 +406,7 @@ impl Inventory {
                 match wal_reader.cluster(cluster_id, offset).await {
                     Ok(cluster) => return Ok(Some(cluster)),
                     Err(err) => {
-                        tracing::error!(error = %err, wal_id = %wal_id, "reading cluster failed");
+                        tracing::error!(error = %err, wal_id = %wal_id, offset, "reading cluster failed");
                     }
                 }
             }
@@ -299,11 +414,38 @@ impl Inventory {
         Ok(None)
     }
 
+    #[instrument[skip_all]]
+    async fn cluster_from_chunk(
+        volume: &VolumeHandler,
+        cluster_id: &ClusterId,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<Option<Cluster>> {
+        tracing::trace!("reading cluster from chunk");
+        let mut last_error = None;
+
+        for (chunk_id, offsets) in Self::chunk_offsets_for_id(cluster_id, &mut *conn).await? {
+            for offset in offsets {
+                match volume.cluster(&chunk_id, offset).await {
+                    Ok(cluster) => return Ok(Some(cluster)),
+                    Err(err) => {
+                        tracing::error!(error = %err, chunk_id = %chunk_id, offset, "reading cluster failed");
+                        last_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(None)
+        }
+    }
+
     #[instrument[skip(self)]]
     async fn block_from_wal(&self, block_id: &BlockId) -> anyhow::Result<Option<Block>> {
         for (wal_id, offsets) in {
             let mut conn = self.pool.read().acquire().await?;
-            self.wal_offsets_for_id(block_id, conn.as_mut()).await?
+            Self::wal_offsets_for_id(block_id, conn.as_mut()).await?
         } {
             let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
@@ -316,7 +458,7 @@ impl Inventory {
                 match wal_reader.block(block_id, offset).await {
                     Ok(block) => return Ok(Some(block)),
                     Err(err) => {
-                        tracing::error!(error = %err, wal_id = %wal_id, "reading block failed");
+                        tracing::error!(error = %err, wal_id = %wal_id, offset, "reading block failed");
                     }
                 }
             }
@@ -324,8 +466,33 @@ impl Inventory {
         Ok(None)
     }
 
+    #[instrument[skip(self)]]
+    async fn block_from_chunk(&self, block_id: &BlockId) -> anyhow::Result<Option<Block>> {
+        tracing::trace!("reading block from chunk");
+        let mut last_error = None;
+
+        for (chunk_id, offsets) in {
+            let mut conn = self.pool.read().acquire().await?;
+            Self::chunk_offsets_for_id(block_id, conn.as_mut()).await?
+        } {
+            for offset in offsets {
+                match self.volume.block(&chunk_id, offset).await {
+                    Ok(block) => return Ok(Some(block)),
+                    Err(err) => {
+                        tracing::error!(error = %err, chunk_id = %chunk_id, offset, "reading block failed");
+                        last_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn wal_offsets_for_id(
-        &self,
         id: impl Into<Id<'_>>,
         conn: &mut SqliteConnection,
     ) -> anyhow::Result<impl Iterator<Item = (WalId, Vec<u64>)>> {
@@ -394,9 +561,78 @@ impl Inventory {
         Ok(matches.into_iter())
     }
 
-    #[instrument[skip(self, conn)]]
+    async fn chunk_offsets_for_id(
+        id: impl Into<Id<'_>>,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<impl Iterator<Item = (ChunkId, Vec<u64>)>> {
+        #[derive(Debug)]
+        struct Row {
+            chunk_id: Option<Vec<u8>>,
+            offset: i64,
+        }
+
+        fn try_convert(row: Row) -> anyhow::Result<(ChunkId, u64)> {
+            Ok(
+                ChunkId::try_from(row.chunk_id.ok_or(anyhow!("chunk_id is NULL"))?.as_slice())
+                    .map(|w| (w, row.offset as u64))?,
+            )
+        }
+
+        let id = id.into();
+        let id_slice = id.as_bytes();
+        let mut stream = match id {
+            Id::BlockId(_) => {
+                sqlx::query_as!(
+                    Row,
+                    "
+                    SELECT chunk_id, offset FROM available_content
+                    WHERE source_type = 'C' AND content_type = 'B' AND block_id = ? AND index_id IS NULL AND cluster_id IS NULL
+                    ",
+                    id_slice
+                ).fetch(conn)
+            }
+            Id::ClusterId(_) => {
+                sqlx::query_as!(
+                    Row,
+                    "
+                    SELECT chunk_id, offset FROM available_content
+                    WHERE source_type = 'C' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND index_id IS NULL
+                    ",
+                    id_slice
+                ).fetch(conn)
+            }
+            Id::IndexId(_) => {
+                sqlx::query_as!(
+                    Row,
+                    "
+                    SELECT chunk_id, offset FROM available_content
+                    WHERE source_type = 'C' AND content_type = 'I' AND index_id = ? AND block_id IS NULL AND cluster_id IS NULL
+                    ",
+                    id_slice
+                ).fetch(conn)
+            }
+        };
+
+        let mut matches = HashMap::new();
+
+        while let Some((chunk_id, offset)) = stream
+            .try_next()
+            .await?
+            .map(|r| try_convert(r))
+            .transpose()?
+        {
+            if !matches.contains_key(&chunk_id) {
+                matches.insert(chunk_id.clone(), Vec::default());
+            }
+            matches.get_mut(&chunk_id).unwrap().push(offset);
+        }
+
+        Ok(matches.into_iter())
+    }
+
+    #[instrument[skip_all]]
     async fn index_from_db(
-        &self,
+        specs: &FixedSpecs,
         index_id: &IndexId,
         conn: &mut SqliteConnection,
     ) -> anyhow::Result<Option<Index>> {
@@ -412,7 +648,7 @@ impl Inventory {
             .map_err(|e| anyhow::Error::from(e))
             .try_filter_map(|r| async move {
                 let idx = r.cluster_index as usize;
-                Hash::try_from((r.cluster_id.as_slice(), self.specs.meta_hash()))
+                Hash::try_from((r.cluster_id.as_slice(), specs.meta_hash()))
                     .map(|h| Some((idx, h.into())))
             })
             .try_collect::<Vec<(usize, ClusterId)>>()
@@ -423,10 +659,7 @@ impl Inventory {
             return Ok(None);
         }
 
-        let mut index = IndexMut::from_index(
-            self.specs().zero_index(cluster_ids.len()),
-            self.specs.clone(),
-        );
+        let mut index = IndexMut::from_index(specs.zero_index(cluster_ids.len()), specs.clone());
         for (idx, cluster_id) in cluster_ids {
             if idx >= index.clusters().len() {
                 return Err(anyhow!("database entry for index [{}] invalid", index_id));
@@ -441,9 +674,9 @@ impl Inventory {
         }
     }
 
-    #[instrument[skip(self, conn)]]
+    #[instrument[skip_all]]
     async fn cluster_from_db(
-        &self,
+        specs: &FixedSpecs,
         cluster_id: &ClusterId,
         conn: &mut SqliteConnection,
     ) -> anyhow::Result<Option<Cluster>> {
@@ -459,7 +692,7 @@ impl Inventory {
             .map_err(|e| anyhow::Error::from(e))
             .try_filter_map(|r| async move {
                 let idx = r.block_index as usize;
-                Hash::try_from((r.block_id.as_slice(), self.specs.meta_hash()))
+                Hash::try_from((r.block_id.as_slice(), specs.meta_hash()))
                     .map(|h| Some((idx, h.into())))
             })
             .try_collect::<Vec<(usize, BlockId)>>()
@@ -470,8 +703,7 @@ impl Inventory {
             return Ok(None);
         }
 
-        let mut cluster =
-            ClusterMut::from_cluster(self.specs().zero_cluster().clone(), self.specs.clone());
+        let mut cluster = ClusterMut::from_cluster(specs.zero_cluster().clone(), specs.clone());
         for (idx, block_id) in block_ids {
             if idx >= cluster.blocks().len() {
                 return Err(anyhow!(
@@ -500,6 +732,18 @@ impl Inventory {
     ) -> anyhow::Result<u64> {
         let mut rows_affected = 0;
         let index_id = index.content_id().as_ref();
+
+        let non_zero_clusters = index
+            .cluster_ids()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, b)| *b != zero_cluster_id)
+            .collect::<Vec<_>>();
+
+        if non_zero_clusters.is_empty() {
+            return Ok(0);
+        }
+
         let num_clusters = {
             let r = sqlx::query!(
                 "
@@ -511,7 +755,7 @@ impl Inventory {
             .await?;
             r.count as usize
         };
-        if num_clusters == index.len() {
+        if num_clusters == non_zero_clusters.len() {
             // already synced
             return Ok(rows_affected);
         };
@@ -529,24 +773,21 @@ impl Inventory {
             .rows_affected();
         }
 
-        let mut idx = 0;
-        for cluster_id in index.cluster_ids() {
-            if cluster_id != zero_cluster_id {
-                let cluster_id = cluster_id.as_ref();
-                rows_affected += sqlx::query!(
-                    "
+        for (idx, cluster_id) in non_zero_clusters {
+            let idx = idx as i32;
+            let cluster_id = cluster_id.as_ref();
+            rows_affected += sqlx::query!(
+                "
                     INSERT INTO index_content (index_id, cluster_index, cluster_id)
                     VALUES (?, ?, ?)
                     ",
-                    index_id,
-                    idx,
-                    cluster_id,
-                )
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            }
-            idx += 1;
+                index_id,
+                idx,
+                cluster_id,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
 
         Ok(rows_affected)
@@ -558,6 +799,17 @@ impl Inventory {
         zero_block_id: &BlockId,
         tx: &mut SqliteConnection,
     ) -> anyhow::Result<u64> {
+        let non_zero_blocks = cluster
+            .block_ids()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, b)| *b != zero_block_id)
+            .collect::<Vec<_>>();
+
+        if non_zero_blocks.is_empty() {
+            return Ok(0);
+        }
+
         let mut rows_affected = 0;
         let num_blocks = {
             let cluster_id = cluster.content_id().as_ref();
@@ -571,7 +823,7 @@ impl Inventory {
             .await?;
             r.count as usize
         };
-        if num_blocks == cluster.len() {
+        if num_blocks == non_zero_blocks.len() {
             // already synced
             return Ok(rows_affected);
         };
@@ -589,79 +841,24 @@ impl Inventory {
             .rows_affected();
         }
 
-        let mut idx = 0;
-        for block_id in cluster.block_ids() {
-            if block_id != zero_block_id {
-                let block_id = block_id.as_ref();
-                rows_affected += sqlx::query!(
-                    "
+        for (idx, block_id) in non_zero_blocks {
+            let idx = idx as i32;
+            let block_id = block_id.as_ref();
+            rows_affected += sqlx::query!(
+                "
                     INSERT INTO cluster_content (cluster_id, block_index, block_id)
                     VALUES (?, ?, ?)
                     ",
-                    cluster_id,
-                    idx,
-                    block_id,
-                )
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            }
-            idx += 1;
+                cluster_id,
+                idx,
+                block_id,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
 
         Ok(rows_affected)
-    }
-
-    fn unused<'a>(
-        tx: &'a mut SqliteConnection,
-        specs: &'a FixedSpecs,
-        zero_block_id: &'a BlockId,
-        zero_cluster_id: &'a ClusterId,
-        zero_index_ids: &'a Vec<IndexId>,
-    ) -> impl Stream<Item = Result<Id<'static>, anyhow::Error>> + use<'a> {
-        sqlx::query!(
-            "
-            SELECT block_id, cluster_id, index_id FROM known_content
-                WHERE used = 0 AND available > 0;
-            "
-        )
-        .fetch(tx)
-        .map_err(|e| anyhow::Error::from(e))
-        .try_filter_map(move |r| async move {
-            if let Some(block_id) = r.block_id {
-                Hash::try_from((block_id.as_slice(), specs.content_hash()))
-                    .map(|h| h.into())
-                    .map(|b: BlockId| {
-                        if &b == zero_block_id {
-                            None
-                        } else {
-                            Some(b.into())
-                        }
-                    })
-            } else if let Some(cluster_id) = r.cluster_id {
-                Hash::try_from((cluster_id.as_slice(), specs.meta_hash()))
-                    .map(|h| h.into())
-                    .map(|c: ClusterId| {
-                        if &c == zero_cluster_id {
-                            None
-                        } else {
-                            Some(c.into())
-                        }
-                    })
-            } else if let Some(index_id) = r.index_id {
-                Hash::try_from((index_id.as_slice(), specs.meta_hash()))
-                    .map(|h| h.into())
-                    .map(|c: IndexId| {
-                        if zero_index_ids.contains(&c) {
-                            None
-                        } else {
-                            Some(c.into())
-                        }
-                    })
-            } else {
-                Err(anyhow!("invalid row"))
-            }
-        })
     }
 
     #[instrument[skip(tx, tx_details)]]
@@ -771,7 +968,8 @@ impl Inventory {
             }
             if !in_sync {
                 tracing::info!(chunk_id = %chunk_id, "chunk needs syncing");
-                self.sync_chunk(&chunk_id, &etag, tx.as_mut()).await?;
+                let chunk = self.volume.chunk_details(&chunk_id).await?;
+                sync_chunk(&chunk, &etag, tx.as_mut()).await?;
             }
         }
 
@@ -788,6 +986,106 @@ impl Inventory {
 
         tx.commit().await?;
 
+        Ok(())
+    }
+
+    #[instrument[skip_all]]
+    async fn sync_commits(&mut self) -> anyhow::Result<()> {
+        let mut tx = self.pool.write().begin().await?;
+        Self::_sync_commits(&self.specs, &self.wal_man, &self.volume, tx.as_mut()).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[instrument[skip_all]]
+    async fn _sync_commits(
+        specs: &FixedSpecs,
+        wal_man: &WalMan,
+        volume: &VolumeHandler,
+        conn: &mut SqliteConnection,
+    ) -> anyhow::Result<()> {
+        let hash_algo = specs.meta_hash();
+        let zero_cluster_id = specs.zero_cluster().content_id().clone();
+        let zero_block_id = specs.zero_block().content_id().clone();
+
+        tracing::info!("syncing commits");
+
+        let mut rows_deleted = sqlx::query!(
+            "DELETE FROM index_content WHERE index_id NOT IN (SELECT DISTINCT index_id FROM commits);"
+        )
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+
+        if rows_deleted > 0 {
+            tracing::debug!(rows_deleted, "removed inactive index_content rows");
+        }
+
+        let missing_index_content = sqlx::query!(
+            "
+            SELECT DISTINCT index_id FROM commits
+            WHERE index_id NOT IN (SELECT DISTINCT index_id FROM index_content);
+            "
+        )
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|r| Hash::try_from((r.index_id.as_slice(), hash_algo)).map(|h| h.into()))
+        .collect::<Result<Vec<IndexId>, _>>()?;
+
+        let mut rows_inserted = 0;
+        for index_id in missing_index_content {
+            if let Some(index) =
+                Self::_index_by_id(specs, wal_man, volume, &index_id, &mut *conn).await?
+            {
+                rows_inserted +=
+                    Self::sync_index_content(&index, &zero_cluster_id, &mut *conn).await?;
+            } else {
+                tracing::warn!(index_id = %index_id, "index for index_id unavailable");
+            }
+        }
+
+        let cluster_rows_deleted = sqlx::query!(
+            "DELETE FROM cluster_content WHERE cluster_id NOT IN (SELECT DISTINCT cluster_id FROM index_content);"
+        )
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+
+        if cluster_rows_deleted > 0 {
+            tracing::debug!(
+                cluster_rows_deleted,
+                "removed inactive cluster_content rows"
+            );
+            rows_deleted += cluster_rows_deleted;
+        }
+
+        let missing_cluster_content = sqlx::query!(
+            "
+            SELECT DISTINCT cluster_id FROM index_content
+            WHERE cluster_id NOT IN (SELECT DISTINCT cluster_id FROM cluster_content);
+            "
+        )
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|r| Hash::try_from((r.cluster_id.as_slice(), hash_algo)).map(|h| h.into()))
+        .collect::<Result<Vec<ClusterId>, _>>()?;
+
+        for cluster_id in missing_cluster_content {
+            if let Some(cluster) =
+                Self::_cluster_by_id(specs, wal_man, volume, &cluster_id, &mut *conn).await?
+            {
+                rows_inserted +=
+                    Self::sync_cluster_content(&cluster, &zero_block_id, &mut *conn).await?;
+            } else {
+                tracing::warn!(cluster_id = %cluster_id, "cluster for cluster_id unavailable");
+            }
+        }
+
+        if rows_deleted > 0 || rows_inserted > 0 {
+            tracing::debug!(rows_inserted, rows_deleted, "commits synced");
+        }
         Ok(())
     }
 
@@ -843,6 +1141,8 @@ impl Inventory {
                 .await?;
         }
 
+        let mut newer_commit = None;
+
         // sync commits
         // this updates all branch commits where the wal commits contain newer commits
         if sqlx::query!(
@@ -886,67 +1186,14 @@ impl Inventory {
         {
             let commit = commit_from_db(&self.branch, &self.specs, tx.as_mut()).await?;
             if &commit > &self.current_commit {
-                tracing::info!(wal = %commit.content_id(), local = %self.current_commit.content_id(), "latest wal commit is further ahead, updating local branch");
-                self.current_commit = commit;
+                newer_commit = Some(commit);
             }
         }
-
         tx.commit().await?;
 
-        Ok(())
-    }
-
-    #[instrument(skip(self, tx), fields(chunk_id = %chunk_id))]
-    async fn sync_chunk(
-        &mut self,
-        chunk_id: &ChunkId,
-        etag: &Etag,
-        tx: &mut SqliteConnection,
-    ) -> anyhow::Result<()> {
-        tracing::debug!(chunk_id = %chunk_id, "syncing chunk");
-
-        let id = chunk_id.as_bytes().as_slice();
-        let etag = etag.as_ref();
-
-        let rows_affected = sqlx::query!("DELETE FROM chunks WHERE id = ?", id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tracing::trace!(rows_affected, "deleted chunk related entries from database");
-
-        sqlx::query!(
-            "INSERT INTO chunks (id, etag)
-             VALUES (?, ?)
-            ",
-            id,
-            etag
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        let chunk = self.volume.chunk_details(&chunk_id).await?;
-        let id = chunk_id.as_bytes().as_slice();
-
-        for (offset, content) in chunk.content().into_iter() {
-            let offset = offset as i64;
-            let (content_type, block_id, cluster_id, index_id) = match content {
-                ChunkEntry::BlockId(block_id) => ("B", Some(block_id.as_ref()), None, None),
-                ChunkEntry::ClusterId(cluster_id) => ("C", None, Some(cluster_id.as_ref()), None),
-                ChunkEntry::IndexId(index_id) => ("I", None, None, Some(index_id.as_ref())),
-            };
-
-            sqlx::query!(
-                "
-                INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
-                VALUES ('C', ?, ?, ?, ?, ?, ?)
-                ",
-                id,
-                offset,
-                content_type,
-                block_id,
-                cluster_id,
-                index_id,
-            ).execute(&mut *tx).await?;
+        if let Some(commit) = newer_commit {
+            tracing::info!(wal = %commit.content_id(), local = %self.current_commit.content_id(), "latest wal commit is further ahead, updating local branch");
+            self.current_commit = commit;
         }
 
         Ok(())
@@ -987,79 +1234,11 @@ impl Inventory {
         .await?
         .rows_affected();
 
-        let mut clusters = HashMap::new();
-        let mut indices = HashMap::new();
-
-        {
-            let mut stream = wal_reader.transactions(None).await?;
-            while let Some(tx_details) = stream.try_next().await? {
-                rows_affected += Self::process_tx_details(&tx_details, &mut *tx).await?;
-                tx_details.clusters.into_iter().for_each(|(id, offset)| {
-                    clusters.insert(id, offset);
-                });
-                tx_details.indices.into_iter().for_each(|(id, offset)| {
-                    indices.insert(id, offset);
-                });
-            }
+        let mut stream = wal_reader.transactions(None).await?;
+        while let Some(tx_details) = stream.try_next().await? {
+            rows_affected += Self::process_tx_details(&tx_details, &mut *tx).await?;
         }
 
-        let zero_block_id = self.specs().zero_block().content_id().clone();
-        let zero_cluster_id = self.specs().zero_cluster().content_id().clone();
-        let zero_index_ids = {
-            self.specs()
-                .zero_indices()
-                .map(|c| c.content_id().clone())
-                .collect::<Vec<_>>()
-        };
-
-        // find any unused content that has been in this wal file
-        for (id, offset) in Self::unused(
-            &mut *tx,
-            &self.specs,
-            &zero_block_id,
-            &zero_cluster_id,
-            &zero_index_ids,
-        )
-        .try_filter_map(|id| {
-            let clusters = &clusters;
-            let indices = &indices;
-            async move {
-                Ok(match &id {
-                    Id::BlockId(_) => None,
-                    Id::ClusterId(cluster_id) => {
-                        if let Some(offset) = clusters.get(cluster_id).map(|c| *c) {
-                            Some((id, offset))
-                        } else {
-                            None
-                        }
-                    }
-                    Id::IndexId(index_id) => {
-                        if let Some(offset) = indices.get(index_id).map(|c| *c) {
-                            Some((id, offset))
-                        } else {
-                            None
-                        }
-                    }
-                })
-            }
-        })
-        .try_collect::<Vec<_>>()
-        .await?
-        {
-            match id {
-                Id::BlockId(_) => {}
-                Id::ClusterId(cluster_id) => {
-                    let cluster = wal_reader.cluster(&cluster_id, offset).await?;
-                    rows_affected +=
-                        Self::sync_cluster_content(&cluster, &zero_block_id, &mut *tx).await?;
-                }
-                Id::IndexId(index_id) => {
-                    let index = wal_reader.index(&index_id, offset).await?;
-                    rows_affected +=
-                        Self::sync_index_content(&index, &zero_cluster_id, &mut *tx).await?;
-                }
-            }
-        }
         tracing::debug!(rows_affected, "wal file sync complete");
         Ok(rows_affected)
     }
@@ -1071,7 +1250,7 @@ impl Inventory {
         wal_id: &WalId,
     ) -> anyhow::Result<()> {
         {
-            let mut wal_reader = self.wal_man.open_reader(wal_id).await?;
+            let wal_reader = self.wal_man.open_reader(wal_id).await?;
             let id = tx_details.wal_id.as_bytes().as_slice();
             let etag = wal_reader.as_ref().etag().await?;
             let etag = etag.as_ref();
@@ -1094,59 +1273,8 @@ impl Inventory {
             .await?;
 
             Self::process_tx_details(tx_details, tx.as_mut()).await?;
-
-            let zero_block_id = self.specs().zero_block().content_id().clone();
-            let zero_cluster_id = self.specs().zero_cluster().content_id().clone();
-            let zero_index_ids = {
-                self.specs()
-                    .zero_indices()
-                    .map(|c| c.content_id().clone())
-                    .collect::<Vec<_>>()
-            };
-
-            // find any unused content that has been in this wal update
-            for id in Self::unused(
-                tx.as_mut(),
-                &self.specs,
-                &zero_block_id,
-                &zero_cluster_id,
-                &zero_index_ids,
-            )
-            .try_filter_map(move |id| async move {
-                Ok(
-                    if match &id {
-                        Id::BlockId(block_id) => tx_details.blocks.contains_key(block_id),
-                        Id::ClusterId(cluster_id) => tx_details.clusters.contains_key(cluster_id),
-                        Id::IndexId(index_id) => tx_details.indices.contains_key(index_id),
-                    } {
-                        Some(id)
-                    } else {
-                        None
-                    },
-                )
-            })
-            .try_collect::<Vec<_>>()
-            .await?
-            {
-                match id {
-                    Id::BlockId(_) => {}
-                    Id::ClusterId(cluster_id) => {
-                        if let Some(offset) = tx_details.clusters.get(&cluster_id) {
-                            let cluster = wal_reader.cluster(&cluster_id, *offset).await?;
-                            Self::sync_cluster_content(&cluster, &zero_block_id, tx.as_mut())
-                                .await?;
-                        }
-                    }
-                    Id::IndexId(index_id) => {
-                        if let Some(offset) = tx_details.indices.get(&index_id) {
-                            let index = wal_reader.index(&index_id, *offset).await?;
-                            Self::sync_index_content(&index, &zero_cluster_id, tx.as_mut()).await?;
-                        }
-                    }
-                }
-            }
-
             update_commit(self.branch(), &tx_details.commit, tx.as_mut()).await?;
+            Self::_sync_commits(&self.specs, &self.wal_man, &self.volume, tx.as_mut()).await?;
 
             tx.commit().await?;
 
@@ -1297,9 +1425,9 @@ async fn db_init(
     let block_id = zero_block.content_id().as_ref();
     sqlx::query!(
         "
-        INSERT INTO known_content (content_type, block_id, used, available)
-        VALUES ('B', ?, 0, 1)
-        ON CONFLICT(block_id) DO UPDATE SET available = 1;
+        INSERT INTO known_content (content_type, block_id, used, chunk_avail, wal_avail)
+        VALUES ('B', ?, 0, 1, 0)
+        ON CONFLICT(block_id) DO UPDATE SET chunk_avail = 1;
         ",
         block_id,
     )
@@ -1310,9 +1438,9 @@ async fn db_init(
     let cluster_id = zero_cluster.content_id().as_ref();
     sqlx::query!(
         "
-        INSERT INTO known_content (content_type, cluster_id, used, available)
-        VALUES ('C', ?, 0, 1)
-        ON CONFLICT(cluster_id) DO UPDATE SET available = 1;
+        INSERT INTO known_content (content_type, cluster_id, used, chunk_avail, wal_avail)
+        VALUES ('C', ?, 0, 1, 0)
+        ON CONFLICT(cluster_id) DO UPDATE SET chunk_avail = 1;
                 ",
         cluster_id
     )
@@ -1324,9 +1452,9 @@ async fn db_init(
         let index_id = zero_index.content_id().as_ref();
         sqlx::query!(
             "
-            INSERT INTO known_content (content_type, index_id, used, available)
-            VALUES ('I', ?, 0, 1)
-            ON CONFLICT(index_id) DO UPDATE SET available = 1;
+            INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
+            VALUES ('I', ?, 0, 1, 0)
+            ON CONFLICT(index_id) DO UPDATE SET chunk_avail = 1;
             ",
             index_id
         )
@@ -1355,6 +1483,11 @@ async fn db_init(
             .execute(tx.as_mut())
             .await?;
     }
+
+    // delete locked commits
+    sqlx::query!("DELETE FROM commits WHERE type = 'LB'")
+        .execute(tx.as_mut())
+        .await?;
 
     for (branch, commit) in branches.iter().map(|(s, b)| (s, &b.commit)) {
         let commit_id = commit.content_id().as_ref();
@@ -1421,142 +1554,51 @@ fn try_from_db_hash(value: String) -> anyhow::Result<HashAlgorithm> {
     }
 }
 
-async fn delete_obsolete_wal_files(pool: &SqlitePool, wal_man: &WalMan) -> anyhow::Result<()> {
-    let mut deleted = 0;
-    // all wal_files with only inactive content
-    let obsolete = sqlx::query!(
-        "
-SELECT wf.id AS wal_id
-FROM wal_files wf
-WHERE wf.active = 0
-  AND NOT EXISTS (
-      SELECT 1
-      FROM available_content ac
-      JOIN known_content kc ON (
-          (ac.content_type = 'B' AND ac.block_id = kc.block_id) OR
-          (ac.content_type = 'C' AND ac.cluster_id = kc.cluster_id) OR
-          (ac.content_type = 'I' AND ac.index_id = kc.index_id)
-      )
-      WHERE ac.source_type = 'W'
-        AND ac.wal_id = wf.id
-        AND kc.used > 0
-  );
-        "
+async fn sync_chunk(chunk: &Chunk, etag: &Etag, tx: &mut SqliteConnection) -> anyhow::Result<()> {
+    tracing::debug!(chunk_id = %chunk.id(), "syncing chunk");
+
+    let id = chunk.id().as_bytes().as_slice();
+    let etag = etag.as_ref();
+
+    let rows_affected = sqlx::query!("DELETE FROM chunks WHERE id = ?", id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if rows_affected > 0 {
+        tracing::trace!(rows_affected, "deleted chunk related entries from database");
+    }
+
+    sqlx::query!(
+        "INSERT INTO chunks (id, etag)
+             VALUES (?, ?)
+            ",
+        id,
+        etag
     )
-    .fetch_all(pool.read())
-    .await?
-    .into_iter()
-    .map(|r| TryInto::<WalId>::try_into(r.wal_id.as_slice()))
-    .collect::<Result<Vec<_>, _>>()?;
+    .execute(&mut *tx)
+    .await?;
 
-    for wal_id in obsolete {
-        let mut tx = pool.write().begin().await?;
-        let id = wal_id.as_bytes().as_slice();
-        if sqlx::query!("DELETE FROM wal_files WHERE id = ? AND active = 0", id)
-            .execute(tx.as_mut())
-            .await?
-            .rows_affected()
-            > 0
-        {
-            wal_man.delete(&wal_id).await?;
-            deleted += 1;
-        }
-        tx.commit().await?;
-    }
-
-    if deleted > 0 {
-        tracing::info!(deleted_wal_files = deleted, "obsolete wal files deleted");
-    }
-
-    Ok(())
-}
-
-async fn pack_chunks(
-    pool: &SqlitePool,
-    wal_man: &WalMan,
-    volume: &VolumeHandler,
-    specs: &FixedSpecs,
-) -> anyhow::Result<()> {
-    let mut offset = 0;
-    let mut tx = pool.read().begin().await?;
-    let content = find_packable_content(offset, 100, tx.as_mut(), specs).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn find_packable_content(
-    offset: usize,
-    limit: usize,
-    conn: &mut SqliteConnection,
-    specs: &FixedSpecs,
-) -> anyhow::Result<Vec<(WalId, u64, ChunkEntry, usize)>> {
-    let offset = offset as i64;
-    let limit = limit as i64;
-
-    let content_hash = specs.content_hash();
-    let meta_hash = specs.meta_hash();
-
-    #[derive(Debug)]
-    struct Row {
-        wal_id: Option<Vec<u8>>,
-        block_id: Option<Vec<u8>>,
-        cluster_id: Option<Vec<u8>>,
-        index_id: Option<Vec<u8>>,
-        offset: i64,
-        used_count: i64,
-    }
-
-    let try_convert = |row: Row| -> anyhow::Result<(WalId, u64, ChunkEntry, usize)> {
-        let wal_id = WalId::try_from(row.wal_id.ok_or(anyhow!("wal_id is NULL"))?.as_slice())?;
-        let offset = row.offset as u64;
-        let used_count = row.used_count as usize;
-        let entry = if row.block_id.is_some() {
-            ChunkEntry::BlockId(
-                Hash::try_from((row.block_id.unwrap().as_slice(), content_hash))?.into(),
-            )
-        } else if row.cluster_id.is_some() {
-            ChunkEntry::ClusterId(
-                Hash::try_from((row.cluster_id.unwrap().as_slice(), meta_hash))?.into(),
-            )
-        } else if row.index_id.is_some() {
-            ChunkEntry::IndexId(
-                Hash::try_from((row.index_id.unwrap().as_slice(), meta_hash))?.into(),
-            )
-        } else {
-            bail!("invalid row returned, no content id found");
+    for (offset, content) in chunk.content().into_iter() {
+        let offset = offset as i64;
+        let (content_type, block_id, cluster_id, index_id) = match content {
+            ChunkEntry::BlockId(block_id) => ("B", Some(block_id.as_ref()), None, None),
+            ChunkEntry::ClusterId(cluster_id) => ("C", None, Some(cluster_id.as_ref()), None),
+            ChunkEntry::IndexId(index_id) => ("I", None, None, Some(index_id.as_ref())),
         };
-        Ok((wal_id, offset, entry, used_count))
-    };
 
-    Ok(sqlx::query_as!(
-        Row,
-        "
-SELECT wc.wal_id, wc.block_id, wc.cluster_id, wc.index_id, wc.offset, kc.used AS used_count
-FROM available_content wc
-         JOIN known_content kc ON (
-    (wc.block_id IS NOT NULL AND wc.block_id = kc.block_id) OR
-    (wc.cluster_id IS NOT NULL AND wc.cluster_id = kc.cluster_id) OR
-    (wc.index_id IS NOT NULL AND wc.index_id = kc.index_id)
-    )
-WHERE wc.source_type = 'W'
-  AND kc.used > 0
-  AND NOT EXISTS (SELECT 1
-                  FROM available_content cc
-                  WHERE cc.source_type = 'C'
-                    AND (
-                      (wc.block_id IS NOT NULL AND wc.block_id = cc.block_id) OR
-                      (wc.cluster_id IS NOT NULL AND wc.cluster_id = cc.cluster_id) OR
-                      (wc.index_id IS NOT NULL AND wc.index_id = cc.index_id)
-                      ))
-ORDER BY kc.used DESC
-LIMIT ? OFFSET ?;
-        ",
-        limit,
-        offset
-    )
-    .fetch_all(&mut *conn)
-    .await?
-    .into_iter()
-    .map(|r| try_convert(r))
-    .collect::<Result<Vec<_>, _>>()?)
+        sqlx::query!(
+                "
+                INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
+                VALUES ('C', ?, ?, ?, ?, ?, ?)
+                ",
+                id,
+                offset,
+                content_type,
+                block_id,
+                cluster_id,
+                index_id,
+            ).execute(&mut *tx).await?;
+    }
+
+    Ok(())
 }

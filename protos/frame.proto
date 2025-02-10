@@ -41,6 +41,7 @@ message Header {
     wal.FileInfo wal_info = 15;
     volume.VolumeInfo volume_info = 16;
     volume.BranchInfo branch_info = 17;
+    volume.ChunkInfo chunk_info = 18;
   }
 }
 
@@ -49,6 +50,7 @@ message Body {
     BLOCK_CONTENT = 0;
     CLUSTER_PROTO3 = 1;
     INDEX_PROTO3 = 2;
+    CHUNK_INDEX_PROTO3 = 3;
   }
 
   Type type = 1;

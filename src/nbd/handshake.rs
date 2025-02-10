@@ -4,12 +4,15 @@ use crate::io::AsyncReadBytesExt;
 use crate::{highest_power_of_two, ClientEndpoint};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::stream::FuturesUnordered;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use once_cell::sync::Lazy;
 use std::cmp::{max, PartialEq};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 const NBD_MAGIC: u64 = 0x4e42444d41474943; // NBDMAGIC;
 const I_HAVE_OPT: u64 = 0x49484156454F5054; // IHAVEOPT;
@@ -312,6 +315,7 @@ pub(super) struct Handshaker {
     default_export: Option<String>,
     structured_replies_disabled: bool,
     extended_headers_disabled: bool,
+    shutdown_ct: CancellationToken,
 }
 
 impl Handshaker {
@@ -320,6 +324,7 @@ impl Handshaker {
         default_export: Option<String>,
         structured_replies_disabled: bool,
         extended_headers_disabled: bool,
+        shutdown_ct: CancellationToken,
     ) -> Self {
         Self {
             exports: exports.into_iter().collect(),
@@ -331,6 +336,7 @@ impl Handshaker {
             } else {
                 extended_headers_disabled
             },
+            shutdown_ct,
         }
     }
 
@@ -363,6 +369,16 @@ impl Handshaker {
 
         let mut buf = [0u8; 16];
         loop {
+            if self.shutdown_ct.is_cancelled() {
+                send_error(
+                    tx,
+                    1,
+                    ErrorType::SHUTDOWN,
+                    "server shutdown imminent".to_string(),
+                )
+                .await?;
+                return Ok(None);
+            }
             // read the next request header
             rx.read_exact(&mut buf).await?;
             let mut buf = &buf[..];
@@ -410,6 +426,7 @@ impl Handshaker {
                             export,
                             transmission_mode,
                             client_endpoint.clone(),
+                            self.shutdown_ct.clone(),
                         )));
                     }
                     // export is unavailable, but client does not support error handling
@@ -496,6 +513,7 @@ impl Handshaker {
                                 export,
                                 transmission_mode,
                                 client_endpoint.clone(),
+                                self.shutdown_ct.clone(),
                             )));
                         }
                     }
@@ -549,6 +567,27 @@ impl Handshaker {
             },
         };
         self.exports.get(name).map(|exp| exp.clone())
+    }
+
+    pub async fn close(self) {
+        let mut close_futures = FuturesUnordered::new();
+
+        for (name, export) in self.exports.into_iter() {
+            close_futures.push(async move {
+                if let Some(vbd) = Arc::get_mut(&mut export.into_inner()) {
+                    eprintln!("closing [{}]", name);
+                    vbd.close().await?
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+
+        while let Some(res) = close_futures.next().await {
+            if let Err(err) = res {
+                //todo
+                eprintln!("error during closing of vbd: {}", err);
+            }
+        }
     }
 }
 

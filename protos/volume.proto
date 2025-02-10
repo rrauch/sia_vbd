@@ -12,3 +12,35 @@ message VolumeInfo {
 message BranchInfo {
   common.Commit commit = 1;
 }
+
+message ChunkContent {
+  message Block {
+    common.Hash cid = 1;
+  }
+
+  message Cluster {
+    common.Hash cid = 1;
+  }
+
+  message Index {
+    common.Hash cid = 1;
+  }
+
+  oneof type {
+    Block block = 11;
+    Cluster cluster = 12;
+    Index index = 13;
+  }
+}
+
+message ChunkInfo {
+  common.Uuid chunk_id = 1;
+  common.FixedSpecs specs = 2;
+  common.Timestamp created = 3;
+  optional common.Compression compression = 4;
+}
+
+message ChunkIndex {
+  common.Uuid chunk_id = 1;
+  map<uint64, ChunkContent> content = 2;
+}
