@@ -37,10 +37,15 @@ message ChunkInfo {
   common.Uuid chunk_id = 1;
   common.FixedSpecs specs = 2;
   common.Timestamp created = 3;
-  optional common.Compression compression = 4;
 }
 
 message ChunkIndex {
   common.Uuid chunk_id = 1;
   map<uint64, ChunkContent> content = 2;
+}
+
+message ChunkIndexInfo {
+  common.Uuid chunk_index_id = 1;
+  common.FixedSpecs specs = 2;
+  common.Timestamp created = 3;
 }

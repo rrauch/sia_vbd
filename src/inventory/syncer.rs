@@ -1,19 +1,22 @@
 use crate::hash::Hash;
-use crate::inventory::chunk::{ChunkContent, ChunkEntry, ChunkWriter};
-use crate::inventory::{commit_from_db, sync_chunk};
+use crate::inventory::chunk::{Chunk, ChunkContent, ChunkEntry, ChunkId, ChunkIndex, ChunkWriter};
+use crate::inventory::{commit_from_db, sync_chunk, sync_chunk_file, sync_chunk_index};
 use crate::repository::VolumeHandler;
-use crate::vbd::{BranchName, Commit, FixedSpecs, IndexId};
+use crate::vbd::{BlockId, BranchName, ClusterId, Commit, FixedSpecs, IndexId};
 use crate::wal::man::WalMan;
 use crate::wal::WalId;
 use crate::SqlitePool;
 use anyhow::{anyhow, bail};
 use async_tempfile::TempDir;
+use chrono::Utc;
+use futures::TryStreamExt;
 use sqlx::SqliteConnection;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
+use uuid::Uuid;
 
 pub(super) struct Syncer {
     pool: SqlitePool,
@@ -296,7 +299,8 @@ async fn pack_chunks(
                 let (chunk, len, reader) = chunk_writer.take().unwrap().finalize().await?;
                 let etag = volume.put_chunk(&chunk, len, reader).await?;
                 let mut tx = pool.write().begin().await?;
-                sync_chunk(&chunk, &etag, tx.as_mut()).await?;
+                sync_chunk_file(chunk.id(), &etag, tx.as_mut()).await?;
+                sync_chunk(&chunk, tx.as_mut()).await?;
                 tx.commit().await?;
                 println!("committed");
             }
@@ -308,8 +312,102 @@ async fn pack_chunks(
             let (chunk, len, reader) = chunk_writer.take().unwrap().finalize().await?;
             let etag = volume.put_chunk(&chunk, len, reader).await?;
             let mut tx = pool.write().begin().await?;
-            sync_chunk(&chunk, &etag, tx.as_mut()).await?;
+            sync_chunk_file(chunk.id(), &etag, tx.as_mut()).await?;
+            sync_chunk(&chunk, tx.as_mut()).await?;
             tx.commit().await?;
+        }
+    }
+
+    if flush {
+        // update index
+        let mut conn = pool.read().acquire().await?;
+        let mut stream = sqlx::query!(
+            "SELECT chunk_id, offset, block_id, cluster_id, index_id
+                FROM available_content
+                WHERE chunk_id IN (SELECT id
+                   FROM known_chunks
+                   WHERE indexed = 0 AND available > 0
+               );
+            "
+        ).fetch(conn.as_mut());
+
+        let mut chunks = HashMap::new();
+        while let Some(r) = stream.try_next().await? {
+            if r.chunk_id.is_none() {
+                continue;
+            }
+            if let Ok(chunk_id) = ChunkId::try_from(r.chunk_id.unwrap().as_slice()) {
+                if !chunks.contains_key(&chunk_id) {
+                    chunks.insert(chunk_id, BTreeMap::new());
+                }
+                let offset = r.offset as u64;
+                if let Some(block_id) = r
+                    .block_id
+                    .map(|b| {
+                        Hash::try_from((b.as_slice(), specs.content_hash()))
+                            .ok()
+                            .map(|h| BlockId::try_from(h).ok())
+                    })
+                    .flatten()
+                    .flatten()
+                {
+                    chunks
+                        .get_mut(&chunk_id)
+                        .unwrap()
+                        .insert(offset, ChunkEntry::BlockId(block_id));
+                }
+                if let Some(cluster_id) = r
+                    .cluster_id
+                    .map(|b| {
+                        Hash::try_from((b.as_slice(), specs.content_hash()))
+                            .ok()
+                            .map(|h| ClusterId::try_from(h).ok())
+                    })
+                    .flatten()
+                    .flatten()
+                {
+                    chunks
+                        .get_mut(&chunk_id)
+                        .unwrap()
+                        .insert(offset, ChunkEntry::ClusterId(cluster_id));
+                }
+                if let Some(index_id) = r
+                    .index_id
+                    .map(|b| {
+                        Hash::try_from((b.as_slice(), specs.content_hash()))
+                            .ok()
+                            .map(|h| IndexId::try_from(h).ok())
+                    })
+                    .flatten()
+                    .flatten()
+                {
+                    chunks
+                        .get_mut(&chunk_id)
+                        .unwrap()
+                        .insert(offset, ChunkEntry::IndexId(index_id));
+                }
+            }
+        }
+        drop(stream);
+        conn.close().await?;
+
+        let chunk_index = ChunkIndex {
+            id: Uuid::now_v7().into(),
+            specs: specs.clone(),
+            created: Utc::now(),
+            chunks: chunks
+                .into_iter()
+                .map(|(chunk_id, entries)| Chunk::new(chunk_id, entries.into_iter()))
+                .collect(),
+        };
+
+        let num_chunks = chunk_index.len();
+        if num_chunks > 0 {
+            let etag = volume.update_chunk_index(chunk_index.clone()).await?;
+            let mut tx = pool.write().begin().await?;
+            sync_chunk_index(&chunk_index, &etag, tx.as_mut()).await?;
+            tx.commit().await?;
+            tracing::debug!(chunk_index_id = %&chunk_index.id, chunks = num_chunks, "chunk index updated");
         }
     }
 

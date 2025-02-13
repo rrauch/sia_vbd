@@ -1,10 +1,10 @@
 use crate::hash::HashAlgorithm;
 use crate::io::AsyncReadExtBuffered;
-use crate::repository::protos::volume::{ChunkIndex, ChunkInfo};
+use crate::repository::protos::volume::ChunkInfo;
 use crate::serde;
 use crate::serde::encoded::{Decoded, DecodedStream, EncodingSink, EncodingSinkBuilder};
 use crate::serde::framed::{FramingSink, WriteFrame};
-use crate::serde::{Compression, Compressor, PREAMBLE_LEN};
+use crate::serde::{Compressor, PREAMBLE_LEN};
 use crate::vbd::{
     Block, BlockId, BlockSize, Cluster, ClusterId, ClusterSize, FixedSpecs, Index, IndexId,
     Position, TypedUuid,
@@ -12,12 +12,13 @@ use crate::vbd::{
 use anyhow::anyhow;
 use async_tempfile::TempFile;
 use bytes::BytesMut;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{io, AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt, SinkExt, StreamExt};
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::Arc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::instrument;
 use uuid::Uuid;
@@ -26,7 +27,12 @@ const CHUNK_MAGIC_NUMBER: &'static [u8; 16] = &[
     0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x43, 0x4E, 0x4B, 0x00, 0x00, 0x01,
 ];
 
+#[derive(Clone)]
 pub(crate) struct Chunk {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     id: ChunkId,
     content: BTreeMap<u64, ChunkEntry>,
 }
@@ -34,41 +40,49 @@ pub(crate) struct Chunk {
 impl Chunk {
     pub fn new(id: ChunkId, content: impl Iterator<Item = (u64, ChunkEntry)>) -> Self {
         Self {
-            id,
-            content: content.into_iter().collect(),
+            inner: Arc::new(Inner {
+                id,
+                content: content.into_iter().collect(),
+            }),
         }
     }
 
     pub fn from_chunk(other: Chunk, offset_adjustment: i64) -> Self {
         Chunk {
-            id: other.id,
-            content: other
-                .content
-                .into_iter()
-                .map(|(offset, entry)| {
-                    (
-                        (offset as i64).saturating_add(offset_adjustment) as u64,
-                        entry,
-                    )
-                })
-                .collect(),
+            inner: Arc::new(Inner {
+                id: other.inner.id.clone(),
+                content: other
+                    .inner
+                    .content
+                    .iter()
+                    .map(|(offset, entry)| {
+                        (
+                            (*offset as i64).saturating_add(offset_adjustment) as u64,
+                            entry.clone(),
+                        )
+                    })
+                    .collect(),
+            }),
         }
     }
 
     pub fn id(&self) -> &ChunkId {
-        &self.id
+        &self.inner.id
     }
 
     pub fn content(&self) -> impl Iterator<Item = (u64, &ChunkEntry)> {
-        self.content.iter().map(|(id, content)| (*id, content))
+        self.inner
+            .content
+            .iter()
+            .map(|(id, content)| (*id, content))
     }
 
     pub fn len(&self) -> usize {
-        self.content.len()
+        self.inner.content.len()
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone)]
 pub(crate) enum ChunkEntry {
     BlockId(BlockId),
     ClusterId(ClusterId),
@@ -89,7 +103,7 @@ pub(super) struct ChunkWriter {
     temp_file: TempFile,
     current_offset: u64,
     header: serde::protos::frame::Header,
-    index: ChunkIndex,
+    index: crate::repository::protos::volume::ChunkIndex,
 }
 
 impl ChunkWriter {
@@ -112,7 +126,6 @@ impl ChunkWriter {
             chunk_id: Some(chunk_id.into()),
             specs: Some((&specs).into()),
             created: Some(Utc::now().into()),
-            compression: Some((&Compression::Zstd).into()),
         };
         let mut body = serde::protos::frame::Body::default();
         body.set_type(serde::protos::frame::body::Type::ChunkIndexProto3);
@@ -129,7 +142,7 @@ impl ChunkWriter {
             temp_file: Self::create_temp_file(temp_path, max_size).await?,
             current_offset: 0,
             header,
-            index: ChunkIndex {
+            index: crate::repository::protos::volume::ChunkIndex {
                 chunk_id: Some(chunk_id.into()),
                 content: HashMap::default(),
             },
@@ -282,5 +295,21 @@ async fn read_file_header<IO: ChunkSource>(
         Some(_) | None => Err(anyhow!(
             "invalid file format, expected chunk info as first frame but got something else"
         ))?,
+    }
+}
+
+pub(crate) type ChunkIndexId = TypedUuid<ChunkIndex>;
+
+#[derive(Clone)]
+pub(crate) struct ChunkIndex {
+    pub id: ChunkIndexId,
+    pub specs: FixedSpecs,
+    pub created: DateTime<Utc>,
+    pub chunks: Vec<Chunk>,
+}
+
+impl ChunkIndex {
+    pub fn len(&self) -> usize {
+        self.chunks.len()
     }
 }

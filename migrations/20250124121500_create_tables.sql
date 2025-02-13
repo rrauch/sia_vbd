@@ -147,6 +147,7 @@ CREATE TRIGGER adjust_wal_critical_after_update_deactivated
         (NEW.used = 0 OR
          NEW.chunk_avail > 0) AND
         NEW.wal_avail > 0 AND
+        OLD.wal_avail > 0 AND
         (OLD.used > 0 AND OLD.chunk_avail = 0)
         )
 BEGIN
@@ -357,22 +358,132 @@ BEGIN
     UPDATE wal_files SET active = 0 WHERE id != NEW.id;
 END;
 
-CREATE TABLE chunks
+CREATE TABLE known_chunks
 (
-    id   BLOB NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
-                                          LENGTH(id) == 16),
-    etag BLOB NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
-                              LENGTH(etag) >= 8)
+    id        BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                                  LENGTH(id) == 16),
+    indexed   INTEGER NOT NULL CHECK (indexed >= 0),
+    available INTEGER NOT NULL CHECK (available >= 0)
 );
 
 -- Prevent Id changes
-CREATE TRIGGER prevent_chunks_id_update
+CREATE TRIGGER prevent_known_chunks_id_update
     BEFORE UPDATE
-    ON chunks
+    ON known_chunks
     FOR EACH ROW
     WHEN NEW.id != OLD.id
 BEGIN
     SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
+END;
+
+-- GC
+CREATE TRIGGER delete_obsolete_known_chunks
+    AFTER UPDATE
+    ON known_chunks
+    WHEN NEW.indexed = 0 AND NEW.available = 0
+BEGIN
+    DELETE FROM known_chunks WHERE ROWID = NEW.ROWID;
+END;
+
+
+CREATE TABLE chunk_files
+(
+    chunk_id BLOB NOT NULL PRIMARY KEY,
+    etag     BLOB NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                                  LENGTH(etag) >= 8),
+
+    FOREIGN KEY (chunk_id) REFERENCES known_chunks (id)
+);
+
+-- Prevent Id changes
+CREATE TRIGGER prevent_chunk_files_id_update
+    BEFORE UPDATE
+    ON chunk_files
+    FOR EACH ROW
+    WHEN NEW.chunk_id != OLD.chunk_id
+BEGIN
+    SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
+END;
+
+-- Reference Counting
+CREATE TRIGGER increment_chunk_available_counter_before_chunk_files_insert
+    BEFORE INSERT
+    ON chunk_files
+BEGIN
+    -- Upsert chunks
+    INSERT INTO known_chunks (id, indexed, available)
+    VALUES (NEW.chunk_id, 0, 1)
+    ON CONFLICT(id) DO UPDATE SET available = known_chunks.available + 1;
+END;
+
+CREATE TRIGGER decrement_chunk_available_counter_after_chunk_files_delete
+    AFTER DELETE
+    ON chunk_files
+BEGIN
+    UPDATE known_chunks
+    SET available = known_chunks.available - 1
+    WHERE id = OLD.chunk_id;
+END;
+
+CREATE TABLE chunk_indices
+(
+    id      BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
+                                                LENGTH(id) == 16),
+    etag    BLOB    NOT NULL CHECK (TYPEOF(etag) == 'blob' AND
+                                    LENGTH(etag) >= 8),
+    entries INTEGER NOT NULL DEFAULT 0 CHECK (entries >= 0)
+);
+
+-- Prevent Id changes
+CREATE TRIGGER prevent_chunk_indices_update
+    BEFORE UPDATE
+    ON chunk_indices
+    FOR EACH ROW
+    WHEN NEW.id != OLD.id
+BEGIN
+    SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
+END;
+
+CREATE TABLE chunk_index_content
+(
+    index_id BLOB NOT NULL,
+    chunk_id BLOB NOT NULL,
+
+    FOREIGN KEY (index_id) REFERENCES chunk_indices (id) ON DELETE CASCADE,
+    FOREIGN KEY (chunk_id) REFERENCES known_chunks (id),
+
+    UNIQUE (index_id, chunk_id)
+);
+
+CREATE INDEX idx_chunk_index_content_index_id ON chunk_index_content (index_id);
+CREATE INDEX idx_chunk_index_content_chunk_id ON chunk_index_content (chunk_id);
+
+-- Reference Counting
+CREATE TRIGGER increment_chunk_indexed_counter_before_chunk_index_content_insert
+    BEFORE INSERT
+    ON chunk_index_content
+BEGIN
+    -- Upsert chunks
+    INSERT INTO known_chunks (id, indexed, available)
+    VALUES (NEW.chunk_id, 1, 0)
+    ON CONFLICT(id) DO UPDATE SET indexed = indexed + 1;
+
+    UPDATE chunk_indices
+    SET entries = entries + 1
+    WHERE id = NEW.index_id;
+END;
+
+CREATE TRIGGER decrement_chunk_indexed_counter_after_chunk_index_content_delete
+    AFTER DELETE
+    ON chunk_index_content
+BEGIN
+    UPDATE known_chunks
+    SET indexed = known_chunks.indexed - 1
+    WHERE id = OLD.chunk_id;
+
+    UPDATE chunk_indices
+    SET entries = entries - 1
+    WHERE id = OLD.index_id;
 END;
 
 CREATE TABLE available_content
@@ -390,7 +501,7 @@ CREATE TABLE available_content
     index_id     BLOB,
 
     FOREIGN KEY (wal_id) REFERENCES wal_files (id) ON DELETE CASCADE,
-    FOREIGN KEY (chunk_id) REFERENCES chunks (id) ON DELETE CASCADE,
+    FOREIGN KEY (chunk_id) REFERENCES chunk_files (chunk_id) ON DELETE CASCADE,
     FOREIGN KEY (block_id) REFERENCES known_content (block_id),
     FOREIGN KEY (cluster_id) REFERENCES known_content (cluster_id),
     FOREIGN KEY (index_id) REFERENCES known_content (index_id),

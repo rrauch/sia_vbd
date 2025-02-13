@@ -1,11 +1,12 @@
-use crate::inventory::chunk::read_chunk_header;
+use crate::inventory::chunk::ChunkIndexId;
 use crate::io::{AsyncReadExtBuffered, TokioFile};
-use crate::repository::{Chunk, ChunkId, Reader, Repository, Stream, Volume};
+use crate::repository::{ChunkId, Reader, Repository, Stream, Volume};
 use crate::vbd::{BranchName, VbdId};
 use crate::Etag;
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
-use futures::{AsyncSeekExt, AsyncWriteExt, StreamExt};
+use futures::io::Cursor;
+use futures::{AsyncRead, AsyncSeekExt, AsyncWriteExt, StreamExt};
 use std::future;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,8 @@ impl Repository for FsRepository {
         file.close().await?;
         let chunk_dir = dir.join("chunks");
         tokio::fs::create_dir(&chunk_dir).await?;
+        let chunk_index_dir = dir.join("chunk_indices");
+        tokio::fs::create_dir(&chunk_index_dir).await?;
         let commit_dir = dir.join("commits");
         tokio::fs::create_dir(&commit_dir).await?;
         let file = commit_dir.join(format!("{}.branch", branch.as_ref()));
@@ -115,6 +118,27 @@ impl Repository for FsRepository {
         }
         tokio::fs::remove_dir(&commit_dir).await?;
 
+        let chunk_index_dir = volume_dir.join("chunk_indices");
+        if !is_dir(&chunk_index_dir).await? {
+            bail!("invalid chunk_indices directory: {}", volume_dir.display());
+        }
+        let mut read_dir = tokio::fs::read_dir(&chunk_index_dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path();
+            if !is_file(&path).await? {
+                bail!("invalid directory entry found: {}", &path.display());
+            }
+            let file_name = path
+                .file_name()
+                .ok_or(anyhow!("invalid file name"))?
+                .to_str()
+                .ok_or(anyhow!("invalid file name"))?;
+            if file_name.ends_with(".chidx") {
+                tokio::fs::remove_file(&path).await?;
+            }
+        }
+        tokio::fs::remove_dir(&chunk_index_dir).await?;
+
         let chunks_dir = volume_dir.join("chunks");
         let mut read_dir = tokio::fs::read_dir(&chunks_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {
@@ -152,6 +176,7 @@ async fn is_file(path: impl AsRef<Path>) -> Result<bool, std::io::Error> {
 
 pub struct FsVolume {
     volume_dir: PathBuf,
+    chunk_index_dir: PathBuf,
     chunk_dir: PathBuf,
     commits_dir: PathBuf,
 }
@@ -161,6 +186,7 @@ impl FsVolume {
         Self {
             chunk_dir: volume_dir.join("chunks"),
             commits_dir: volume_dir.join("commits"),
+            chunk_index_dir: volume_dir.join("chunk_indices"),
             volume_dir,
         }
     }
@@ -218,10 +244,66 @@ impl Volume for FsVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn chunk_details(&self, chunk_id: &ChunkId) -> Result<Chunk, Self::Error> {
-        let path = self.chunk_path(chunk_id);
-        let mut file = TokioFile::open(&path).await?;
-        Ok(read_chunk_header(&mut file).await?)
+    async fn chunk_indices(
+        &self,
+    ) -> Result<impl Stream<Item = Result<(ChunkIndexId, Etag), Self::Error>> + 'static, Self::Error>
+    {
+        let stream = tokio_stream::wrappers::ReadDirStream::new(
+            tokio::fs::read_dir(&self.chunk_index_dir).await?,
+        );
+        let stream = stream
+            .then(|r| async move {
+                match r {
+                    Ok(e) => {
+                        if let Some(file_name) = e.file_name().to_str() {
+                            if let Some(id) = file_name.strip_suffix(".chidx") {
+                                match ChunkIndexId::try_from(id) {
+                                    Ok(id) => {
+                                        if let Ok(etag) = etag(e.path()).await {
+                                            Ok(Some((id, etag)))
+                                        } else {
+                                            Ok(None)
+                                        }
+                                    }
+                                    Err(_) => Ok(None),
+                                }
+                            } else {
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            })
+            .filter_map(|e| future::ready(e.transpose()));
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn read_chunk_index(
+        &self,
+        id: &ChunkIndexId,
+    ) -> Result<impl Reader + 'static, Self::Error> {
+        let path = self.chunk_index_dir.join(format!("{}.chidx", id));
+        Ok(TokioFile::open(&path).await?)
+    }
+
+    async fn write_chunk_index(
+        &self,
+        id: &ChunkIndexId,
+        content: impl AsyncRead + Send + Unpin + 'static,
+    ) -> Result<Etag, Self::Error> {
+        let path = self.chunk_index_dir.join(format!("{}.chidx", id));
+        write_bak(&path, content).await?;
+        let etag = etag(&path).await?;
+        Ok(etag)
+    }
+
+    async fn delete_chunk_index(&self, id: &ChunkIndexId) -> Result<(), Self::Error> {
+        let path = self.chunk_index_dir.join(format!("{}.chidx", id));
+        Ok(tokio::fs::remove_file(&path).await?)
     }
 
     async fn read_chunk(
@@ -237,14 +319,23 @@ impl Volume for FsVolume {
 
     async fn write_chunk(
         &self,
-        chunk: &Chunk,
+        chunk_id: &ChunkId,
+        len: u64,
         content: impl Reader + 'static,
     ) -> Result<Etag, Self::Error> {
-        let path = self.chunk_path(chunk.id());
+        let path = self.chunk_path(chunk_id);
         let mut writer = TokioFile::create_new(&path).await?;
         match futures::io::copy(content, &mut writer).await {
             Ok(_) => {
                 writer.close().await?;
+                let success = match tokio::fs::metadata(&path).await {
+                    Ok(metadata) => metadata.is_file() && metadata.len() == len,
+                    Err(_) => false,
+                };
+                if !success {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    bail!("chunk creation failed");
+                }
                 let etag = etag(&path).await?;
                 Ok(etag)
             }
@@ -298,7 +389,7 @@ impl Volume for FsVolume {
 
     async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
         let path = self.commits_dir.join(format!("{}.branch", branch.as_ref()));
-        write_bak(&path, commit.as_ref()).await?;
+        write_bak(&path, Cursor::new(commit)).await?;
         Ok(())
     }
 
@@ -308,7 +399,10 @@ impl Volume for FsVolume {
     }
 }
 
-async fn write_bak(final_path: &Path, data: &[u8]) -> Result<(), anyhow::Error> {
+async fn write_bak(
+    final_path: &Path,
+    reader: impl AsyncRead + Send + Unpin + 'static,
+) -> Result<(), anyhow::Error> {
     let mut temp_path = final_path.to_path_buf();
     let mut bak_path = final_path.to_path_buf();
     let file_name = final_path
@@ -322,7 +416,7 @@ async fn write_bak(final_path: &Path, data: &[u8]) -> Result<(), anyhow::Error> 
         tokio::fs::remove_file(&temp_path).await?;
     }
     let mut file = TokioFile::create_new(&temp_path).await?;
-    file.write_all(data).await?;
+    futures::io::copy(reader, &mut file).await?;
     file.close().await?;
 
     if tokio::fs::try_exists(&bak_path).await? {

@@ -106,21 +106,13 @@ impl Hash {
 
 impl Display for Hash {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Hash::Tent(bytes) => {
-                for &byte in bytes {
-                    write!(f, "{:0>2x}", byte)?;
-                }
-                Ok(())
-            }
-            Hash::Blake3(hash) => Display::fmt(hash, f),
-            Hash::XXH3(bytes) => {
-                for &byte in bytes {
-                    write!(f, "{:0>2x}", byte)?;
-                }
-                Ok(())
-            }
-        }
+        let bytes = match self {
+            Hash::Tent(bytes) => bytes.as_slice(),
+            Hash::Blake3(hash) => hash.as_bytes().as_slice(),
+            Hash::XXH3(bytes) => bytes.as_slice(),
+        };
+
+        write!(f, "{}", hex::encode(bytes))
     }
 }
 
@@ -131,6 +123,15 @@ impl AsRef<[u8]> for Hash {
             Hash::Blake3(hash) => hash.as_bytes().as_slice(),
             Hash::XXH3(bytes) => bytes.as_slice(),
         }
+    }
+}
+
+impl TryFrom<(&str, HashAlgorithm)> for Hash {
+    type Error = anyhow::Error;
+
+    fn try_from((value, algo): (&str, HashAlgorithm)) -> Result<Self, Self::Error> {
+        let bytes = hex::decode(value)?;
+        (bytes.as_slice(), algo).try_into()
     }
 }
 

@@ -1,6 +1,8 @@
 pub(crate) mod volume {
+    use crate::inventory::chunk::ChunkIndexId;
     use anyhow::anyhow;
     use std::collections::BTreeMap;
+    use std::ops::Deref;
     use uuid::Uuid;
 
     include!(concat!(env!("OUT_DIR"), "/protos/volume.rs"));
@@ -108,6 +110,69 @@ pub(crate) mod volume {
                         .ok_or(anyhow!("index id is missing"))?,
                 ),
             })
+        }
+    }
+
+    impl From<ChunkIndexId> for crate::serde::protos::Uuid {
+        fn from(value: ChunkIndexId) -> Self {
+            value.deref().into()
+        }
+    }
+
+    impl From<crate::serde::protos::Uuid> for ChunkIndexId {
+        fn from(value: crate::serde::protos::Uuid) -> Self {
+            Into::<Uuid>::into(value).into()
+        }
+    }
+
+    impl From<&crate::inventory::chunk::ChunkIndex> for ChunkIndexInfo {
+        fn from(value: &crate::inventory::chunk::ChunkIndex) -> Self {
+            Self {
+                chunk_index_id: Some(value.id.into()),
+                specs: Some((&value.specs).into()),
+                created: Some((&value.created).into()),
+            }
+        }
+    }
+
+    impl TryFrom<ChunkIndexInfo> for crate::inventory::chunk::ChunkIndex {
+        type Error = anyhow::Error;
+
+        fn try_from(value: ChunkIndexInfo) -> Result<Self, Self::Error> {
+            let id = value
+                .chunk_index_id
+                .map(|id| id.into())
+                .ok_or(anyhow!("id is missing"))?;
+            let specs = value
+                .specs
+                .map(|specs| specs.try_into())
+                .transpose()?
+                .ok_or(anyhow!("specs are missing"))?;
+            let created = value
+                .created
+                .map(|c| c.try_into())
+                .transpose()?
+                .ok_or(anyhow!("created is missing"))?;
+
+            Ok(crate::inventory::chunk::ChunkIndex {
+                id,
+                specs,
+                created,
+                chunks: vec![],
+            })
+        }
+    }
+
+    impl From<&crate::inventory::chunk::Chunk> for ChunkIndex {
+        fn from(value: &crate::inventory::chunk::Chunk) -> Self {
+            Self {
+                chunk_id: Some(value.id().clone().into()),
+                content: value
+                    .content()
+                    .into_iter()
+                    .map(|(offset, entry)| (offset, entry.into()))
+                    .collect(),
+            }
         }
     }
 

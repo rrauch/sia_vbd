@@ -1,4 +1,4 @@
-use crate::inventory::chunk::{Chunk, ChunkId};
+use crate::inventory::chunk::{Chunk, ChunkId, ChunkIndex};
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::{BranchInfo, VolumeInfo};
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
@@ -263,6 +263,19 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
                         let frame = DecodedReadFrame::new(chunk_id, body, frame, fixed_specs);
                         Decoded::ChunkInfo(frame)
                     }
+                    frame::header::Type::Chunk(chunk) => {
+                        let chunk_id: ChunkId = chunk
+                            .id
+                            .map(|id| id.into())
+                            .ok_or(DecodingError::Other(anyhow!("chunk id missing")))?;
+                        let frame = DecodedReadFrame::new(chunk_id, body, frame, fixed_specs);
+                        Decoded::Chunk(frame)
+                    }
+                    frame::header::Type::ChunkIndexInfo(index_info) => {
+                        let index_info: ChunkIndex = index_info.try_into()?;
+                        let frame = DecodedReadFrame::new(index_info, body, frame, fixed_specs);
+                        Decoded::ChunkIndexInfo(frame)
+                    }
                 })
             } else {
                 Err(DecodingError::MissingHeader)
@@ -363,6 +376,8 @@ pub(crate) enum Decoded<R: InnerReader> {
     VolumeInfo(DecodedReadFrame<VolumeInfo, R, ()>),
     BranchInfo(DecodedReadFrame<BranchInfo, R, ()>),
     ChunkInfo(DecodedReadFrame<ChunkId, R, Chunk>),
+    Chunk(DecodedReadFrame<ChunkId, R, Chunk>),
+    ChunkIndexInfo(DecodedReadFrame<ChunkIndex, R, ()>),
 }
 
 impl<R: InnerReader> Decoded<R> {
@@ -377,6 +392,8 @@ impl<R: InnerReader> Decoded<R> {
             Self::VolumeInfo(f) => f.position(),
             Self::BranchInfo(f) => f.position(),
             Self::ChunkInfo(f) => f.position(),
+            Self::Chunk(f) => f.position(),
+            Self::ChunkIndexInfo(f) => f.position(),
         }
     }
 
@@ -391,6 +408,8 @@ impl<R: InnerReader> Decoded<R> {
             Self::VolumeInfo(f) => f.body.as_ref(),
             Self::BranchInfo(f) => f.body.as_ref(),
             Self::ChunkInfo(f) => f.body.as_ref(),
+            Self::Chunk(f) => f.body.as_ref(),
+            Self::ChunkIndexInfo(f) => f.body.as_ref(),
         }
     }
 }
@@ -528,6 +547,38 @@ impl Converter {
                 None,
                 false,
             ),
+            Encodable::Chunk(chunk) => {
+                let mut buf = self.body_buf.get();
+                Into::<crate::repository::protos::volume::ChunkIndex>::into(chunk)
+                    .encode(&mut buf)?;
+                let bytes = buf.freeze();
+                let compression = self.compression(bytes.len() as u64);
+                let header = frame::Header {
+                    r#type: Some(frame::header::Type::Chunk(chunk.id().clone().into())),
+                    body: Some(
+                        (&Body {
+                            body_type: BodyType::ChunkIndex,
+                            compressed: compression.as_ref().map(|c| {
+                                Compressed {
+                                    compression: c.clone(),
+                                    uncompressed: bytes.len() as u64,
+                                }
+                                .into()
+                            }),
+                        })
+                            .into(),
+                    ),
+                };
+                (header, Some(bytes), compression.is_some())
+            }
+            Encodable::ChunkIndex(index_info) => (
+                frame::Header {
+                    r#type: Some(frame::header::Type::ChunkIndexInfo(index_info.into())),
+                    body: None,
+                },
+                None,
+                false,
+            ),
         };
         let mut head_buf = self.head_buf.get();
         header.encode(&mut head_buf)?;
@@ -557,6 +608,8 @@ pub(crate) enum Encodable<'a> {
     WalInfo(&'a WalInfo),
     VolumeInfo(&'a VolumeInfo),
     BranchInfo(&'a BranchInfo),
+    Chunk(&'a Chunk),
+    ChunkIndex(&'a ChunkIndex),
 }
 
 impl<'a> From<&'a TxBegin> for Encodable<'a> {
@@ -604,6 +657,18 @@ impl<'a> From<&'a VolumeInfo> for Encodable<'a> {
 impl<'a> From<&'a BranchInfo> for Encodable<'a> {
     fn from(value: &'a BranchInfo) -> Self {
         Encodable::BranchInfo(value)
+    }
+}
+
+impl<'a> From<&'a Chunk> for Encodable<'a> {
+    fn from(value: &'a Chunk) -> Self {
+        Encodable::Chunk(value)
+    }
+}
+
+impl<'a> From<&'a ChunkIndex> for Encodable<'a> {
+    fn from(value: &'a ChunkIndex) -> Self {
+        Encodable::ChunkIndex(value)
     }
 }
 
@@ -657,7 +722,7 @@ impl<'a> Display for Encodable<'a> {
             Self::VolumeInfo(volume_info) => {
                 write!(
                     f,
-                    "VolumeInfo[vbid={}, created={}, name={:?}]",
+                    "VolumeInfo[vbd_id={}, created={}, name={:?}]",
                     volume_info.specs.vbd_id(),
                     volume_info.created,
                     volume_info.name.as_ref()
@@ -665,6 +730,22 @@ impl<'a> Display for Encodable<'a> {
             }
             Self::BranchInfo(branch_info) => {
                 write!(f, "BranchInfo[commit={}]", &branch_info.commit.content_id())
+            }
+            Self::Chunk(chunk) => {
+                write!(
+                    f,
+                    "ChunkIndex[chunk_id={}, len={}]",
+                    chunk.id(),
+                    chunk.len()
+                )
+            }
+            Self::ChunkIndex(index_info) => {
+                write!(
+                    f,
+                    "ChunkIndexInfo[vbd_id={}, created={}]",
+                    index_info.specs.vbd_id(),
+                    index_info.created,
+                )
             }
         }
     }

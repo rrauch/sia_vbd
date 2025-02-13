@@ -30,6 +30,10 @@ message Header {
     common.Hash cid = 1;
   }
 
+  message Chunk {
+    common.Uuid id = 1;
+  }
+
   optional Body body = 1;
 
   oneof type {
@@ -42,6 +46,8 @@ message Header {
     volume.VolumeInfo volume_info = 16;
     volume.BranchInfo branch_info = 17;
     volume.ChunkInfo chunk_info = 18;
+    Chunk chunk = 19;
+    volume.ChunkIndexInfo chunk_index_info = 20;
   }
 }
 

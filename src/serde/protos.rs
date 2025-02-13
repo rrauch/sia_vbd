@@ -287,6 +287,7 @@ impl From<&crate::vbd::Index> for Index {
 
 pub(crate) mod frame {
     use self::Error::*;
+    use crate::inventory::chunk::ChunkId;
     use crate::serde::{BodyType, Compressed};
     use crate::vbd::{BlockId, ClusterId, IndexId};
     use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, IndexFrameError};
@@ -403,6 +404,22 @@ pub(crate) mod frame {
                 .ok_or(ContentIdInvalid)?
                 .try_into()
                 .map_err(|_| ContentIdInvalid)?)
+        }
+    }
+
+    impl TryFrom<header::Chunk> for ChunkId {
+        type Error = Error;
+
+        fn try_from(value: header::Chunk) -> Result<Self, Self::Error> {
+            Ok(value.id.ok_or(ContentIdInvalid)?.into())
+        }
+    }
+
+    impl From<ChunkId> for header::Chunk {
+        fn from(value: ChunkId) -> Self {
+            header::Chunk {
+                id: Some(value.into())
+            }
         }
     }
 

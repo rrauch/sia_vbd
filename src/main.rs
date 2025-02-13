@@ -5,6 +5,7 @@ use futures::TryStreamExt;
 use sia_vbd::hash::HashAlgorithm;
 use sia_vbd::nbd::{Builder, RunGuard};
 use sia_vbd::repository::fs::FsRepository;
+use sia_vbd::repository::renterd::RenterdRepository;
 use sia_vbd::repository::RepositoryHandler;
 use sia_vbd::vbd::nbd_device::NbdDevice;
 use sia_vbd::vbd::{BlockSize, ClusterSize, VirtualBlockDevice};
@@ -126,7 +127,17 @@ async fn main() -> anyhow::Result<()> {
     let max_db_connections = 25;
     let branch = "main".try_into()?;
 
-    let repository: RepositoryHandler = FsRepository::new("/tmp/foo/repo").await?.into();
+    //let repository: RepositoryHandler = FsRepository::new("/tmp/foo/repo").await?.into();
+    let repository: RepositoryHandler = RenterdRepository::new(
+        renterd_client::ClientBuilder::new()
+            .api_endpoint_url("http://t430s:9980/api/")
+            .api_password("test")
+            .verbose_logging(true)
+            .build()?,
+        "vbd_dev".to_string().into(),
+        "/repo1/".to_string().into(),
+    )
+    .into();
 
     let volume = if let Some(vbd_id) = repository.list_volumes().await?.try_next().await? {
         repository.open_volume(&vbd_id, &branch).await?
@@ -157,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                     arguments.wal_dir,
                     arguments.max_wal_size.as_u64(),
                     arguments.max_tx_size.as_u64(),
-                    1024 * 1024 * 30,
+                    1024 * 1024 * 40,
                     &db_file,
                     max_db_connections,
                     branch,
@@ -176,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
     let res = runner.run().await;
     shutdown.abort();
     res?;
+    tracing::info!("sia_vbd shut down cleanly");
     Ok(())
 }
 

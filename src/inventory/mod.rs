@@ -2,7 +2,7 @@ pub(crate) mod chunk;
 mod syncer;
 
 use crate::hash::{Hash, HashAlgorithm};
-use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId};
+use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId, ChunkIndex, ChunkIndexId};
 use crate::inventory::syncer::Syncer;
 use crate::repository::{BranchInfo, VolumeHandler};
 use crate::vbd::{
@@ -180,6 +180,8 @@ impl Inventory {
         };
 
         this.sync_chunks().await?;
+        this.sync_chunk_indices().await?;
+        this.sync_unindexed_chunk_content().await?;
         this.sync_wal_files().await?;
         this.sync_commits().await?;
         this.syncer = Some(Syncer::new(
@@ -935,22 +937,103 @@ impl Inventory {
     }
 
     #[instrument[skip_all]]
+    pub async fn sync_unindexed_chunk_content(&mut self) -> anyhow::Result<()> {
+        tracing::info!("syncing unindexed chunk content");
+        let mut tx = self.pool.write().begin().await?;
+        for chunk_id in sqlx::query!(
+            "
+            SELECT id FROM known_chunks WHERE indexed = 0 AND available > 0;
+            "
+        )
+        .fetch_all(tx.as_mut())
+        .await?
+        .into_iter()
+        .map(|r| ChunkId::try_from(r.id.as_slice()))
+        {
+            let chunk_id = chunk_id?;
+            tracing::info!(chunk_id = %chunk_id, "chunk needs syncing");
+            let chunk = self.volume.chunk_details(&chunk_id).await?;
+            sync_chunk(&chunk, tx.as_mut()).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[instrument[skip_all]]
+    pub async fn sync_chunk_indices(&mut self) -> anyhow::Result<()> {
+        tracing::info!("syncing chunk indices");
+        let available_indices = self
+            .volume
+            .list_chunk_indices()
+            .await?
+            .collect::<HashMap<_, _>>();
+        let mut tx = self.pool.write().begin().await?;
+
+        let mut known_indices: HashMap<ChunkIndexId, Etag> = HashMap::default();
+        for r in sqlx::query!("SELECT id, etag FROM chunk_indices")
+            .fetch_all(tx.as_mut())
+            .await?
+            .into_iter()
+        {
+            let id = match ChunkIndexId::try_from(r.id.as_slice()) {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::error!(error = %err, chunk_index_id = ?r.id, "invalid chunk_index_id found in database, removing");
+                    sqlx::query!("DELETE FROM chunk_indices WHERE id = ?", r.id)
+                        .execute(tx.as_mut())
+                        .await?;
+                    continue;
+                }
+            };
+            known_indices.insert(id, Etag::from(r.etag));
+        }
+
+        for (id, etag) in available_indices {
+            let mut in_sync = false;
+            if let Some(known_etag) = known_indices.remove(&id) {
+                if &known_etag == &etag {
+                    in_sync = true;
+                }
+            }
+            if !in_sync {
+                tracing::info!(chunk_index_id = %id, "chunk_index needs syncing");
+                let chunk_index = self.volume.chunk_index(&id).await?;
+                sync_chunk_index(&chunk_index, &etag, tx.as_mut()).await?;
+            }
+        }
+
+        for obsolete in known_indices.into_keys() {
+            tracing::debug!(
+                chunk_index_id = %obsolete,
+                "removing obsolete chunk_index from inventory",
+            );
+            let id = obsolete.as_bytes().as_slice();
+            sqlx::query!("DELETE FROM chunk_indices WHERE id = ?", id)
+                .execute(tx.as_mut())
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[instrument[skip_all]]
     pub async fn sync_chunks(&mut self) -> anyhow::Result<()> {
         tracing::info!("syncing chunks");
         let available_chunks = self.volume.list_chunks().await?.collect::<HashMap<_, _>>();
         let mut tx = self.pool.write().begin().await?;
 
         let mut known_chunks: HashMap<ChunkId, Etag> = HashMap::default();
-        for r in sqlx::query!("SELECT id, etag FROM chunks")
+        for r in sqlx::query!("SELECT chunk_id, etag FROM chunk_files")
             .fetch_all(tx.as_mut())
             .await?
             .into_iter()
         {
-            let chunk_id = match ChunkId::try_from(r.id.as_slice()) {
+            let chunk_id = match ChunkId::try_from(r.chunk_id.as_slice()) {
                 Ok(chunk_id) => chunk_id,
                 Err(err) => {
-                    tracing::error!(error = %err, chunk_id = ?r.id, "invalid chunk_id found in database, removing");
-                    sqlx::query!("DELETE FROM chunks WHERE id = ?", r.id)
+                    tracing::error!(error = %err, chunk_id = ?r.chunk_id, "invalid chunk_id found in database, removing");
+                    sqlx::query!("DELETE FROM chunk_files WHERE chunk_id = ?", r.chunk_id)
                         .execute(tx.as_mut())
                         .await?;
                     continue;
@@ -967,9 +1050,7 @@ impl Inventory {
                 }
             }
             if !in_sync {
-                tracing::info!(chunk_id = %chunk_id, "chunk needs syncing");
-                let chunk = self.volume.chunk_details(&chunk_id).await?;
-                sync_chunk(&chunk, &etag, tx.as_mut()).await?;
+                sync_chunk_file(&chunk_id, &etag, tx.as_mut()).await?;
             }
         }
 
@@ -979,7 +1060,7 @@ impl Inventory {
                 "removing obsolete chunk from inventory",
             );
             let id = obsolete.as_bytes().as_slice();
-            sqlx::query!("DELETE FROM chunks WHERE id = ?", id)
+            sqlx::query!("DELETE FROM chunk_files WHERE chunk_id = ?", id)
                 .execute(tx.as_mut())
                 .await?;
         }
@@ -1554,22 +1635,29 @@ fn try_from_db_hash(value: String) -> anyhow::Result<HashAlgorithm> {
     }
 }
 
-async fn sync_chunk(chunk: &Chunk, etag: &Etag, tx: &mut SqliteConnection) -> anyhow::Result<()> {
-    tracing::debug!(chunk_id = %chunk.id(), "syncing chunk");
+async fn sync_chunk_index(
+    index: &ChunkIndex,
+    etag: &Etag,
+    tx: &mut SqliteConnection,
+) -> anyhow::Result<()> {
+    tracing::debug!(chunk_index_id = %&index.id, "syncing chunk_index");
 
-    let id = chunk.id().as_bytes().as_slice();
+    let id = index.id.as_bytes().as_slice();
     let etag = etag.as_ref();
 
-    let rows_affected = sqlx::query!("DELETE FROM chunks WHERE id = ?", id)
+    let rows_affected = sqlx::query!("DELETE FROM chunk_indices WHERE id = ?", id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
     if rows_affected > 0 {
-        tracing::trace!(rows_affected, "deleted chunk related entries from database");
+        tracing::trace!(
+            rows_affected,
+            "deleted chunk_index related entries from database"
+        );
     }
 
     sqlx::query!(
-        "INSERT INTO chunks (id, etag)
+        "INSERT INTO chunk_indices (id, etag)
              VALUES (?, ?)
             ",
         id,
@@ -1577,6 +1665,56 @@ async fn sync_chunk(chunk: &Chunk, etag: &Etag, tx: &mut SqliteConnection) -> an
     )
     .execute(&mut *tx)
     .await?;
+
+    for chunk in index.chunks.iter() {
+        let chunk_id = chunk.id().as_bytes().as_slice();
+        sqlx::query!(
+            "
+            INSERT INTO chunk_index_content (index_id, chunk_id)
+            VALUES (?, ?)
+            ",
+            id,
+            chunk_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sync_chunk(&chunk, tx).await?;
+    }
+
+    Ok(())
+}
+
+async fn sync_chunk(chunk: &Chunk, tx: &mut SqliteConnection) -> anyhow::Result<()> {
+    tracing::debug!(chunk_id = %chunk.id(), "syncing chunk");
+
+    let id = chunk.id().as_bytes().as_slice();
+
+    let rows_affected = sqlx::query!("DELETE FROM available_content WHERE chunk_id = ?", id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if rows_affected > 0 {
+        tracing::trace!(rows_affected, "deleted chunk related entries from database");
+    }
+
+    let chunk_file_exists = sqlx::query!(
+        "SELECT count(*) AS num FROM chunk_files WHERE chunk_id = ?",
+        id
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    .num > 0;
+
+    if chunk_file_exists {
+        insert_chunk_content(chunk, tx).await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_chunk_content(chunk: &Chunk, tx: &mut SqliteConnection) -> anyhow::Result<()> {
+    let id = chunk.id().as_bytes().as_slice();
 
     for (offset, content) in chunk.content().into_iter() {
         let offset = offset as i64;
@@ -1587,18 +1725,49 @@ async fn sync_chunk(chunk: &Chunk, etag: &Etag, tx: &mut SqliteConnection) -> an
         };
 
         sqlx::query!(
-                "
-                INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
-                VALUES ('C', ?, ?, ?, ?, ?, ?)
-                ",
-                id,
-                offset,
-                content_type,
-                block_id,
-                cluster_id,
-                index_id,
-            ).execute(&mut *tx).await?;
+                    "
+                    INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
+                    VALUES ('C', ?, ?, ?, ?, ?, ?)
+                    ",
+                    id,
+                    offset,
+                    content_type,
+                    block_id,
+                    cluster_id,
+                    index_id,
+                ).execute(&mut *tx).await?;
     }
+
+    Ok(())
+}
+
+async fn sync_chunk_file(
+    id: &ChunkId,
+    etag: &Etag,
+    tx: &mut SqliteConnection,
+) -> anyhow::Result<()> {
+    tracing::debug!(chunk_id = %id, "syncing chunk");
+
+    let id = id.as_bytes().as_slice();
+    let etag = etag.as_ref();
+
+    let rows_affected = sqlx::query!("DELETE FROM chunk_files WHERE chunk_id = ?", id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if rows_affected > 0 {
+        tracing::trace!(rows_affected, "deleted chunk related entries from database");
+    }
+
+    sqlx::query!(
+        "INSERT INTO chunk_files (chunk_id, etag)
+             VALUES (?, ?)
+            ",
+        id,
+        etag
+    )
+    .execute(&mut *tx)
+    .await?;
 
     Ok(())
 }
