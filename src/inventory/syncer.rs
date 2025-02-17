@@ -302,7 +302,6 @@ async fn pack_chunks(
                 sync_chunk_file(chunk.id(), &etag, tx.as_mut()).await?;
                 sync_chunk(&chunk, tx.as_mut()).await?;
                 tx.commit().await?;
-                println!("committed");
             }
         }
     }

@@ -19,6 +19,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 compact_bytes = "0.1"
 crc = "3.2"
 derivative = "2.2"
+duration-str = "0.13"
 either = "1"
 futures = "0.3"
 hex = "0.4"

@@ -159,7 +159,8 @@ BEGIN
                            (ac.block_id = NEW.block_id) OR
                            (ac.cluster_id = NEW.cluster_id) OR
                            (ac.index_id = NEW.index_id)
-                           ));
+                           ))
+    AND critical > 0; -- todo: investigate critical counter becoming negative
 END;
 
 

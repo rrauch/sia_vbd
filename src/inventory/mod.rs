@@ -1679,7 +1679,9 @@ async fn sync_chunk_index(
         .execute(&mut *tx)
         .await?;
 
-        sync_chunk(&chunk, tx).await?;
+        if chunk.len() > 0 {
+            sync_chunk(&chunk, tx).await?;
+        }
     }
 
     Ok(())

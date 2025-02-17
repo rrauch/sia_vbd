@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail};
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
+use duration_str::deserialize_duration;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use indicatif::ProgressBar;
@@ -99,7 +100,7 @@ enum VolumeCommands {
 struct Config {
     server: BTreeMap<String, ServerConfig>,
     repository: BTreeMap<String, RepoConfig>,
-    volume: Vec<VolumeConfig>,
+    volume: Option<Vec<VolumeConfig>>,
 }
 
 fn default_max_write_buffer() -> ByteSize {
@@ -159,8 +160,10 @@ struct VolumeConfig {
     #[serde(default = "default_branch")]
     branch: String,
     #[serde(default = "default_initial_sync_delay")]
+    #[serde(deserialize_with = "deserialize_duration")]
     initial_sync_delay: Duration,
     #[serde(default = "default_sync_interval")]
+    #[serde(deserialize_with = "deserialize_duration")]
     sync_interval: Duration,
     #[serde(default = "default_read_only")]
     read_only: bool,
@@ -380,14 +383,15 @@ async fn main() -> anyhow::Result<()> {
         bail!("Invalid Configuration: No [repository]'s found. Please configure at least one repository.");
     }
 
-    if config.volume.is_empty() {
+    let volumes = config.volume.unwrap_or_else(|| vec![]);
+    if volumes.is_empty() {
         bail!(
             "Invalid Configuration: No [[volume]]'s found. Please configure at least one volume."
         );
     }
 
-    let mut vol_set = HashSet::with_capacity(config.volume.len());
-    for config in config.volume.iter() {
+    let mut vol_set = HashSet::with_capacity(volumes.len());
+    for config in volumes.iter() {
         let key = (config.repository.as_str(), config.volume_id.as_str());
         if vol_set.contains(&key) {
             bail!(
@@ -399,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
         vol_set.insert(key);
     }
 
-    for config in config.volume {
+    for config in volumes {
         let repo = repositories.get(&config.repository).ok_or(anyhow!(
             "configuration error: repository [{}] not found",
             &config.repository

@@ -334,7 +334,7 @@ impl Volume for FsVolume {
         content: impl AsyncRead + Send + Unpin + 'static,
     ) -> Result<Etag, Self::Error> {
         let path = self.chunk_index_dir.join(format!("{}.chidx", id));
-        write_bak(&path, content).await?;
+        write_file(&path, content).await?;
         let etag = etag(&path).await?;
         Ok(etag)
     }
@@ -402,7 +402,7 @@ impl Volume for FsVolume {
 
     async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
         let path = self.commits_dir.join(format!("{}.branch", branch.as_ref()));
-        write_bak(&path, Cursor::new(commit)).await?;
+        write_file(&path, Cursor::new(commit)).await?;
         Ok(())
     }
 
@@ -451,7 +451,7 @@ async fn read_volume_info(volume_dir: &Path) -> Result<Bytes, anyhow::Error> {
     read_file(&file, MAX_VOLUME_FILE_SIZE).await
 }
 
-async fn write_bak(
+async fn write_file(
     final_path: &Path,
     reader: impl AsyncRead + Send + Unpin + 'static,
 ) -> Result<(), anyhow::Error> {
@@ -478,6 +478,7 @@ async fn write_bak(
         tokio::fs::rename(&final_path, &bak_path).await?;
     }
     tokio::fs::rename(&temp_path, &final_path).await?;
+    let _ = tokio::fs::remove_file(&bak_path).await;
     Ok(())
 }
 
