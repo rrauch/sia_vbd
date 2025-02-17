@@ -1,12 +1,13 @@
 use crate::inventory::chunk::ChunkIndexId;
 use crate::io::{AsyncReadExtBuffered, TokioFile};
-use crate::repository::{ChunkId, Reader, Repository, Stream, Volume};
+use crate::repository::{ChunkId, Reader, Repository, Stream, Volume, VolumeInfo};
 use crate::vbd::{BranchName, VbdId};
 use crate::Etag;
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use futures::io::Cursor;
 use futures::{AsyncRead, AsyncSeekExt, AsyncWriteExt, StreamExt};
+use std::fmt::{Display, Formatter};
 use std::future;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -16,12 +17,16 @@ pub struct FsRepository {
 }
 
 impl FsRepository {
-    pub async fn new(root_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root_dir = root_dir.as_ref().to_path_buf();
-        if !is_dir(&root_dir).await? {
-            bail!("{} not a directory", root_dir.display())
+    pub fn new(root_dir: impl AsRef<Path>) -> Self {
+        Self {
+            root_dir: root_dir.as_ref().to_path_buf(),
         }
-        Ok(Self { root_dir })
+    }
+}
+
+impl Display for FsRepository {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Local File System [{}]", self.root_dir.display())
     }
 }
 
@@ -61,6 +66,40 @@ impl Repository for FsRepository {
             bail!("volume {} not found", vbd_id);
         }
         Ok(FsVolume::new(volume_dir))
+    }
+
+    async fn details(
+        &self,
+        vbd_id: &VbdId,
+    ) -> Result<
+        (
+            VolumeInfo,
+            impl Stream<Item = Result<(BranchName, Bytes), Self::Error>> + 'static,
+        ),
+        Self::Error,
+    > {
+        let volume_dir = self.root_dir.join(format!("{}", vbd_id));
+        if !is_dir(&volume_dir).await? {
+            bail!("volume {} not found", vbd_id);
+        }
+        let volume_info = read_volume_info(&volume_dir).await?;
+        let volume_info = super::read_volume(volume_info).await?;
+        let commits_dir = volume_dir.join("commits");
+
+        let stream = list_branches(&commits_dir).await?.then(move |r| {
+            let commits_dir = commits_dir.clone();
+            async move {
+                match r {
+                    Ok(branch_name) => match read_commit(&commits_dir, &branch_name).await {
+                        Ok(bytes) => Ok((branch_name, bytes)),
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => Err(err),
+                }
+            }
+        });
+
+        Ok((volume_info, Box::pin(stream)))
     }
 
     async fn create(
@@ -203,8 +242,7 @@ impl Volume for FsVolume {
     type Error = anyhow::Error;
 
     async fn read_info(&self) -> Result<Bytes, Self::Error> {
-        let file = self.volume_dir.join("sia_vbd.volume");
-        read_file(&file, MAX_VOLUME_FILE_SIZE).await
+        read_volume_info(&self.volume_dir).await
     }
 
     async fn chunks(
@@ -359,32 +397,7 @@ impl Volume for FsVolume {
     async fn branches(
         &self,
     ) -> Result<impl Stream<Item = Result<BranchName, Self::Error>> + 'static, Self::Error> {
-        let stream = tokio_stream::wrappers::ReadDirStream::new(
-            tokio::fs::read_dir(&self.commits_dir).await?,
-        );
-        let stream = stream
-            .then(|r| async move {
-                match r {
-                    Ok(e) => {
-                        if let Some(file_name) = e.file_name().to_str() {
-                            if let Some(branch) = file_name.strip_suffix(".branch") {
-                                Ok(match branch.try_into() {
-                                    Ok(branch) => Some(branch),
-                                    Err(_) => None,
-                                })
-                            } else {
-                                Ok(None)
-                            }
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    Err(err) => Err(err.into()),
-                }
-            })
-            .filter_map(|e| future::ready(e.transpose()));
-
-        Ok(Box::pin(stream))
+        list_branches(&self.commits_dir).await
     }
 
     async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
@@ -394,9 +407,48 @@ impl Volume for FsVolume {
     }
 
     async fn read_commit(&self, branch: &BranchName) -> Result<Bytes, Self::Error> {
-        let path = self.commits_dir.join(format!("{}.branch", branch.as_ref()));
-        read_file(&path, MAX_COMMIT_FILE_SIZE).await
+        read_commit(&self.commits_dir, branch).await
     }
+}
+
+async fn read_commit(commits_dir: &Path, branch: &BranchName) -> Result<Bytes, anyhow::Error> {
+    let path = commits_dir.join(format!("{}.branch", branch.as_ref()));
+    read_file(&path, MAX_COMMIT_FILE_SIZE).await
+}
+
+async fn list_branches(
+    commits_dir: &Path,
+) -> Result<impl Stream<Item = Result<BranchName, anyhow::Error>> + 'static, anyhow::Error> {
+    let stream =
+        tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(commits_dir).await?);
+    let stream = stream
+        .then(|r| async move {
+            match r {
+                Ok(e) => {
+                    if let Some(file_name) = e.file_name().to_str() {
+                        if let Some(branch) = file_name.strip_suffix(".branch") {
+                            Ok(match branch.try_into() {
+                                Ok(branch) => Some(branch),
+                                Err(_) => None,
+                            })
+                        } else {
+                            Ok(None)
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Err(err) => Err(err.into()),
+            }
+        })
+        .filter_map(|e| future::ready(e.transpose()));
+
+    Ok(Box::pin(stream))
+}
+
+async fn read_volume_info(volume_dir: &Path) -> Result<Bytes, anyhow::Error> {
+    let file = volume_dir.join("sia_vbd.volume");
+    read_file(&file, MAX_VOLUME_FILE_SIZE).await
 }
 
 async fn write_bak(

@@ -13,32 +13,35 @@ async-trait = "0.1"
 bitflags = "2.6"
 blake3 = "1.5"
 bytes = "1"
-bytesize = "1.3"
+bytesize = { version = "1.3", features = ["serde"] }
 chrono = "0.4"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 compact_bytes = "0.1"
 crc = "3.2"
 derivative = "2.2"
 either = "1"
 futures = "0.3"
 hex = "0.4"
+indicatif = "0.17"
 num_enum = "0.7"
 once_cell = "1.20"
 pin-project-lite = "0.2"
 prost = "0.13"
 rangemap = "1.5"
 renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "cf8ba6197c5b0d7e843035e9231505a5b99623b1", features = ["seek"] }
+serde = { version = "1.0", features = ["derive"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
-tenthash = "0.4"
+tenthash = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.41", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
+toml = { version = "0.8", features = ["preserve_order", "display"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 twox-hash = { version = "2.1", features = ["xxhash3_128"] }
 uuid = { version = "1.11", features = ["v7"] }
-url = "2.5"
+url = { version = "2.5", features = ["serde"] }
 
 [build-dependencies]
 anyhow = "1"

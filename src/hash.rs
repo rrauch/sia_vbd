@@ -30,7 +30,7 @@ impl HashAlgorithm {
     /// Creates a new hasher instance for incremental hashing.
     pub(crate) fn new(&self) -> Hasher {
         match self {
-            HashAlgorithm::Tent => Hasher::Tent(tenthash::TentHasher::new()),
+            HashAlgorithm::Tent => Hasher::Tent(tenthash::TentHash::new()),
             HashAlgorithm::Blake3 => Hasher::Blake3(blake3::Hasher::new()),
             HashAlgorithm::XXH3 => Hasher::XXH3(twox_hash::XxHash3_128::new()),
         }
@@ -38,7 +38,7 @@ impl HashAlgorithm {
 
     pub(crate) fn as_str(&self) -> &str {
         match self {
-            HashAlgorithm::Tent => "TentHash v0.4",
+            HashAlgorithm::Tent => "TentHash",
             HashAlgorithm::Blake3 => "BLAKE3",
             HashAlgorithm::XXH3 => "XXH128",
         }
@@ -52,7 +52,7 @@ impl FromStr for HashAlgorithm {
         match s.trim().to_ascii_lowercase().as_str() {
             "blake3" => Ok(HashAlgorithm::Blake3),
             "xxh128" => Ok(HashAlgorithm::XXH3),
-            "tent0_4" => Ok(HashAlgorithm::Tent),
+            "tent" => Ok(HashAlgorithm::Tent),
             _ => Err(format!("'{}' is not a known hash algorithm", s)),
         }
     }
@@ -60,7 +60,7 @@ impl FromStr for HashAlgorithm {
 
 #[derive(Clone)]
 pub(crate) enum Hasher {
-    Tent(tenthash::TentHasher),
+    Tent(tenthash::TentHash),
     Blake3(blake3::Hasher),
     XXH3(twox_hash::XxHash3_128),
 }

@@ -180,6 +180,9 @@ impl Builder {
         force_read_only: bool,
     ) -> Result<Self, anyhow::Error> {
         let name = name.to_string();
+        if self.exports.contains_key(&name) {
+            bail!("export {} already defined", name);
+        }
         let export = Export::new(name.clone(), block_device, force_read_only).await?;
         self.exports.insert(name, export);
         Ok(self)
@@ -188,7 +191,7 @@ impl Builder {
     pub fn with_default_export<S: ToString>(mut self, name: S) -> Result<Self, anyhow::Error> {
         let name = name.to_string();
         if !self.exports.contains_key(&name) {
-            anyhow::bail!("unknown export: {}", name);
+            bail!("unknown export: {}", name);
         }
         self.default_export = Some(name.to_string());
         Ok(self)

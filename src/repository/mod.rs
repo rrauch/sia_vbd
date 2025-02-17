@@ -21,10 +21,10 @@ use chrono::{DateTime, Utc};
 use futures::io::Cursor;
 use futures::lock::OwnedMutexGuard;
 use futures::{
-    AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SinkExt, TryStreamExt,
+    AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SinkExt, StreamExt, TryStreamExt,
 };
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
 use std::io::{ErrorKind, SeekFrom};
 use std::sync::Mutex;
@@ -58,6 +58,18 @@ pub trait Repository: Send {
         &self,
         vbd_id: &VbdId,
     ) -> impl Future<Output = Result<Self::Volume, Self::Error>> + Send;
+    fn details(
+        &self,
+        vbd_id: &VbdId,
+    ) -> impl Future<
+        Output = Result<
+            (
+                VolumeInfo,
+                impl Stream<Item = Result<(BranchName, Bytes), Self::Error>> + 'static,
+            ),
+            Self::Error,
+        >,
+    > + Send;
     fn create(
         &self,
         vbd_id: &VbdId,
@@ -155,6 +167,15 @@ pub enum RepositoryHandler {
     RenterdRepo(RenterdRepository),
 }
 
+impl Display for RepositoryHandler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FsRepo(repo) => repo.fmt(f),
+            Self::RenterdRepo(repo) => repo.fmt(f),
+        }
+    }
+}
+
 impl RepositoryHandler {
     pub async fn list_volumes(
         &self,
@@ -167,6 +188,47 @@ impl RepositoryHandler {
                 Box::new(renterd.list().await?) as Box<dyn Stream<Item = anyhow::Result<VbdId>>>
             }
         })
+    }
+
+    pub async fn volume_details(
+        &self,
+        vbd_id: &VbdId,
+    ) -> anyhow::Result<
+        (
+            VolumeInfo,
+            impl Stream<Item = anyhow::Result<(BranchName, BranchInfo)>> + 'static + use<'_>,
+        ),
+        anyhow::Error,
+    > {
+        let (info, stream) = match self {
+            Self::FsRepo(fs) => {
+                let (info, stream) = fs.details(vbd_id).await?;
+                (
+                    info,
+                    Box::new(stream) as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
+                )
+            }
+            Self::RenterdRepo(renterd) => {
+                let (info, stream) = renterd.details(vbd_id).await?;
+                (
+                    info,
+                    Box::new(stream) as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
+                )
+            }
+        };
+
+        let specs = info.specs.clone();
+        let stream = stream.then(move |r| {
+            let specs = specs.clone();
+            async move {
+                match r {
+                    Ok((name, data)) => read_branch(data, specs).await.map(|bi| (name, bi)),
+                    Err(err) => Err(err),
+                }
+            }
+        });
+
+        Ok((info, Box::pin(stream)))
     }
 
     pub async fn open_volume(
@@ -763,13 +825,13 @@ impl From<RenterdVolume> for WrappedVolume {
 }
 
 #[derive(Clone)]
-pub(crate) struct VolumeInfo {
+pub struct VolumeInfo {
     pub specs: FixedSpecs,
     pub created: DateTime<Utc>,
     pub name: Option<String>,
 }
 
 #[derive(Clone)]
-pub(crate) struct BranchInfo {
+pub struct BranchInfo {
     pub commit: Commit,
 }

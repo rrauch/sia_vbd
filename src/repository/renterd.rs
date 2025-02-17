@@ -1,7 +1,9 @@
 use crate::hash::HashAlgorithm;
 use crate::inventory::chunk::{ChunkId, ChunkIndexId};
 use crate::io::AsyncReadExtBuffered;
-use crate::repository::{Reader, Repository, Stream, Volume, VOL_MAGIC_NUMBER};
+use crate::repository::{
+    read_volume, Reader, Repository, Stream, Volume, VolumeInfo, VOL_MAGIC_NUMBER,
+};
 use crate::serde::encoded::{Decoded, Decoder};
 use crate::vbd::{BlockSize, BranchName, ClusterSize, FixedSpecs, VbdId};
 use crate::Etag;
@@ -14,6 +16,7 @@ use renterd_client::bus::object::{Metadata, RenameMode};
 use std::fmt::{Debug, Display, Formatter};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use url::Url;
 use uuid::Uuid;
 
 const MAX_VOLUME_FILE_SIZE: u64 = 4096;
@@ -21,14 +24,28 @@ const MAX_COMMIT_FILE_SIZE: u64 = 4096;
 
 pub struct RenterdRepository {
     renterd: renterd_client::Client,
+    endpoint: Url,
     bucket: Bucket,
     path: Path,
 }
 
+impl Display for RenterdRepository {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "renterd [endpoint={}, bucket={}, path={}]",
+            self.endpoint,
+            self.bucket.as_ref(),
+            self.path.as_ref()
+        )
+    }
+}
+
 impl RenterdRepository {
-    pub fn new(renterd: renterd_client::Client, bucket: Bucket, path: Path) -> Self {
+    pub fn new(renterd: renterd_client::Client, endpoint: Url, bucket: Bucket, path: Path) -> Self {
         Self {
             renterd,
+            endpoint,
             bucket,
             path,
         }
@@ -76,6 +93,69 @@ impl Repository for RenterdRepository {
             self.renterd.clone(),
         )
         .await?)
+    }
+
+    async fn details(
+        &self,
+        vbd_id: &VbdId,
+    ) -> Result<
+        (
+            VolumeInfo,
+            impl Stream<Item = Result<(BranchName, Bytes), Self::Error>> + 'static,
+        ),
+        Self::Error,
+    > {
+        let volume_path = self
+            .path
+            .try_join(format!("{}.volume", vbd_id).as_str(), true)?;
+        let volume_info_path = volume_path.try_join("sia_vbd.volume", false)?;
+        let volume_info =
+            read_volume(read_volume_info(&self.renterd, &volume_info_path, &self.bucket).await?)
+                .await?;
+        let commits_path = volume_path.try_join("commits", true)?;
+        let renterd = self.renterd.clone();
+        let bucket = self.bucket.clone();
+
+        let stream = list_dir(&self.renterd, &self.bucket, &commits_path)
+            .await?
+            .filter_map(|res| async {
+                match res.map(|o| {
+                    o.as_file()
+                        .map(|f| {
+                            f.name()
+                                .strip_suffix(".branch")
+                                .map(|name| BranchName::try_from(name))
+                        })
+                        .flatten()
+                }) {
+                    Ok(Some(Ok(name))) => Some(Ok(name)),
+                    Ok(None) => None,
+                    Ok(Some(Err(err))) => Some(Err(err)),
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .then(move |r| {
+                let renterd = renterd.clone();
+                let bucket = bucket.clone();
+                let commits_path = commits_path.clone();
+                async move {
+                    match r {
+                        Ok(branch_name) => {
+                            match commits_path
+                                .try_join(format!("{}.branch", branch_name).as_str(), false)
+                            {
+                                Ok(path) => read_commit(&renterd, &path, &bucket)
+                                    .await
+                                    .map(|data| (branch_name, data)),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+            });
+
+        Ok((volume_info, Box::pin(stream)))
     }
 
     async fn create(
@@ -272,17 +352,7 @@ impl Volume for RenterdVolume {
     type Error = anyhow::Error;
 
     async fn read_info(&self) -> Result<Bytes, Self::Error> {
-        let mut reader = read_file(
-            &self.renterd,
-            self.volume_info.path(),
-            &self.bucket,
-            0,
-            Some(MAX_VOLUME_FILE_SIZE),
-        )
-        .await?;
-        let mut buf = BytesMut::with_capacity(MAX_VOLUME_FILE_SIZE as usize);
-        reader.read_all_buffered(&mut buf).await?;
-        Ok(buf.freeze())
+        read_volume_info(&self.renterd, self.volume_info.path(), &self.bucket).await
     }
 
     async fn chunks(
@@ -499,18 +569,19 @@ impl Volume for RenterdVolume {
 
     async fn read_commit(&self, branch: &BranchName) -> Result<Bytes, Self::Error> {
         let path = self.commit_path(branch)?;
-        let mut reader = read_file(
-            &self.renterd,
-            &path,
-            &self.bucket,
-            0,
-            Some(MAX_COMMIT_FILE_SIZE),
-        )
-        .await?;
-        let mut buf = BytesMut::with_capacity(MAX_COMMIT_FILE_SIZE as usize);
-        reader.read_all_buffered(&mut buf).await?;
-        Ok(buf.freeze())
+        read_commit(&self.renterd, &path, &self.bucket).await
     }
+}
+
+async fn read_commit(
+    renterd: &renterd_client::Client,
+    path: &Path,
+    bucket: &Bucket,
+) -> anyhow::Result<Bytes> {
+    let mut reader = read_file(&renterd, &path, &bucket, 0, Some(MAX_COMMIT_FILE_SIZE)).await?;
+    let mut buf = BytesMut::with_capacity(MAX_COMMIT_FILE_SIZE as usize);
+    reader.read_all_buffered(&mut buf).await?;
+    Ok(buf.freeze())
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -925,4 +996,15 @@ async fn read_file(
     }
 
     Ok(dl_object.open_seekable_stream(offset).await?)
+}
+
+async fn read_volume_info(
+    renterd: &renterd_client::Client,
+    path: &Path,
+    bucket: &Bucket,
+) -> anyhow::Result<Bytes> {
+    let mut reader = read_file(renterd, path, bucket, 0, Some(MAX_VOLUME_FILE_SIZE)).await?;
+    let mut buf = BytesMut::with_capacity(MAX_VOLUME_FILE_SIZE as usize);
+    reader.read_all_buffered(&mut buf).await?;
+    Ok(buf.freeze())
 }

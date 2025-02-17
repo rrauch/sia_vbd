@@ -1533,6 +1533,16 @@ pub enum ClusterSize {
     Cs256,
 }
 
+impl Display for ClusterSize {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Cs256 => "256",
+        };
+
+        write!(f, "{}", s)
+    }
+}
+
 impl TryFrom<usize> for ClusterSize {
     type Error = anyhow::Error;
 
@@ -1570,6 +1580,18 @@ pub enum BlockSize {
     Bs16k,
     Bs64k,
     Bs256k,
+}
+
+impl Display for BlockSize {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Bs16k => "16KiB",
+            Self::Bs64k => "64KiB",
+            Self::Bs256k => "256KiB",
+        };
+
+        write!(f, "{}", s)
+    }
 }
 
 impl TryFrom<usize> for BlockSize {
