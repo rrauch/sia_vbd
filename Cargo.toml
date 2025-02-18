@@ -44,6 +44,9 @@ twox-hash = { version = "2.1", features = ["xxhash3_128"] }
 uuid = { version = "1.11", features = ["v7"] }
 url = { version = "2.5", features = ["serde"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.4"
+
 [build-dependencies]
 anyhow = "1"
 prost-build = "0.13"

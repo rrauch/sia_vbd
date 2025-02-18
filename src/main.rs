@@ -473,6 +473,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    notify_ready().await;
+
     while let Some((res, name)) = runner_futs.next().await {
         if let Err(err) = res {
             tracing::error!(error = %err, name, "server error");
@@ -717,6 +719,7 @@ fn shutdown_listener(guards: impl Iterator<Item = RunGuard>) -> impl Future<Outp
                 tracing::info!("SIGTERM received, shutting down")
             }
         }
+        notify_stopping().await;
     }
 }
 
@@ -755,3 +758,25 @@ fn uds_supported() -> bool {
 fn uds_supported() -> bool {
     false
 }
+
+#[cfg(target_os = "linux")]
+async fn notify_ready() {
+    let _ = tokio::task::spawn_blocking(|| {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+async fn notify_stopping() {
+    let _ = tokio::task::spawn_blocking(|| {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+    })
+    .await;
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn notify_ready() {}
+
+#[cfg(not(target_os = "linux"))]
+async fn notify_stopping() {}
