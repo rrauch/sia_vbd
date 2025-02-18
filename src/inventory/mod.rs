@@ -2,7 +2,7 @@ pub(crate) mod chunk;
 mod syncer;
 
 use crate::hash::{Hash, HashAlgorithm};
-use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId, ChunkIndex, ChunkIndexId};
+use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId, Manifest, ManifestId};
 use crate::inventory::syncer::Syncer;
 use crate::repository::{BranchInfo, VolumeHandler};
 use crate::vbd::{
@@ -180,7 +180,7 @@ impl Inventory {
         };
 
         this.sync_chunks().await?;
-        this.sync_chunk_indices().await?;
+        this.sync_manifests().await?;
         this.sync_unindexed_chunk_content().await?;
         this.sync_wal_files().await?;
         this.sync_commits().await?;
@@ -960,55 +960,55 @@ impl Inventory {
     }
 
     #[instrument[skip_all]]
-    pub async fn sync_chunk_indices(&mut self) -> anyhow::Result<()> {
-        tracing::info!("syncing chunk indices");
-        let available_indices = self
+    pub async fn sync_manifests(&mut self) -> anyhow::Result<()> {
+        tracing::info!("syncing manifests");
+        let available_manifests = self
             .volume
-            .list_chunk_indices()
+            .list_manifests()
             .await?
             .collect::<HashMap<_, _>>();
         let mut tx = self.pool.write().begin().await?;
 
-        let mut known_indices: HashMap<ChunkIndexId, Etag> = HashMap::default();
-        for r in sqlx::query!("SELECT id, etag FROM chunk_indices")
+        let mut known_manifests: HashMap<ManifestId, Etag> = HashMap::default();
+        for r in sqlx::query!("SELECT id, etag FROM manifests")
             .fetch_all(tx.as_mut())
             .await?
             .into_iter()
         {
-            let id = match ChunkIndexId::try_from(r.id.as_slice()) {
+            let id = match ManifestId::try_from(r.id.as_slice()) {
                 Ok(id) => id,
                 Err(err) => {
-                    tracing::error!(error = %err, chunk_index_id = ?r.id, "invalid chunk_index_id found in database, removing");
-                    sqlx::query!("DELETE FROM chunk_indices WHERE id = ?", r.id)
+                    tracing::error!(error = %err, manifest_id = ?r.id, "invalid manifest_id found in database, removing");
+                    sqlx::query!("DELETE FROM manifests WHERE id = ?", r.id)
                         .execute(tx.as_mut())
                         .await?;
                     continue;
                 }
             };
-            known_indices.insert(id, Etag::from(r.etag));
+            known_manifests.insert(id, Etag::from(r.etag));
         }
 
-        for (id, etag) in available_indices {
+        for (id, etag) in available_manifests {
             let mut in_sync = false;
-            if let Some(known_etag) = known_indices.remove(&id) {
+            if let Some(known_etag) = known_manifests.remove(&id) {
                 if &known_etag == &etag {
                     in_sync = true;
                 }
             }
             if !in_sync {
-                tracing::info!(chunk_index_id = %id, "chunk_index needs syncing");
-                let chunk_index = self.volume.chunk_index(&id).await?;
-                sync_chunk_index(&chunk_index, &etag, tx.as_mut()).await?;
+                tracing::info!(manifest_id = %id, "manifest needs syncing");
+                let manifest = self.volume.manifest(&id).await?;
+                sync_manifest(&manifest, &etag, tx.as_mut()).await?;
             }
         }
 
-        for obsolete in known_indices.into_keys() {
+        for obsolete in known_manifests.into_keys() {
             tracing::debug!(
-                chunk_index_id = %obsolete,
-                "removing obsolete chunk_index from inventory",
+                manifest_id = %obsolete,
+                "removing obsolete manifest from inventory",
             );
             let id = obsolete.as_bytes().as_slice();
-            sqlx::query!("DELETE FROM chunk_indices WHERE id = ?", id)
+            sqlx::query!("DELETE FROM manifests WHERE id = ?", id)
                 .execute(tx.as_mut())
                 .await?;
         }
@@ -1635,29 +1635,29 @@ fn try_from_db_hash(value: String) -> anyhow::Result<HashAlgorithm> {
     }
 }
 
-async fn sync_chunk_index(
-    index: &ChunkIndex,
+async fn sync_manifest(
+    manifest: &Manifest,
     etag: &Etag,
     tx: &mut SqliteConnection,
 ) -> anyhow::Result<()> {
-    tracing::debug!(chunk_index_id = %&index.id, "syncing chunk_index");
+    tracing::debug!(manifest_id = %&manifest.id, "syncing manifest");
 
-    let id = index.id.as_bytes().as_slice();
+    let id = manifest.id.as_bytes().as_slice();
     let etag = etag.as_ref();
 
-    let rows_affected = sqlx::query!("DELETE FROM chunk_indices WHERE id = ?", id)
+    let rows_affected = sqlx::query!("DELETE FROM manifests WHERE id = ?", id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
     if rows_affected > 0 {
         tracing::trace!(
             rows_affected,
-            "deleted chunk_index related entries from database"
+            "deleted manifest related entries from database"
         );
     }
 
     sqlx::query!(
-        "INSERT INTO chunk_indices (id, etag)
+        "INSERT INTO manifests (id, etag)
              VALUES (?, ?)
             ",
         id,
@@ -1666,11 +1666,11 @@ async fn sync_chunk_index(
     .execute(&mut *tx)
     .await?;
 
-    for chunk in index.chunks.iter() {
+    for chunk in manifest.chunks.iter() {
         let chunk_id = chunk.id().as_bytes().as_slice();
         sqlx::query!(
             "
-            INSERT INTO chunk_index_content (index_id, chunk_id)
+            INSERT INTO manifest_content (manifest_id, chunk_id)
             VALUES (?, ?)
             ",
             id,

@@ -1,5 +1,5 @@
 pub(crate) mod volume {
-    use crate::inventory::chunk::ChunkIndexId;
+    use crate::inventory::chunk::ManifestId;
     use anyhow::anyhow;
     use std::collections::BTreeMap;
     use std::ops::Deref;
@@ -113,34 +113,34 @@ pub(crate) mod volume {
         }
     }
 
-    impl From<ChunkIndexId> for crate::serde::protos::Uuid {
-        fn from(value: ChunkIndexId) -> Self {
+    impl From<ManifestId> for crate::serde::protos::Uuid {
+        fn from(value: ManifestId) -> Self {
             value.deref().into()
         }
     }
 
-    impl From<crate::serde::protos::Uuid> for ChunkIndexId {
+    impl From<crate::serde::protos::Uuid> for ManifestId {
         fn from(value: crate::serde::protos::Uuid) -> Self {
             Into::<Uuid>::into(value).into()
         }
     }
 
-    impl From<&crate::inventory::chunk::ChunkIndex> for ChunkIndexInfo {
-        fn from(value: &crate::inventory::chunk::ChunkIndex) -> Self {
+    impl From<&crate::inventory::chunk::Manifest> for Manifest {
+        fn from(value: &crate::inventory::chunk::Manifest) -> Self {
             Self {
-                chunk_index_id: Some(value.id.into()),
+                manifest_id: Some(value.id.into()),
                 specs: Some((&value.specs).into()),
                 created: Some((&value.created).into()),
             }
         }
     }
 
-    impl TryFrom<ChunkIndexInfo> for crate::inventory::chunk::ChunkIndex {
+    impl TryFrom<Manifest> for crate::inventory::chunk::Manifest {
         type Error = anyhow::Error;
 
-        fn try_from(value: ChunkIndexInfo) -> Result<Self, Self::Error> {
+        fn try_from(value: Manifest) -> Result<Self, Self::Error> {
             let id = value
-                .chunk_index_id
+                .manifest_id
                 .map(|id| id.into())
                 .ok_or(anyhow!("id is missing"))?;
             let specs = value
@@ -154,7 +154,7 @@ pub(crate) mod volume {
                 .transpose()?
                 .ok_or(anyhow!("created is missing"))?;
 
-            Ok(crate::inventory::chunk::ChunkIndex {
+            Ok(crate::inventory::chunk::Manifest {
                 id,
                 specs,
                 created,

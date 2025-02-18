@@ -4,7 +4,7 @@ pub mod renterd;
 
 use crate::hash::HashAlgorithm;
 use crate::inventory::chunk::{
-    read_chunk_header, Chunk, ChunkContent, ChunkId, ChunkIndex, ChunkIndexId,
+    read_chunk_header, Chunk, ChunkContent, ChunkId, Manifest, ManifestId,
 };
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::fs::{FsRepository, FsVolume};
@@ -32,16 +32,16 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::instrument;
 use uuid::Uuid;
 
-const VOL_MAGIC_NUMBER: &'static [u8; 16] = &[
+const VOLUME_MAGIC_NUMBER: &'static [u8; 16] = &[
     0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x56, 0x4F, 0x4C, 0x00, 0x00, 0x01,
 ];
 
-const BRA_MAGIC_NUMBER: &'static [u8; 16] = &[
+const BRANCH_MAGIC_NUMBER: &'static [u8; 16] = &[
     0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x42, 0x52, 0x41, 0x00, 0x00, 0x01,
 ];
 
-const IDX_MAGIC_NUMBER: &'static [u8; 16] = &[
-    0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x49, 0x44, 0x58, 0x00, 0x00, 0x01,
+const MANIFEST_MAGIC_NUMBER: &'static [u8; 16] = &[
+    0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x4D, 0x41, 0x4E, 0x00, 0x00, 0x01,
 ];
 
 pub trait Repository: Send {
@@ -95,29 +95,29 @@ pub(crate) trait Volume: Send {
         >,
     > + Send;
 
-    fn chunk_indices(
+    fn manifests(
         &self,
     ) -> impl Future<
         Output = Result<
-            impl Stream<Item = Result<(ChunkIndexId, Etag), Self::Error>> + 'static,
+            impl Stream<Item = Result<(ManifestId, Etag), Self::Error>> + 'static,
             Self::Error,
         >,
     > + Send;
 
-    fn read_chunk_index(
+    fn read_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
     ) -> impl Future<Output = Result<impl Reader + 'static, Self::Error>> + Send;
 
-    fn write_chunk_index(
+    fn write_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
         content: impl AsyncRead + Send + Unpin + 'static,
     ) -> impl Future<Output = Result<Etag, Self::Error>> + Send;
 
-    fn delete_chunk_index(
+    fn delete_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     fn read_chunk(
@@ -383,30 +383,30 @@ impl VolumeHandler {
         Ok(read_chunk_header(&mut reader).await?)
     }
 
-    pub async fn list_chunk_indices(
+    pub async fn list_manifests(
         &self,
-    ) -> anyhow::Result<impl Iterator<Item = (ChunkIndexId, Etag)> + 'static> {
-        self.wrapper.list_chunk_indices().await
+    ) -> anyhow::Result<impl Iterator<Item = (ManifestId, Etag)> + 'static> {
+        self.wrapper.list_manifests().await
     }
 
-    pub async fn chunk_index(&self, id: &ChunkIndexId) -> anyhow::Result<ChunkIndex> {
-        let mut reader = self.wrapper.chunk_index_reader(id).await?;
-        Ok(read_chunk_index(&mut reader, self.volume_info.specs.clone()).await?)
+    pub async fn manifest(&self, id: &ManifestId) -> anyhow::Result<Manifest> {
+        let mut reader = self.wrapper.manifest_reader(id).await?;
+        Ok(read_manifest(&mut reader, self.volume_info.specs.clone()).await?)
     }
 
-    pub async fn update_chunk_index(&self, chunk_index: ChunkIndex) -> anyhow::Result<Etag> {
+    pub async fn update_manifest(&self, manifest: Manifest) -> anyhow::Result<Etag> {
         let (reader, writer) = tokio::io::duplex(1024 * 64);
-        let id = chunk_index.id.clone();
+        let id = manifest.id.clone();
         tokio::task::spawn(async move {
             let mut writer = writer.compat_write();
-            let _ = write_chunk_index(&chunk_index, &mut writer).await;
+            let _ = write_manifest(&manifest, &mut writer).await;
         });
 
-        Ok(self.wrapper.write_chunk_index(&id, reader.compat()).await?)
+        Ok(self.wrapper.write_manifest(&id, reader.compat()).await?)
     }
 
-    pub async fn delete_chunk_index(&self, id: &ChunkIndexId) -> anyhow::Result<()> {
-        Ok(self.wrapper.delete_chunk_index(id).await?)
+    pub async fn delete_manifest(&self, id: &ManifestId) -> anyhow::Result<()> {
+        Ok(self.wrapper.delete_manifest(id).await?)
     }
 
     pub fn volume_info(&self) -> &VolumeInfo {
@@ -514,18 +514,18 @@ impl VolumeHandler {
     }
 }
 
-async fn write_chunk_index<IO: AsyncWrite + Send + Unpin>(
-    chunk_index: &ChunkIndex,
+async fn write_manifest<IO: AsyncWrite + Send + Unpin>(
+    manifest: &Manifest,
     mut out: IO,
 ) -> anyhow::Result<()> {
-    out.write_all(IDX_MAGIC_NUMBER).await?;
+    out.write_all(MANIFEST_MAGIC_NUMBER).await?;
     let mut sink = EncodingSinkBuilder::from_writer(&mut out)
         .with_compressor(Compressor::zstd(1024, 3)?)
         .build();
 
-    sink.send(chunk_index.into()).await?;
+    sink.send(manifest.into()).await?;
 
-    for chunk in chunk_index.chunks.iter() {
+    for chunk in manifest.chunks.iter() {
         sink.send(chunk.into()).await?;
     }
 
@@ -572,10 +572,10 @@ async fn try_convert_chunk<IO: Reader>(
 
 async fn read_volume(data: Bytes) -> anyhow::Result<VolumeInfo> {
     let mut io = Cursor::new(data);
-    let mut buf = BytesMut::with_capacity(VOL_MAGIC_NUMBER.len());
-    io.read_exact_buffered(&mut buf, VOL_MAGIC_NUMBER.len())
+    let mut buf = BytesMut::with_capacity(VOLUME_MAGIC_NUMBER.len());
+    io.read_exact_buffered(&mut buf, VOLUME_MAGIC_NUMBER.len())
         .await?;
-    if buf.as_ref() != VOL_MAGIC_NUMBER {
+    if buf.as_ref() != VOLUME_MAGIC_NUMBER {
         bail!("invalid magic number");
     }
 
@@ -597,7 +597,7 @@ async fn write_volume<IO: AsyncWrite + Send + Unpin>(
     mut io: IO,
     volume_info: &VolumeInfo,
 ) -> anyhow::Result<()> {
-    io.write_all(VOL_MAGIC_NUMBER).await?;
+    io.write_all(VOLUME_MAGIC_NUMBER).await?;
 
     let mut sink = EncodingSinkBuilder::from_writer(&mut io).build();
     sink.send(volume_info.into()).await?;
@@ -608,49 +608,49 @@ async fn write_volume<IO: AsyncWrite + Send + Unpin>(
     Ok(())
 }
 
-async fn read_chunk_index(
+async fn read_manifest(
     reader: &mut impl Reader,
     fixed_specs: FixedSpecs,
-) -> anyhow::Result<ChunkIndex> {
-    let mut buf = BytesMut::with_capacity(IDX_MAGIC_NUMBER.len());
+) -> anyhow::Result<Manifest> {
+    let mut buf = BytesMut::with_capacity(MANIFEST_MAGIC_NUMBER.len());
     reader
-        .read_exact_buffered(&mut buf, IDX_MAGIC_NUMBER.len())
+        .read_exact_buffered(&mut buf, MANIFEST_MAGIC_NUMBER.len())
         .await?;
-    if buf.as_ref() != IDX_MAGIC_NUMBER {
+    if buf.as_ref() != MANIFEST_MAGIC_NUMBER {
         bail!("invalid magic number");
     }
 
     let mut stream = DecodedStream::from_reader(reader, fixed_specs.clone());
-    let mut chunk_index = match stream.try_next().await? {
-        Some(Decoded::ChunkIndexInfo(chunk_index)) => {
-            let chunk_index = chunk_index.into_header();
-            if chunk_index.specs != fixed_specs {
-                bail!("index appears to be for a different vbd");
+    let mut manifest = match stream.try_next().await? {
+        Some(Decoded::Manifest(manifest)) => {
+            let manifest = manifest.into_header();
+            if manifest.specs != fixed_specs {
+                bail!("manifest appears to be for a different vbd");
             }
-            chunk_index
+            manifest
         }
-        _ => return Err(anyhow!("incorrect entry, expected chunk_index_info")),
+        _ => return Err(anyhow!("incorrect entry, expected manifest_info")),
     };
 
     while let Some(frame) = stream.try_next().await? {
         match frame {
             Decoded::Chunk(mut c) => {
                 let chunk = c.read_body().await?;
-                chunk_index.chunks.push(chunk);
+                manifest.chunks.push(chunk);
             }
             _ => return Err(anyhow!("incorrect entry, expected chunk_info")),
         }
     }
 
-    Ok(chunk_index)
+    Ok(manifest)
 }
 
 async fn read_branch(data: Bytes, fixed_specs: FixedSpecs) -> anyhow::Result<BranchInfo> {
     let mut io = Cursor::new(data);
-    let mut buf = BytesMut::with_capacity(BRA_MAGIC_NUMBER.len());
-    io.read_exact_buffered(&mut buf, BRA_MAGIC_NUMBER.len())
+    let mut buf = BytesMut::with_capacity(BRANCH_MAGIC_NUMBER.len());
+    io.read_exact_buffered(&mut buf, BRANCH_MAGIC_NUMBER.len())
         .await?;
-    if buf.as_ref() != BRA_MAGIC_NUMBER {
+    if buf.as_ref() != BRANCH_MAGIC_NUMBER {
         bail!("invalid magic number");
     }
 
@@ -665,7 +665,7 @@ async fn write_branch<IO: AsyncWrite + Send + Unpin>(
     mut io: IO,
     branch_info: &BranchInfo,
 ) -> anyhow::Result<()> {
-    io.write_all(BRA_MAGIC_NUMBER).await?;
+    io.write_all(BRANCH_MAGIC_NUMBER).await?;
 
     let mut sink = EncodingSinkBuilder::from_writer(&mut io).build();
     sink.send(branch_info.into()).await?;
@@ -735,17 +735,17 @@ impl WrappedVolume {
         })
     }
 
-    async fn list_chunk_indices(
+    async fn list_manifests(
         &self,
-    ) -> anyhow::Result<impl Iterator<Item = (ChunkIndexId, Etag)> + 'static> {
+    ) -> anyhow::Result<impl Iterator<Item = (ManifestId, Etag)> + 'static> {
         Ok(match &self {
             Self::FsVolume(fs) => {
-                let stream = fs.chunk_indices().await?;
+                let stream = fs.manifests().await?;
                 let res: Result<Vec<_>, <FsVolume as Volume>::Error> = stream.try_collect().await;
                 res?.into_iter()
             }
             Self::RenterdVolume(renterd) => {
-                let stream = renterd.chunk_indices().await?;
+                let stream = renterd.manifests().await?;
                 let res: Result<Vec<_>, <RenterdVolume as Volume>::Error> =
                     stream.try_collect().await;
                 res?.into_iter()
@@ -753,31 +753,31 @@ impl WrappedVolume {
         })
     }
 
-    async fn chunk_index_reader(
+    async fn manifest_reader(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
     ) -> anyhow::Result<Box<dyn Reader + 'static>> {
         Ok(match &self {
-            WrappedVolume::FsVolume(fs) => Box::new(fs.read_chunk_index(id).await?),
-            WrappedVolume::RenterdVolume(renterd) => Box::new(renterd.read_chunk_index(id).await?),
+            WrappedVolume::FsVolume(fs) => Box::new(fs.read_manifest(id).await?),
+            WrappedVolume::RenterdVolume(renterd) => Box::new(renterd.read_manifest(id).await?),
         })
     }
 
-    async fn write_chunk_index(
+    async fn write_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
         content: impl AsyncRead + Send + Unpin + 'static,
     ) -> anyhow::Result<Etag> {
         Ok(match &self {
-            Self::FsVolume(fs) => fs.write_chunk_index(id, content).await?,
-            Self::RenterdVolume(renterd) => renterd.write_chunk_index(id, content).await?,
+            Self::FsVolume(fs) => fs.write_manifest(id, content).await?,
+            Self::RenterdVolume(renterd) => renterd.write_manifest(id, content).await?,
         })
     }
 
-    async fn delete_chunk_index(&self, id: &ChunkIndexId) -> anyhow::Result<()> {
+    async fn delete_manifest(&self, id: &ManifestId) -> anyhow::Result<()> {
         Ok(match &self {
-            WrappedVolume::FsVolume(fs) => fs.delete_chunk_index(id).await?,
-            WrappedVolume::RenterdVolume(renterd) => renterd.delete_chunk_index(id).await?,
+            WrappedVolume::FsVolume(fs) => fs.delete_manifest(id).await?,
+            WrappedVolume::RenterdVolume(renterd) => renterd.delete_manifest(id).await?,
         })
     }
 

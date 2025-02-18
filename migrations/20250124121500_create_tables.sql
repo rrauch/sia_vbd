@@ -160,7 +160,7 @@ BEGIN
                            (ac.cluster_id = NEW.cluster_id) OR
                            (ac.index_id = NEW.index_id)
                            ))
-    AND critical > 0; -- todo: investigate critical counter becoming negative
+      AND critical > 0; -- todo: investigate critical counter becoming negative
 END;
 
 
@@ -426,7 +426,7 @@ BEGIN
     WHERE id = OLD.chunk_id;
 END;
 
-CREATE TABLE chunk_indices
+CREATE TABLE manifests
 (
     id      BLOB    NOT NULL PRIMARY KEY CHECK (TYPEOF(id) == 'blob' AND
                                                 LENGTH(id) == 16),
@@ -436,55 +436,55 @@ CREATE TABLE chunk_indices
 );
 
 -- Prevent Id changes
-CREATE TRIGGER prevent_chunk_indices_update
+CREATE TRIGGER prevent_manifests_update
     BEFORE UPDATE
-    ON chunk_indices
+    ON manifests
     FOR EACH ROW
     WHEN NEW.id != OLD.id
 BEGIN
     SELECT RAISE(ABORT, 'Updates to id columns are not allowed.');
 END;
 
-CREATE TABLE chunk_index_content
+CREATE TABLE manifest_content
 (
-    index_id BLOB NOT NULL,
-    chunk_id BLOB NOT NULL,
+    manifest_id BLOB NOT NULL,
+    chunk_id    BLOB NOT NULL,
 
-    FOREIGN KEY (index_id) REFERENCES chunk_indices (id) ON DELETE CASCADE,
+    FOREIGN KEY (manifest_id) REFERENCES manifests (id) ON DELETE CASCADE,
     FOREIGN KEY (chunk_id) REFERENCES known_chunks (id),
 
-    UNIQUE (index_id, chunk_id)
+    UNIQUE (manifest_id, chunk_id)
 );
 
-CREATE INDEX idx_chunk_index_content_index_id ON chunk_index_content (index_id);
-CREATE INDEX idx_chunk_index_content_chunk_id ON chunk_index_content (chunk_id);
+CREATE INDEX idx_manifest_content_index_id ON manifest_content (manifest_id);
+CREATE INDEX idx_manifest_content_chunk_id ON manifest_content (chunk_id);
 
 -- Reference Counting
-CREATE TRIGGER increment_chunk_indexed_counter_before_chunk_index_content_insert
+CREATE TRIGGER increment_chunk_indexed_counter_before_manifest_content_insert
     BEFORE INSERT
-    ON chunk_index_content
+    ON manifest_content
 BEGIN
     -- Upsert chunks
     INSERT INTO known_chunks (id, indexed, available)
     VALUES (NEW.chunk_id, 1, 0)
     ON CONFLICT(id) DO UPDATE SET indexed = indexed + 1;
 
-    UPDATE chunk_indices
+    UPDATE manifests
     SET entries = entries + 1
-    WHERE id = NEW.index_id;
+    WHERE id = NEW.manifest_id;
 END;
 
-CREATE TRIGGER decrement_chunk_indexed_counter_after_chunk_index_content_delete
+CREATE TRIGGER decrement_chunk_indexed_counter_after_manifest_content_delete
     AFTER DELETE
-    ON chunk_index_content
+    ON manifest_content
 BEGIN
     UPDATE known_chunks
     SET indexed = known_chunks.indexed - 1
     WHERE id = OLD.chunk_id;
 
-    UPDATE chunk_indices
+    UPDATE manifests
     SET entries = entries - 1
-    WHERE id = OLD.index_id;
+    WHERE id = OLD.manifest_id;
 END;
 
 CREATE TABLE available_content

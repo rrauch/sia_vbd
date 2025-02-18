@@ -47,7 +47,7 @@ message Header {
     volume.BranchInfo branch_info = 17;
     volume.ChunkInfo chunk_info = 18;
     Chunk chunk = 19;
-    volume.ChunkIndexInfo chunk_index_info = 20;
+    volume.Manifest manifest = 20;
   }
 }
 

@@ -298,17 +298,17 @@ async fn read_file_header<IO: ChunkSource>(
     }
 }
 
-pub(crate) type ChunkIndexId = TypedUuid<ChunkIndex>;
+pub(crate) type ManifestId = TypedUuid<Manifest>;
 
 #[derive(Clone)]
-pub(crate) struct ChunkIndex {
-    pub id: ChunkIndexId,
+pub(crate) struct Manifest {
+    pub id: ManifestId,
     pub specs: FixedSpecs,
     pub created: DateTime<Utc>,
     pub chunks: Vec<Chunk>,
 }
 
-impl ChunkIndex {
+impl Manifest {
     pub fn len(&self) -> usize {
         self.chunks.len()
     }

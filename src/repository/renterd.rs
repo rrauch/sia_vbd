@@ -1,8 +1,8 @@
 use crate::hash::HashAlgorithm;
-use crate::inventory::chunk::{ChunkId, ChunkIndexId};
+use crate::inventory::chunk::{ChunkId, ManifestId};
 use crate::io::AsyncReadExtBuffered;
 use crate::repository::{
-    read_volume, Reader, Repository, Stream, Volume, VolumeInfo, VOL_MAGIC_NUMBER,
+    read_volume, Reader, Repository, Stream, Volume, VolumeInfo, VOLUME_MAGIC_NUMBER,
 };
 use crate::serde::encoded::{Decoded, Decoder};
 use crate::vbd::{BlockSize, BranchName, ClusterSize, FixedSpecs, VbdId};
@@ -197,7 +197,7 @@ impl Repository for RenterdRepository {
         }
         mkdir(
             &self.renterd,
-            "chunk_indices",
+            "manifests",
             volume_dir.path(),
             &self.bucket,
         )
@@ -222,7 +222,7 @@ pub struct RenterdVolume {
     specs: FixedSpecs,
     volume_info: File,
     chunks: Directory,
-    chunk_indices: Directory,
+    manifests: Directory,
     commits: Directory,
 }
 
@@ -235,7 +235,7 @@ impl RenterdVolume {
         let mut volume_info = None;
         let mut chunks = None;
         let mut commits = None;
-        let mut chunk_indices = None;
+        let mut manifests = None;
 
         let mut stream = list_dir(&renterd, &bucket, &path).await?;
         while let Some(res) = stream.next().await {
@@ -254,8 +254,8 @@ impl RenterdVolume {
                     "commits" => {
                         commits = Some(dir);
                     }
-                    "chunk_indices" => {
-                        chunk_indices = Some(dir);
+                    "manifests" => {
+                        manifests = Some(dir);
                     }
                     _ => continue,
                 },
@@ -280,10 +280,10 @@ impl RenterdVolume {
         }
         let commits = commits.unwrap();
 
-        if chunk_indices.is_none() {
-            bail!("chunk_indices not found in {}", path);
+        if manifests.is_none() {
+            bail!("manifests not found in {}", path);
         }
-        let chunk_indices = chunk_indices.unwrap();
+        let manifests = manifests.unwrap();
 
         let mut reader = read_file(
             &renterd,
@@ -294,11 +294,11 @@ impl RenterdVolume {
         )
         .await?;
 
-        let mut buf = BytesMut::with_capacity(VOL_MAGIC_NUMBER.len());
+        let mut buf = BytesMut::with_capacity(VOLUME_MAGIC_NUMBER.len());
         reader
-            .read_exact_buffered(&mut buf, VOL_MAGIC_NUMBER.len())
+            .read_exact_buffered(&mut buf, VOLUME_MAGIC_NUMBER.len())
             .await?;
-        if buf.as_ref() != VOL_MAGIC_NUMBER {
+        if buf.as_ref() != VOLUME_MAGIC_NUMBER {
             bail!("invalid magic number");
         }
 
@@ -325,7 +325,7 @@ impl RenterdVolume {
             bucket,
             specs,
             volume_info,
-            chunk_indices,
+            manifests,
             chunks,
             commits,
         })
@@ -400,20 +400,20 @@ impl Volume for RenterdVolume {
         Ok(Box::pin(futures::stream::select_all(streams)))
     }
 
-    async fn chunk_indices(
+    async fn manifests(
         &self,
-    ) -> Result<impl Stream<Item = Result<(ChunkIndexId, Etag), Self::Error>> + 'static, Self::Error>
+    ) -> Result<impl Stream<Item = Result<(ManifestId, Etag), Self::Error>> + 'static, Self::Error>
     {
-        let stream = list_dir(&self.renterd, &self.bucket, self.chunk_indices.path())
+        let stream = list_dir(&self.renterd, &self.bucket, self.manifests.path())
             .await?
             .filter_map(|res| async {
                 match res.map(|o| {
                     o.as_file()
                         .map(|f| {
                             f.name()
-                                .strip_suffix(".chidx")
+                                .strip_suffix(".manifest")
                                 .map(|id| {
-                                    ChunkIndexId::try_from(id)
+                                    ManifestId::try_from(id)
                                         .ok()
                                         .map(|c| (c, f.etag().map(|e| e.clone())))
                                 })
@@ -437,26 +437,26 @@ impl Volume for RenterdVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn read_chunk_index(
+    async fn read_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
     ) -> Result<impl Reader + 'static, Self::Error> {
         let path = self
-            .chunk_indices
+            .manifests
             .path()
-            .try_join(format!("{}.chidx", id).as_str(), false)?;
+            .try_join(format!("{}.manifest", id).as_str(), false)?;
         Ok(read_file(&self.renterd, &path, &self.bucket, 0, None).await?)
     }
 
-    async fn write_chunk_index(
+    async fn write_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
         content: impl AsyncRead + Send + Unpin + 'static,
     ) -> Result<Etag, Self::Error> {
         let file = write_file(
             &self.renterd,
-            self.chunk_indices.path(),
-            format!("{}.chidx", id).as_str(),
+            self.manifests.path(),
+            format!("{}.manifest", id).as_str(),
             &self.bucket,
             None,
             content,
@@ -467,11 +467,11 @@ impl Volume for RenterdVolume {
         Ok(file.etag().ok_or(anyhow!("etag missing"))?.clone())
     }
 
-    async fn delete_chunk_index(&self, id: &ChunkIndexId) -> Result<(), Self::Error> {
+    async fn delete_manifest(&self, id: &ManifestId) -> Result<(), Self::Error> {
         let path = self
-            .chunk_indices
+            .manifests
             .path()
-            .try_join(format!("{}.chidx", id).as_str(), false)?;
+            .try_join(format!("{}.manifest", id).as_str(), false)?;
         self.renterd
             .worker()
             .object()

@@ -1,6 +1,6 @@
 use crate::hash::Hash;
-use crate::inventory::chunk::{Chunk, ChunkContent, ChunkEntry, ChunkId, ChunkIndex, ChunkWriter};
-use crate::inventory::{commit_from_db, sync_chunk, sync_chunk_file, sync_chunk_index};
+use crate::inventory::chunk::{Chunk, ChunkContent, ChunkEntry, ChunkId, Manifest, ChunkWriter};
+use crate::inventory::{commit_from_db, sync_chunk, sync_chunk_file, sync_manifest};
 use crate::repository::VolumeHandler;
 use crate::vbd::{BlockId, BranchName, ClusterId, Commit, FixedSpecs, IndexId};
 use crate::wal::man::WalMan;
@@ -390,7 +390,7 @@ async fn pack_chunks(
         drop(stream);
         conn.close().await?;
 
-        let chunk_index = ChunkIndex {
+        let manifest = Manifest {
             id: Uuid::now_v7().into(),
             specs: specs.clone(),
             created: Utc::now(),
@@ -400,13 +400,13 @@ async fn pack_chunks(
                 .collect(),
         };
 
-        let num_chunks = chunk_index.len();
+        let num_chunks = manifest.len();
         if num_chunks > 0 {
-            let etag = volume.update_chunk_index(chunk_index.clone()).await?;
+            let etag = volume.update_manifest(manifest.clone()).await?;
             let mut tx = pool.write().begin().await?;
-            sync_chunk_index(&chunk_index, &etag, tx.as_mut()).await?;
+            sync_manifest(&manifest, &etag, tx.as_mut()).await?;
             tx.commit().await?;
-            tracing::debug!(chunk_index_id = %&chunk_index.id, chunks = num_chunks, "chunk index updated");
+            tracing::debug!(manifest_id = %&manifest.id, chunks = num_chunks, "manifest updated");
         }
     }
 

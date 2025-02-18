@@ -44,8 +44,8 @@ message ChunkIndex {
   map<uint64, ChunkContent> content = 2;
 }
 
-message ChunkIndexInfo {
-  common.Uuid chunk_index_id = 1;
+message Manifest {
+  common.Uuid manifest_id = 1;
   common.FixedSpecs specs = 2;
   common.Timestamp created = 3;
 }

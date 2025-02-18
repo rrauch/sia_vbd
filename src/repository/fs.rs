@@ -1,4 +1,4 @@
-use crate::inventory::chunk::ChunkIndexId;
+use crate::inventory::chunk::ManifestId;
 use crate::io::{AsyncReadExtBuffered, TokioFile};
 use crate::repository::{ChunkId, Reader, Repository, Stream, Volume, VolumeInfo};
 use crate::vbd::{BranchName, VbdId};
@@ -117,8 +117,8 @@ impl Repository for FsRepository {
         file.close().await?;
         let chunk_dir = dir.join("chunks");
         tokio::fs::create_dir(&chunk_dir).await?;
-        let chunk_index_dir = dir.join("chunk_indices");
-        tokio::fs::create_dir(&chunk_index_dir).await?;
+        let manifest_dir = dir.join("manifests");
+        tokio::fs::create_dir(&manifest_dir).await?;
         let commit_dir = dir.join("commits");
         tokio::fs::create_dir(&commit_dir).await?;
         let file = commit_dir.join(format!("{}.branch", branch.as_ref()));
@@ -157,11 +157,11 @@ impl Repository for FsRepository {
         }
         tokio::fs::remove_dir(&commit_dir).await?;
 
-        let chunk_index_dir = volume_dir.join("chunk_indices");
-        if !is_dir(&chunk_index_dir).await? {
-            bail!("invalid chunk_indices directory: {}", volume_dir.display());
+        let manifest_dir = volume_dir.join("manifests");
+        if !is_dir(&manifest_dir).await? {
+            bail!("invalid manifests directory: {}", volume_dir.display());
         }
-        let mut read_dir = tokio::fs::read_dir(&chunk_index_dir).await?;
+        let mut read_dir = tokio::fs::read_dir(&manifest_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
             if !is_file(&path).await? {
@@ -172,11 +172,11 @@ impl Repository for FsRepository {
                 .ok_or(anyhow!("invalid file name"))?
                 .to_str()
                 .ok_or(anyhow!("invalid file name"))?;
-            if file_name.ends_with(".chidx") {
+            if file_name.ends_with(".manifest") {
                 tokio::fs::remove_file(&path).await?;
             }
         }
-        tokio::fs::remove_dir(&chunk_index_dir).await?;
+        tokio::fs::remove_dir(&manifest_dir).await?;
 
         let chunks_dir = volume_dir.join("chunks");
         let mut read_dir = tokio::fs::read_dir(&chunks_dir).await?;
@@ -215,7 +215,7 @@ async fn is_file(path: impl AsRef<Path>) -> Result<bool, std::io::Error> {
 
 pub struct FsVolume {
     volume_dir: PathBuf,
-    chunk_index_dir: PathBuf,
+    manifest_dir: PathBuf,
     chunk_dir: PathBuf,
     commits_dir: PathBuf,
 }
@@ -225,7 +225,7 @@ impl FsVolume {
         Self {
             chunk_dir: volume_dir.join("chunks"),
             commits_dir: volume_dir.join("commits"),
-            chunk_index_dir: volume_dir.join("chunk_indices"),
+            manifest_dir: volume_dir.join("manifests"),
             volume_dir,
         }
     }
@@ -282,20 +282,20 @@ impl Volume for FsVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn chunk_indices(
+    async fn manifests(
         &self,
-    ) -> Result<impl Stream<Item = Result<(ChunkIndexId, Etag), Self::Error>> + 'static, Self::Error>
+    ) -> Result<impl Stream<Item = Result<(ManifestId, Etag), Self::Error>> + 'static, Self::Error>
     {
         let stream = tokio_stream::wrappers::ReadDirStream::new(
-            tokio::fs::read_dir(&self.chunk_index_dir).await?,
+            tokio::fs::read_dir(&self.manifest_dir).await?,
         );
         let stream = stream
             .then(|r| async move {
                 match r {
                     Ok(e) => {
                         if let Some(file_name) = e.file_name().to_str() {
-                            if let Some(id) = file_name.strip_suffix(".chidx") {
-                                match ChunkIndexId::try_from(id) {
+                            if let Some(id) = file_name.strip_suffix(".manifest") {
+                                match ManifestId::try_from(id) {
                                     Ok(id) => {
                                         if let Ok(etag) = etag(e.path()).await {
                                             Ok(Some((id, etag)))
@@ -320,27 +320,27 @@ impl Volume for FsVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn read_chunk_index(
+    async fn read_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
     ) -> Result<impl Reader + 'static, Self::Error> {
-        let path = self.chunk_index_dir.join(format!("{}.chidx", id));
+        let path = self.manifest_dir.join(format!("{}.manifest", id));
         Ok(TokioFile::open(&path).await?)
     }
 
-    async fn write_chunk_index(
+    async fn write_manifest(
         &self,
-        id: &ChunkIndexId,
+        id: &ManifestId,
         content: impl AsyncRead + Send + Unpin + 'static,
     ) -> Result<Etag, Self::Error> {
-        let path = self.chunk_index_dir.join(format!("{}.chidx", id));
+        let path = self.manifest_dir.join(format!("{}.manifest", id));
         write_file(&path, content).await?;
         let etag = etag(&path).await?;
         Ok(etag)
     }
 
-    async fn delete_chunk_index(&self, id: &ChunkIndexId) -> Result<(), Self::Error> {
-        let path = self.chunk_index_dir.join(format!("{}.chidx", id));
+    async fn delete_manifest(&self, id: &ManifestId) -> Result<(), Self::Error> {
+        let path = self.manifest_dir.join(format!("{}.manifest", id));
         Ok(tokio::fs::remove_file(&path).await?)
     }
 

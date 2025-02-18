@@ -1,4 +1,4 @@
-use crate::inventory::chunk::{Chunk, ChunkId, ChunkIndex};
+use crate::inventory::chunk::{Chunk, ChunkId, Manifest};
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::repository::{BranchInfo, VolumeInfo};
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
@@ -271,10 +271,10 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
                         let frame = DecodedReadFrame::new(chunk_id, body, frame, fixed_specs);
                         Decoded::Chunk(frame)
                     }
-                    frame::header::Type::ChunkIndexInfo(index_info) => {
-                        let index_info: ChunkIndex = index_info.try_into()?;
-                        let frame = DecodedReadFrame::new(index_info, body, frame, fixed_specs);
-                        Decoded::ChunkIndexInfo(frame)
+                    frame::header::Type::Manifest(manifest) => {
+                        let manifest: Manifest = manifest.try_into()?;
+                        let frame = DecodedReadFrame::new(manifest, body, frame, fixed_specs);
+                        Decoded::Manifest(frame)
                     }
                 })
             } else {
@@ -377,7 +377,7 @@ pub(crate) enum Decoded<R: InnerReader> {
     BranchInfo(DecodedReadFrame<BranchInfo, R, ()>),
     ChunkInfo(DecodedReadFrame<ChunkId, R, Chunk>),
     Chunk(DecodedReadFrame<ChunkId, R, Chunk>),
-    ChunkIndexInfo(DecodedReadFrame<ChunkIndex, R, ()>),
+    Manifest(DecodedReadFrame<Manifest, R, ()>),
 }
 
 impl<R: InnerReader> Decoded<R> {
@@ -393,7 +393,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::BranchInfo(f) => f.position(),
             Self::ChunkInfo(f) => f.position(),
             Self::Chunk(f) => f.position(),
-            Self::ChunkIndexInfo(f) => f.position(),
+            Self::Manifest(f) => f.position(),
         }
     }
 
@@ -409,7 +409,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::BranchInfo(f) => f.body.as_ref(),
             Self::ChunkInfo(f) => f.body.as_ref(),
             Self::Chunk(f) => f.body.as_ref(),
-            Self::ChunkIndexInfo(f) => f.body.as_ref(),
+            Self::Manifest(f) => f.body.as_ref(),
         }
     }
 }
@@ -571,9 +571,9 @@ impl Converter {
                 };
                 (header, Some(bytes), compression.is_some())
             }
-            Encodable::ChunkIndex(index_info) => (
+            Encodable::Manifest(manifest) => (
                 frame::Header {
-                    r#type: Some(frame::header::Type::ChunkIndexInfo(index_info.into())),
+                    r#type: Some(frame::header::Type::Manifest(manifest.into())),
                     body: None,
                 },
                 None,
@@ -609,7 +609,7 @@ pub(crate) enum Encodable<'a> {
     VolumeInfo(&'a VolumeInfo),
     BranchInfo(&'a BranchInfo),
     Chunk(&'a Chunk),
-    ChunkIndex(&'a ChunkIndex),
+    Manifest(&'a Manifest),
 }
 
 impl<'a> From<&'a TxBegin> for Encodable<'a> {
@@ -666,9 +666,9 @@ impl<'a> From<&'a Chunk> for Encodable<'a> {
     }
 }
 
-impl<'a> From<&'a ChunkIndex> for Encodable<'a> {
-    fn from(value: &'a ChunkIndex) -> Self {
-        Encodable::ChunkIndex(value)
+impl<'a> From<&'a Manifest> for Encodable<'a> {
+    fn from(value: &'a Manifest) -> Self {
+        Encodable::Manifest(value)
     }
 }
 
@@ -739,12 +739,12 @@ impl<'a> Display for Encodable<'a> {
                     chunk.len()
                 )
             }
-            Self::ChunkIndex(index_info) => {
+            Self::Manifest(manifest) => {
                 write!(
                     f,
-                    "ChunkIndexInfo[vbd_id={}, created={}]",
-                    index_info.specs.vbd_id(),
-                    index_info.created,
+                    "Manifest[vbd_id={}, created={}]",
+                    manifest.specs.vbd_id(),
+                    manifest.created,
                 )
             }
         }
