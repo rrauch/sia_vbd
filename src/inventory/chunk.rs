@@ -6,7 +6,7 @@ use crate::serde::encoded::{Decoded, DecodedStream, EncodingSink, EncodingSinkBu
 use crate::serde::framed::{FramingSink, WriteFrame};
 use crate::serde::{Compressor, PREAMBLE_LEN};
 use crate::vbd::{
-    Block, BlockId, BlockSize, Cluster, ClusterId, ClusterSize, FixedSpecs, Index, IndexId,
+    Block, BlockId, BlockSize, Cluster, ClusterId, ClusterSize, FixedSpecs, Snapshot, SnapshotId,
     Position, TypedUuid,
 };
 use anyhow::anyhow;
@@ -86,13 +86,13 @@ impl Chunk {
 pub(crate) enum ChunkEntry {
     BlockId(BlockId),
     ClusterId(ClusterId),
-    IndexId(IndexId),
+    SnapshotId(SnapshotId),
 }
 
 pub(crate) enum ChunkContent {
     Block(Block),
     Cluster(Cluster),
-    Index(Index),
+    Snapshot(Snapshot),
 }
 
 pub(crate) type ChunkId = TypedUuid<Chunk>;
@@ -165,9 +165,9 @@ impl ChunkWriter {
                 ChunkEntry::ClusterId(cluster.content_id().clone()),
                 cluster.into(),
             ),
-            ChunkContent::Index(index) => (
-                ChunkEntry::IndexId(index.content_id().clone()),
-                index.into(),
+            ChunkContent::Snapshot(snapshot) => (
+                ChunkEntry::SnapshotId(snapshot.content_id().clone()),
+                snapshot.into(),
             ),
         };
 

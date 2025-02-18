@@ -1,8 +1,8 @@
 use crate::hash::Hash;
-use crate::inventory::chunk::{Chunk, ChunkContent, ChunkEntry, ChunkId, Manifest, ChunkWriter};
+use crate::inventory::chunk::{Chunk, ChunkContent, ChunkEntry, ChunkId, ChunkWriter, Manifest};
 use crate::inventory::{commit_from_db, sync_chunk, sync_chunk_file, sync_manifest};
 use crate::repository::VolumeHandler;
-use crate::vbd::{BlockId, BranchName, ClusterId, Commit, FixedSpecs, IndexId};
+use crate::vbd::{BlockId, BranchName, ClusterId, Commit, FixedSpecs, SnapshotId};
 use crate::wal::man::WalMan;
 use crate::wal::WalId;
 use crate::SqlitePool;
@@ -241,7 +241,7 @@ async fn pack_chunks(
     {
         let commit_id = commit.content_id().as_ref();
         let preceding_commit_id = commit.preceding_commit().as_ref();
-        let index_id = commit.index().as_ref();
+        let snapshot_id = commit.snapshot().as_ref();
         let committed = commit.committed().timestamp_micros();
         let num_clusters = commit.num_clusters() as i64;
         let branch = branch.as_ref();
@@ -253,13 +253,13 @@ async fn pack_chunks(
         // Lock the current commit
         sqlx::query!(
             "
-            INSERT INTO commits (name, type, commit_id, preceding_commit_id, index_id, committed, num_clusters)
+            INSERT INTO commits (name, type, commit_id, preceding_commit_id, snapshot_id, committed, num_clusters)
             SELECT ?, 'LB', ?, ?, ?, ?, ?
             ",
             branch,
             commit_id,
             preceding_commit_id,
-            index_id,
+            snapshot_id,
             committed,
             num_clusters,
     )
@@ -267,7 +267,7 @@ async fn pack_chunks(
             .await?;
     }
 
-    let content = find_packable_content(commit.index(), tx.as_mut(), specs).await?;
+    let content = find_packable_content(commit.snapshot(), tx.as_mut(), specs).await?;
     tx.commit().await?;
 
     for (wal_id, content) in content.into_iter() {
@@ -280,8 +280,8 @@ async fn pack_chunks(
                 ChunkEntry::ClusterId(cluster_id) => {
                     ChunkContent::Cluster(wal_reader.cluster(&cluster_id, wal_offset).await?)
                 }
-                ChunkEntry::IndexId(index_id) => {
-                    ChunkContent::Index(wal_reader.index(&index_id, wal_offset).await?)
+                ChunkEntry::SnapshotId(snapshot_id) => {
+                    ChunkContent::Snapshot(wal_reader.snapshot(&snapshot_id, wal_offset).await?)
                 }
             };
 
@@ -321,14 +321,15 @@ async fn pack_chunks(
         // update index
         let mut conn = pool.read().acquire().await?;
         let mut stream = sqlx::query!(
-            "SELECT chunk_id, offset, block_id, cluster_id, index_id
+            "SELECT chunk_id, offset, block_id, cluster_id, snapshot_id
                 FROM available_content
                 WHERE chunk_id IN (SELECT id
                    FROM known_chunks
                    WHERE indexed = 0 AND available > 0
                );
             "
-        ).fetch(conn.as_mut());
+        )
+        .fetch(conn.as_mut());
 
         let mut chunks = HashMap::new();
         while let Some(r) = stream.try_next().await? {
@@ -370,12 +371,12 @@ async fn pack_chunks(
                         .unwrap()
                         .insert(offset, ChunkEntry::ClusterId(cluster_id));
                 }
-                if let Some(index_id) = r
-                    .index_id
+                if let Some(snapshot_id) = r
+                    .snapshot_id
                     .map(|b| {
                         Hash::try_from((b.as_slice(), specs.content_hash()))
                             .ok()
-                            .map(|h| IndexId::try_from(h).ok())
+                            .map(|h| SnapshotId::try_from(h).ok())
                     })
                     .flatten()
                     .flatten()
@@ -383,7 +384,7 @@ async fn pack_chunks(
                     chunks
                         .get_mut(&chunk_id)
                         .unwrap()
-                        .insert(offset, ChunkEntry::IndexId(index_id));
+                        .insert(offset, ChunkEntry::SnapshotId(snapshot_id));
                 }
             }
         }
@@ -428,20 +429,20 @@ async fn pack_chunks(
 }
 
 async fn find_packable_content(
-    index_id: &IndexId,
+    snapshot_id: &SnapshotId,
     conn: &mut SqliteConnection,
     specs: &FixedSpecs,
 ) -> anyhow::Result<HashMap<WalId, Vec<(u64, ChunkEntry)>>> {
     let content_hash = specs.content_hash();
     let meta_hash = specs.meta_hash();
-    let index_id = index_id.as_ref();
+    let snapshot_id = snapshot_id.as_ref();
 
     #[derive(Debug)]
     struct Row {
         wal_id: Option<Vec<u8>>,
         block_id: Option<Vec<u8>>,
         cluster_id: Option<Vec<u8>>,
-        index_id: Option<Vec<u8>>,
+        snapshot_id: Option<Vec<u8>>,
         offset: i64,
     }
 
@@ -456,9 +457,9 @@ async fn find_packable_content(
             ChunkEntry::ClusterId(
                 Hash::try_from((row.cluster_id.unwrap().as_slice(), meta_hash))?.into(),
             )
-        } else if row.index_id.is_some() {
-            ChunkEntry::IndexId(
-                Hash::try_from((row.index_id.unwrap().as_slice(), meta_hash))?.into(),
+        } else if row.snapshot_id.is_some() {
+            ChunkEntry::SnapshotId(
+                Hash::try_from((row.snapshot_id.unwrap().as_slice(), meta_hash))?.into(),
             )
         } else {
             bail!("invalid row returned, no content id found");
@@ -472,17 +473,17 @@ async fn find_packable_content(
         Row,
         "
 WITH clusters AS (SELECT DISTINCT cluster_id
-                  FROM index_content
-                  WHERE index_id = ?),
+                  FROM snapshot_content
+                  WHERE snapshot_id = ?),
      blocks AS (SELECT DISTINCT block_id
                 FROM cluster_content
                 WHERE cluster_id IN (SELECT cluster_id FROM clusters)),
-     filtered_content AS (SELECT block_id, cluster_id, index_id
+     filtered_content AS (SELECT block_id, cluster_id, snapshot_id
                           FROM known_content
                           WHERE (
                               block_id IN (SELECT block_id FROM blocks) OR
                               cluster_id IN (SELECT cluster_id FROM clusters) OR
-                              index_id = ?
+                              snapshot_id = ?
                               )
                             AND chunk_avail = 0
                             AND wal_avail > 0),
@@ -492,16 +493,16 @@ WITH clusters AS (SELECT DISTINCT cluster_id
                      SELECT cluster_id
                      FROM filtered_content
                      UNION
-                     SELECT index_id
+                     SELECT snapshot_id
                      FROM filtered_content)
-SELECT wal_id, offset, cluster_id, block_id, index_id
+SELECT wal_id, offset, cluster_id, block_id, snapshot_id
 FROM available_content
 WHERE block_id IN (SELECT id FROM desired_ids)
    OR cluster_id IN (SELECT id FROM desired_ids)
-   OR index_id IN (SELECT id FROM desired_ids);
+   OR snapshot_id IN (SELECT id FROM desired_ids);
         ",
-        index_id,
-        index_id
+        snapshot_id,
+        snapshot_id
     )
     .fetch_all(&mut *conn)
     .await?

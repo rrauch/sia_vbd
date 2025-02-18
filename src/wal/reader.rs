@@ -4,7 +4,7 @@ use crate::wal::ParseError::InvalidMagicNumber;
 
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
 use crate::vbd::{
-    BlockId, BlockSize, ClusterId, ClusterSize, Commit, FixedSpecs, Index, IndexId, Position, VbdId,
+    BlockId, BlockSize, ClusterId, ClusterSize, Commit, FixedSpecs, Snapshot, SnapshotId, Position, VbdId,
 };
 use crate::wal::{
     FileHeader, HeaderError, ParseError, TxDetailBuilder, TxDetails, WalError, WalId, WalSource,
@@ -126,20 +126,20 @@ impl<IO: WalSource> WalReader<IO> {
     }
 
     #[instrument(skip(self))]
-    pub async fn index(&mut self, index_id: &IndexId, offset: u64) -> Result<Index, WalError> {
-        tracing::trace!("reading INDEX from WAL");
+    pub async fn snapshot(&mut self, snapshot_id: &SnapshotId, offset: u64) -> Result<Snapshot, WalError> {
+        tracing::trace!("reading SNAPSHOT from WAL");
         let mut frame = match self.read(offset).await? {
-            Decoded::Index(frame) => frame,
+            Decoded::Snapshot(frame) => frame,
             _ => {
                 return Err(WalError::IncorrectType);
             }
         };
 
-        if frame.header() != index_id {
+        if frame.header() != snapshot_id {
             Err(anyhow!(
-                "Index Ids do not match: {} != {}",
+                "Snapshot Ids do not match: {} != {}",
                 frame.header(),
-                index_id
+                snapshot_id
             ))?;
         }
 
@@ -269,10 +269,10 @@ impl<'a, IO: WalSource + 'a> TxStream<'a, IO> {
                         }
                         Ok(Either::Left(tx_builder))
                     }
-                    Decoded::Index(frame) => {
+                    Decoded::Snapshot(frame) => {
                         if let Some(_) = frame.body() {
                             let offset = frame.position().offset;
-                            tx_builder.indices.insert(frame.into_header(), offset);
+                            tx_builder.snapshots.insert(frame.into_header(), offset);
                         }
                         Ok(Either::Left(tx_builder))
                     }

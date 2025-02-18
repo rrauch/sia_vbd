@@ -1,5 +1,6 @@
+use crate::now;
 use crate::serde::encoded::{Encodable, Encoder, EncodingSinkBuilder};
-use crate::vbd::{Block, BranchName, Cluster, Commit, FixedSpecs, Index, VbdId};
+use crate::vbd::{Block, BranchName, Cluster, Commit, FixedSpecs, Snapshot, VbdId};
 use crate::wal::{
     EncodeError, FileHeader, RollbackError, TxBegin, TxCommit, TxDetailBuilder, TxDetails, TxId,
     WalError, WalId, WalSink, MAGIC_NUMBER,
@@ -10,7 +11,6 @@ use futures::{AsyncSeekExt, AsyncWriteExt, SinkExt};
 use std::io::SeekFrom;
 use tracing::instrument;
 use uuid::Uuid;
-use crate::now;
 
 const MAX_WAL_FILE_SIZE: u64 = 1024 * 1024 * 128;
 
@@ -176,7 +176,7 @@ pub struct Tx<IO: WalSink> {
 enum Puttable<'a> {
     Block(&'a Block),
     Cluster(&'a Cluster),
-    Index(&'a Index),
+    Snapshot(&'a Snapshot),
 }
 
 impl<'a> From<Puttable<'a>> for Encodable<'a> {
@@ -184,7 +184,7 @@ impl<'a> From<Puttable<'a>> for Encodable<'a> {
         match value {
             Puttable::Block(block) => Encodable::Block(block),
             Puttable::Cluster(cluster) => Encodable::Cluster(cluster),
-            Puttable::Index(index) => Encodable::Index(index),
+            Puttable::Snapshot(snapshot) => Encodable::Snapshot(snapshot),
         }
     }
 }
@@ -201,9 +201,9 @@ impl<'a> From<&'a Cluster> for Puttable<'a> {
     }
 }
 
-impl<'a> From<&'a Index> for Puttable<'a> {
-    fn from(value: &'a Index) -> Self {
-        Puttable::Index(value)
+impl<'a> From<&'a Snapshot> for Puttable<'a> {
+    fn from(value: &'a Snapshot) -> Self {
+        Puttable::Snapshot(value)
     }
 }
 
@@ -334,14 +334,14 @@ impl<IO: WalSink> Tx<IO> {
                 self.builder.clusters.insert(id, pos.clone());
                 pos
             }
-            Puttable::Index(commit) => {
-                if let Some(pos) = self.builder.indices.get(commit.content_id()) {
+            Puttable::Snapshot(snapshot) => {
+                if let Some(pos) = self.builder.snapshots.get(snapshot.content_id()) {
                     return Ok(pos.clone());
                 }
-                let id = commit.content_id().clone();
-                tracing::trace!("writing COMMIT [{}] to wal", &id);
+                let id = snapshot.content_id().clone();
+                tracing::trace!("writing SNAPSHOT [{}] to wal", &id);
                 let pos = self.write_frame(value).await?;
-                self.builder.indices.insert(id, pos.clone());
+                self.builder.snapshots.insert(id, pos.clone());
                 pos
             }
         })

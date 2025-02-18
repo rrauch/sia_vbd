@@ -49,7 +49,7 @@ message Cluster {
   repeated common.Hash block_ids = 2;
 }
 
-message Index {
+message Snapshot {
   common.Hash cid = 1;
   repeated common.Hash cluster_ids = 2;
 }
@@ -58,6 +58,6 @@ message Commit {
   common.Hash cid = 1;
   common.Hash preceding_cid = 2;
   common.Timestamp committed = 3;
-  common.Hash index_id = 4;
+  common.Hash snapshot_id = 4;
   uint64 clusters = 5;
 }

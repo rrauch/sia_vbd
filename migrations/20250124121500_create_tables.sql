@@ -37,34 +37,34 @@ END;
 -- Entries will be auto-deleted once they aren't referenced anymore
 CREATE TABLE known_content
 (
-    content_type TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'I')),
+    content_type TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'S')),
     block_id     BLOB UNIQUE CHECK (block_id IS NULL OR (TYPEOF(block_id) == 'blob' AND
                                                          LENGTH(block_id) >= 16 AND
                                                          LENGTH(block_id) <= 32)),
     cluster_id   BLOB UNIQUE CHECK (cluster_id IS NULL OR (TYPEOF(cluster_id) == 'blob' AND
                                                            LENGTH(cluster_id) >= 16 AND
                                                            LENGTH(cluster_id) <= 32)),
-    index_id     BLOB UNIQUE CHECK (index_id IS NULL OR (TYPEOF(index_id) == 'blob' AND
-                                                         LENGTH(index_id) >= 16 AND
-                                                         LENGTH(index_id) <= 32)),
+    snapshot_id  BLOB UNIQUE CHECK (snapshot_id IS NULL OR (TYPEOF(snapshot_id) == 'blob' AND
+                                                            LENGTH(snapshot_id) >= 16 AND
+                                                            LENGTH(snapshot_id) <= 32)),
     used         INTEGER NOT NULL CHECK (used >= 0),
     chunk_avail  INTEGER NOT NULL CHECK (chunk_avail >= 0),
     wal_avail    INTEGER NOT NULL CHECK (wal_avail >= 0),
 
     CHECK (
-        (content_type = 'B' AND block_id IS NOT NULL AND cluster_id IS NULL AND index_id IS NULL) OR
-        (content_type = 'C' AND cluster_id IS NOT NULL AND block_id IS NULL AND index_id IS NULL) OR
-        (content_type = 'I' AND index_id IS NOT NULL AND block_id IS NULL AND cluster_id IS NULL)
+        (content_type = 'B' AND block_id IS NOT NULL AND cluster_id IS NULL AND snapshot_id IS NULL) OR
+        (content_type = 'C' AND cluster_id IS NOT NULL AND block_id IS NULL AND snapshot_id IS NULL) OR
+        (content_type = 'S' AND snapshot_id IS NOT NULL AND block_id IS NULL AND cluster_id IS NULL)
         )
 );
 
 CREATE INDEX idx_known_content_content_type ON known_content (content_type);
 CREATE INDEX idx_known_content_block_id ON known_content (block_id);
 CREATE INDEX idx_known_content_cluster_id ON known_content (cluster_id);
-CREATE INDEX idx_known_content_index_id ON known_content (index_id);
+CREATE INDEX idx_known_content_snapshot_id ON known_content (snapshot_id);
 
 -- Prevent Id changes
-CREATE TRIGGER prevent_known_blocks_id_update
+CREATE TRIGGER prevent_known_block_id_update
     BEFORE UPDATE
     ON known_content
     FOR EACH ROW
@@ -82,13 +82,13 @@ BEGIN
     SELECT RAISE(ABORT, 'Updates to cluster_id columns are not allowed.');
 END;
 
-CREATE TRIGGER prevent_known_indices_id_update
+CREATE TRIGGER prevent_known_snapshot_id_update
     BEFORE UPDATE
     ON known_content
     FOR EACH ROW
-    WHEN NEW.index_id != OLD.index_id
+    WHEN NEW.snapshot_id != OLD.snapshot_id
 BEGIN
-    SELECT RAISE(ABORT, 'Updates to index_id columns are not allowed.');
+    SELECT RAISE(ABORT, 'Updates to snapshot_id columns are not allowed.');
 END;
 
 -- GC
@@ -113,7 +113,7 @@ BEGIN
                  WHERE (
                            (ac.block_id = NEW.block_id) OR
                            (ac.cluster_id = NEW.cluster_id) OR
-                           (ac.index_id = NEW.index_id)
+                           (ac.snapshot_id = NEW.snapshot_id)
                            ));
 END;
 
@@ -135,7 +135,7 @@ BEGIN
                  WHERE (
                            (ac.block_id = NEW.block_id) OR
                            (ac.cluster_id = NEW.cluster_id) OR
-                           (ac.index_id = NEW.index_id)
+                           (ac.snapshot_id = NEW.snapshot_id)
                            ));
 END;
 
@@ -158,7 +158,7 @@ BEGIN
                  WHERE (
                            (ac.block_id = NEW.block_id) OR
                            (ac.cluster_id = NEW.cluster_id) OR
-                           (ac.index_id = NEW.index_id)
+                           (ac.snapshot_id = NEW.snapshot_id)
                            ))
       AND critical > 0; -- todo: investigate critical counter becoming negative
 END;
@@ -210,35 +210,35 @@ BEGIN
 END;
 
 
-CREATE TABLE index_content
+CREATE TABLE snapshot_content
 (
-    index_id      BLOB    NOT NULL CHECK (TYPEOF(index_id) == 'blob' AND
-                                          LENGTH(index_id) >= 16 AND
-                                          LENGTH(index_id) <= 32),
+    snapshot_id   BLOB    NOT NULL CHECK (TYPEOF(snapshot_id) == 'blob' AND
+                                          LENGTH(snapshot_id) >= 16 AND
+                                          LENGTH(snapshot_id) <= 32),
     cluster_index INTEGER NOT NULL CHECK (cluster_index >= 0),
     cluster_id    BLOB    NOT NULL CHECK (TYPEOF(cluster_id) == 'blob' AND
                                           LENGTH(cluster_id) >= 16 AND
                                           LENGTH(cluster_id) <= 32),
 
-    FOREIGN KEY (index_id) REFERENCES known_content (index_id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES known_content (snapshot_id) ON DELETE CASCADE,
     FOREIGN KEY (cluster_id) REFERENCES known_content (cluster_id),
 
-    UNIQUE (index_id, cluster_index)
+    UNIQUE (snapshot_id, cluster_index)
 );
 
 -- Prevent Updates
-CREATE TRIGGER prevent_index_content_update
+CREATE TRIGGER prevent_snapshot_content_update
     BEFORE UPDATE
-    ON index_content
+    ON snapshot_content
     FOR EACH ROW
 BEGIN
-    SELECT RAISE(ABORT, 'Updates to index_content are not allowed.');
+    SELECT RAISE(ABORT, 'Updates to snapshot_content are not allowed.');
 END;
 
 -- Reference Counting
-CREATE TRIGGER increment_used_counters_before_index_content_cluster_insert
+CREATE TRIGGER increment_used_counters_before_snapshot_content_cluster_insert
     BEFORE INSERT
-    ON index_content
+    ON snapshot_content
 BEGIN
     -- Upsert known clusters
     INSERT INTO known_content (content_type, cluster_id, used, chunk_avail, wal_avail)
@@ -246,9 +246,9 @@ BEGIN
     ON CONFLICT(cluster_id) DO UPDATE SET used = used + 1;
 END;
 
-CREATE TRIGGER decrement_used_counters_after_index_content_delete
+CREATE TRIGGER decrement_used_counters_after_snapshot_content_delete
     AFTER DELETE
-    ON index_content
+    ON snapshot_content
 BEGIN
     UPDATE known_content
     SET used = used - 1
@@ -266,14 +266,14 @@ CREATE TABLE commits
     preceding_commit_id BLOB    NOT NULL CHECK (TYPEOF(preceding_commit_id) == 'blob' AND
                                                 LENGTH(preceding_commit_id) >= 16 AND
                                                 LENGTH(preceding_commit_id) <= 32),
-    index_id            BLOB    NOT NULL CHECK (TYPEOF(index_id) == 'blob' AND
-                                                LENGTH(index_id) >= 16 AND
-                                                LENGTH(index_id) <= 32),
+    snapshot_id         BLOB    NOT NULL CHECK (TYPEOF(snapshot_id) == 'blob' AND
+                                                LENGTH(snapshot_id) >= 16 AND
+                                                LENGTH(snapshot_id) <= 32),
     committed           INTEGER NOT NULL,
     num_clusters        INTEGER NOT NULL CHECK (num_clusters > 0),
 
     PRIMARY KEY (name, type),
-    FOREIGN KEY (index_id) REFERENCES known_content (index_id)
+    FOREIGN KEY (snapshot_id) REFERENCES known_content (snapshot_id)
 );
 
 -- Reference Counting
@@ -282,31 +282,31 @@ CREATE TRIGGER increment_used_counters_before_commit_insert
     ON commits
 BEGIN
     -- Upsert known indices
-    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
-    VALUES ('I', NEW.index_id, 1, 0, 0)
-    ON CONFLICT(index_id) DO UPDATE SET used = used + 1;
+    INSERT INTO known_content (content_type, snapshot_id, used, chunk_avail, wal_avail)
+    VALUES ('S', NEW.snapshot_id, 1, 0, 0)
+    ON CONFLICT(snapshot_id) DO UPDATE SET used = used + 1;
 END;
 
 CREATE TRIGGER increment_used_counters_before_commit_update
     BEFORE UPDATE
     ON commits
-    WHEN NEW.index_id != OLD.index_id
+    WHEN NEW.snapshot_id != OLD.snapshot_id
 BEGIN
-    -- Upsert new index_id
-    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
-    VALUES ('I', NEW.index_id, 1, 0, 0)
-    ON CONFLICT(index_id) DO UPDATE SET used = used + 1;
+    -- Upsert new snapshot_id
+    INSERT INTO known_content (content_type, snapshot_id, used, chunk_avail, wal_avail)
+    VALUES ('S', NEW.snapshot_id, 1, 0, 0)
+    ON CONFLICT(snapshot_id) DO UPDATE SET used = used + 1;
 END;
 
 CREATE TRIGGER decrement_used_counters_after_commit_update
     AFTER UPDATE
     ON commits
-    WHEN NEW.index_id != OLD.index_id
+    WHEN NEW.snapshot_id != OLD.snapshot_id
 BEGIN
-    -- Decrement old index_id
+    -- Decrement old snapshot_id
     UPDATE known_content
     SET used = used - 1
-    WHERE index_id = OLD.index_id;
+    WHERE snapshot_id = OLD.snapshot_id;
 END;
 
 CREATE TRIGGER decrement_used_counters_after_commit_delete
@@ -315,7 +315,7 @@ CREATE TRIGGER decrement_used_counters_after_commit_delete
 BEGIN
     UPDATE known_content
     SET used = used - 1
-    WHERE index_id = OLD.index_id;
+    WHERE snapshot_id = OLD.snapshot_id;
 END;
 
 CREATE TABLE wal_files
@@ -456,7 +456,7 @@ CREATE TABLE manifest_content
     UNIQUE (manifest_id, chunk_id)
 );
 
-CREATE INDEX idx_manifest_content_index_id ON manifest_content (manifest_id);
+CREATE INDEX idx_manifest_content_manifest_id ON manifest_content (manifest_id);
 CREATE INDEX idx_manifest_content_chunk_id ON manifest_content (chunk_id);
 
 -- Reference Counting
@@ -495,17 +495,17 @@ CREATE TABLE available_content
     chunk_id     BLOB CHECK (chunk_id IS NULL OR (TYPEOF(chunk_id) == 'blob' AND
                                                   LENGTH(chunk_id) == 16)),
     offset       INTEGER NOT NULL CHECK (offset > 0),
-    content_type TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'I')),
+    content_type TEXT    NOT NULL CHECK (content_type IN ('B', 'C', 'S')),
 
     block_id     BLOB,
     cluster_id   BLOB,
-    index_id     BLOB,
+    snapshot_id  BLOB,
 
     FOREIGN KEY (wal_id) REFERENCES wal_files (id) ON DELETE CASCADE,
     FOREIGN KEY (chunk_id) REFERENCES chunk_files (chunk_id) ON DELETE CASCADE,
     FOREIGN KEY (block_id) REFERENCES known_content (block_id),
     FOREIGN KEY (cluster_id) REFERENCES known_content (cluster_id),
-    FOREIGN KEY (index_id) REFERENCES known_content (index_id),
+    FOREIGN KEY (snapshot_id) REFERENCES known_content (snapshot_id),
 
     UNIQUE (wal_id, offset),
     UNIQUE (chunk_id, offset),
@@ -516,9 +516,9 @@ CREATE TABLE available_content
         ),
 
     CHECK (
-        (content_type = 'B' AND block_id IS NOT NULL AND cluster_id IS NULL AND index_id IS NULL) OR
-        (content_type = 'C' AND cluster_id IS NOT NULL AND block_id IS NULL AND index_id IS NULL) OR
-        (content_type = 'I' AND index_id IS NOT NULL AND block_id IS NULL AND cluster_id IS NULL)
+        (content_type = 'B' AND block_id IS NOT NULL AND cluster_id IS NULL AND snapshot_id IS NULL) OR
+        (content_type = 'C' AND cluster_id IS NOT NULL AND block_id IS NULL AND snapshot_id IS NULL) OR
+        (content_type = 'S' AND snapshot_id IS NOT NULL AND block_id IS NULL AND cluster_id IS NULL)
         )
 );
 
@@ -526,7 +526,7 @@ CREATE INDEX idx_available_content_source_type ON available_content (source_type
 CREATE INDEX idx_available_content_content_type ON available_content (content_type);
 CREATE INDEX idx_available_content_block_id ON available_content (block_id);
 CREATE INDEX idx_available_content_cluster_id ON available_content (cluster_id);
-CREATE INDEX idx_available_content_index_id ON available_content (index_id);
+CREATE INDEX idx_available_content_snapshot_id ON available_content (snapshot_id);
 
 -- Prevent Updates
 CREATE TRIGGER prevent_available_content_update
@@ -562,16 +562,16 @@ BEGIN
     ON CONFLICT(cluster_id) DO UPDATE SET chunk_avail = chunk_avail + 1;
 END;
 
-CREATE TRIGGER increment_chunk_avail_counter_before_available_content_index_insert
+CREATE TRIGGER increment_chunk_avail_counter_before_available_content_snapshot_insert
     BEFORE INSERT
     ON available_content
     WHEN NEW.chunk_id IS NOT NULL
-        AND NEW.index_id IS NOT NULL
+        AND NEW.snapshot_id IS NOT NULL
 BEGIN
-    -- Upsert known indices
-    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
-    VALUES ('I', NEW.index_id, 0, 1, 0)
-    ON CONFLICT(index_id) DO UPDATE SET chunk_avail = chunk_avail + 1;
+    -- Upsert known snapshots
+    INSERT INTO known_content (content_type, snapshot_id, used, chunk_avail, wal_avail)
+    VALUES ('S', NEW.snapshot_id, 0, 1, 0)
+    ON CONFLICT(snapshot_id) DO UPDATE SET chunk_avail = chunk_avail + 1;
 END;
 
 CREATE TRIGGER increment_wal_avail_counter_before_available_content_block_insert
@@ -606,16 +606,16 @@ BEGIN
     WHERE id = NEW.wal_id;
 END;
 
-CREATE TRIGGER increment_wal_avail_counter_before_available_content_index_insert
+CREATE TRIGGER increment_wal_avail_counter_before_available_content_snapshot_insert
     BEFORE INSERT
     ON available_content
     WHEN NEW.wal_id IS NOT NULL
-        AND NEW.index_id IS NOT NULL
+        AND NEW.snapshot_id IS NOT NULL
 BEGIN
     -- Upsert known indices
-    INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
-    VALUES ('I', NEW.index_id, 0, 0, 1)
-    ON CONFLICT(index_id) DO UPDATE SET wal_avail = wal_avail + 1;
+    INSERT INTO known_content (content_type, snapshot_id, used, chunk_avail, wal_avail)
+    VALUES ('S', NEW.snapshot_id, 0, 0, 1)
+    ON CONFLICT(snapshot_id) DO UPDATE SET wal_avail = wal_avail + 1;
 
     UPDATE wal_files
     SET entries = entries + 1
@@ -639,8 +639,8 @@ BEGIN
 
     UPDATE known_content
     SET chunk_avail = known_content.chunk_avail - 1
-    WHERE OLD.index_id IS NOT NULL
-      AND index_id = OLD.index_id;
+    WHERE OLD.snapshot_id IS NOT NULL
+      AND snapshot_id = OLD.snapshot_id;
 END;
 
 CREATE TRIGGER decrement_wal_avail_counters_after_available_content_delete
@@ -664,8 +664,8 @@ BEGIN
 
     UPDATE known_content
     SET wal_avail = known_content.wal_avail - 1
-    WHERE OLD.index_id IS NOT NULL
-      AND index_id = OLD.index_id;
+    WHERE OLD.snapshot_id IS NOT NULL
+      AND snapshot_id = OLD.snapshot_id;
 END;
 
 -- keeps track of the most recent commit per wal_id / branch
@@ -681,9 +681,9 @@ CREATE TABLE wal_commits
     preceding_commit_id BLOB    NOT NULL CHECK (TYPEOF(preceding_commit_id) == 'blob' AND
                                                 LENGTH(preceding_commit_id) >= 16 AND
                                                 LENGTH(preceding_commit_id) <= 32),
-    index_id            BLOB    NOT NULL CHECK (TYPEOF(index_id) == 'blob' AND
-                                                LENGTH(index_id) >= 16 AND
-                                                LENGTH(index_id) <= 32),
+    snapshot_id         BLOB    NOT NULL CHECK (TYPEOF(snapshot_id) == 'blob' AND
+                                                LENGTH(snapshot_id) >= 16 AND
+                                                LENGTH(snapshot_id) <= 32),
     committed           INTEGER NOT NULL,
     num_clusters        INTEGER NOT NULL CHECK (num_clusters > 0),
 

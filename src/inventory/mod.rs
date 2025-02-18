@@ -7,7 +7,7 @@ use crate::inventory::syncer::Syncer;
 use crate::repository::{BranchInfo, VolumeHandler};
 use crate::vbd::{
     Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit,
-    FixedSpecs, Index, IndexId, IndexMut, VbdId,
+    FixedSpecs, Snapshot, SnapshotId, SnapshotMut, VbdId,
 };
 use crate::wal::man::WalMan;
 use crate::wal::{TxDetails, WalId};
@@ -41,7 +41,7 @@ pub(crate) struct Inventory {
 enum Id<'a> {
     BlockId(OwnedOrBorrowed<'a, BlockId>),
     ClusterId(OwnedOrBorrowed<'a, ClusterId>),
-    IndexId(OwnedOrBorrowed<'a, IndexId>),
+    SnapshotId(OwnedOrBorrowed<'a, SnapshotId>),
 }
 
 impl<'a> Display for Id<'a> {
@@ -49,7 +49,7 @@ impl<'a> Display for Id<'a> {
         match self {
             Self::BlockId(id) => Display::fmt(id.deref(), f),
             Self::ClusterId(id) => Display::fmt(id.deref(), f),
-            Self::IndexId(id) => Display::fmt(id.deref(), f),
+            Self::SnapshotId(id) => Display::fmt(id.deref(), f),
         }
     }
 }
@@ -59,7 +59,7 @@ impl<'a> Debug for Id<'a> {
         match self {
             Self::BlockId(id) => Debug::fmt(id.deref(), f),
             Self::ClusterId(id) => Debug::fmt(id.deref(), f),
-            Self::IndexId(id) => Debug::fmt(id.deref(), f),
+            Self::SnapshotId(id) => Debug::fmt(id.deref(), f),
         }
     }
 }
@@ -69,7 +69,7 @@ impl<'a> Id<'a> {
         match self {
             Self::BlockId(id) => id.as_ref(),
             Self::ClusterId(id) => id.as_ref(),
-            Self::IndexId(id) => id.as_ref(),
+            Self::SnapshotId(id) => id.as_ref(),
         }
     }
 }
@@ -114,15 +114,15 @@ impl<'a> From<&'a ClusterId> for Id<'a> {
     }
 }
 
-impl From<IndexId> for Id<'static> {
-    fn from(value: IndexId) -> Self {
-        Self::IndexId(OwnedOrBorrowed::Owned(value))
+impl From<SnapshotId> for Id<'static> {
+    fn from(value: SnapshotId) -> Self {
+        Self::SnapshotId(OwnedOrBorrowed::Owned(value))
     }
 }
 
-impl<'a> From<&'a IndexId> for Id<'a> {
-    fn from(value: &'a IndexId) -> Self {
-        Self::IndexId(OwnedOrBorrowed::Borrowed(value))
+impl<'a> From<&'a SnapshotId> for Id<'a> {
+    fn from(value: &'a SnapshotId) -> Self {
+        Self::SnapshotId(OwnedOrBorrowed::Borrowed(value))
     }
 }
 
@@ -287,13 +287,13 @@ impl Inventory {
     }
 
     #[instrument[skip(self)]]
-    pub async fn index_by_id(&self, index_id: &IndexId) -> anyhow::Result<Option<Index>> {
+    pub async fn snapshot_by_id(&self, snapshot_id: &SnapshotId) -> anyhow::Result<Option<Snapshot>> {
         let mut conn = self.pool.read().acquire().await?;
-        let res = Self::_index_by_id(
+        let res = Self::_snapshot_by_id(
             &self.specs,
             &self.wal_man,
             &self.volume,
-            index_id,
+            snapshot_id,
             conn.as_mut(),
         )
         .await?;
@@ -302,47 +302,50 @@ impl Inventory {
     }
 
     #[instrument[skip_all]]
-    async fn _index_by_id(
+    async fn _snapshot_by_id(
         specs: &FixedSpecs,
         wal_man: &WalMan,
         volume: &VolumeHandler,
-        index_id: &IndexId,
+        snapshot_id: &SnapshotId,
         conn: &mut SqliteConnection,
-    ) -> anyhow::Result<Option<Index>> {
-        for index in specs.zero_indices() {
-            if index.content_id() == index_id {
-                return Ok(Some(index.clone()));
+    ) -> anyhow::Result<Option<Snapshot>> {
+        for snapshot in specs.zero_snapshots() {
+            if snapshot.content_id() == snapshot_id {
+                return Ok(Some(snapshot.clone()));
             }
         }
 
         // try to load directly from database
         {
-            if let Ok(Some(index)) = Self::index_from_db(specs, index_id, &mut *conn).await {
-                return Ok(Some(index));
+            if let Ok(Some(snapshot)) = Self::snapshot_from_db(specs, snapshot_id, &mut *conn).await
+            {
+                return Ok(Some(snapshot));
             }
         }
 
         // check the local WALs
-        if let Ok(Some(index)) = Self::index_from_wal(wal_man, index_id, &mut *conn).await {
-            return Ok(Some(index));
+        if let Ok(Some(snapshot)) = Self::snapshot_from_wal(wal_man, snapshot_id, &mut *conn).await
+        {
+            return Ok(Some(snapshot));
         }
 
         // get from chunk
-        if let Ok(Some(index)) = Self::index_from_chunk(volume, index_id, &mut *conn).await {
-            return Ok(Some(index));
+        if let Ok(Some(snapshot)) = Self::snapshot_from_chunk(volume, snapshot_id, &mut *conn).await
+        {
+            return Ok(Some(snapshot));
         }
 
         Ok(None)
     }
 
     #[instrument[skip_all]]
-    async fn index_from_wal(
+    async fn snapshot_from_wal(
         wal_man: &WalMan,
-        index_id: &IndexId,
+        snapshot_id: &SnapshotId,
         conn: &mut SqliteConnection,
-    ) -> anyhow::Result<Option<Index>> {
-        tracing::trace!("reading index from wal");
-        for (wal_id, offsets) in Self::wal_offsets_for_id(index_id, &mut *conn).await? {
+    ) -> anyhow::Result<Option<Snapshot>> {
+        tracing::trace!("reading SNAPSHOT from WAL");
+        for (wal_id, offsets) in Self::wal_offsets_for_id(snapshot_id, &mut *conn).await? {
             let mut wal_reader = match wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
@@ -351,10 +354,10 @@ impl Inventory {
                 }
             };
             for offset in offsets {
-                match wal_reader.index(index_id, offset).await {
-                    Ok(index) => return Ok(Some(index)),
+                match wal_reader.snapshot(snapshot_id, offset).await {
+                    Ok(snapshot) => return Ok(Some(snapshot)),
                     Err(err) => {
-                        tracing::error!(error = %err, wal_id = %wal_id, offset, "reading index failed");
+                        tracing::error!(error = %err, wal_id = %wal_id, offset, "reading snapshot failed");
                     }
                 }
             }
@@ -363,20 +366,20 @@ impl Inventory {
     }
 
     #[instrument[skip_all]]
-    async fn index_from_chunk(
+    async fn snapshot_from_chunk(
         volume: &VolumeHandler,
-        index_id: &IndexId,
+        snapshot_id: &SnapshotId,
         conn: &mut SqliteConnection,
-    ) -> anyhow::Result<Option<Index>> {
-        tracing::trace!("reading index from chunk");
+    ) -> anyhow::Result<Option<Snapshot>> {
+        tracing::trace!("reading SNAPSHOT from CHUNK");
         let mut last_error = None;
 
-        for (chunk_id, offsets) in Self::chunk_offsets_for_id(index_id, &mut *conn).await? {
+        for (chunk_id, offsets) in Self::chunk_offsets_for_id(snapshot_id, &mut *conn).await? {
             for offset in offsets {
-                match volume.index(&chunk_id, offset).await {
-                    Ok(index) => return Ok(Some(index)),
+                match volume.snapshot(&chunk_id, offset).await {
+                    Ok(snapshot) => return Ok(Some(snapshot)),
                     Err(err) => {
-                        tracing::error!(error = %err, chunk_id = %chunk_id, offset, "reading index failed");
+                        tracing::error!(error = %err, chunk_id = %chunk_id, offset, "reading snapshot failed");
                         last_error = Some(err);
                     }
                 }
@@ -519,7 +522,7 @@ impl Inventory {
                     Row,
                     "
                     SELECT wal_id, offset FROM available_content
-                    WHERE source_type = 'W' AND content_type = 'B' AND block_id = ? AND index_id IS NULL AND cluster_id IS NULL
+                    WHERE source_type = 'W' AND content_type = 'B' AND block_id = ? AND snapshot_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -529,17 +532,17 @@ impl Inventory {
                     Row,
                     "
                     SELECT wal_id, offset FROM available_content
-                    WHERE source_type = 'W' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND index_id IS NULL
+                    WHERE source_type = 'W' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND snapshot_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
             }
-            Id::IndexId(_) => {
+            Id::SnapshotId(_) => {
                 sqlx::query_as!(
                     Row,
                     "
                     SELECT wal_id, offset FROM available_content
-                    WHERE source_type = 'W' AND content_type = 'I' AND index_id = ? AND block_id IS NULL AND cluster_id IS NULL
+                    WHERE source_type = 'W' AND content_type = 'S' AND snapshot_id = ? AND block_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -588,7 +591,7 @@ impl Inventory {
                     Row,
                     "
                     SELECT chunk_id, offset FROM available_content
-                    WHERE source_type = 'C' AND content_type = 'B' AND block_id = ? AND index_id IS NULL AND cluster_id IS NULL
+                    WHERE source_type = 'C' AND content_type = 'B' AND block_id = ? AND snapshot_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -598,17 +601,17 @@ impl Inventory {
                     Row,
                     "
                     SELECT chunk_id, offset FROM available_content
-                    WHERE source_type = 'C' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND index_id IS NULL
+                    WHERE source_type = 'C' AND content_type = 'C' AND cluster_id = ? AND block_id IS NULL AND snapshot_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
             }
-            Id::IndexId(_) => {
+            Id::SnapshotId(_) => {
                 sqlx::query_as!(
                     Row,
                     "
                     SELECT chunk_id, offset FROM available_content
-                    WHERE source_type = 'C' AND content_type = 'I' AND index_id = ? AND block_id IS NULL AND cluster_id IS NULL
+                    WHERE source_type = 'C' AND content_type = 'S' AND snapshot_id = ? AND block_id IS NULL AND cluster_id IS NULL
                     ",
                     id_slice
                 ).fetch(conn)
@@ -633,18 +636,18 @@ impl Inventory {
     }
 
     #[instrument[skip_all]]
-    async fn index_from_db(
+    async fn snapshot_from_db(
         specs: &FixedSpecs,
-        index_id: &IndexId,
+        snapshot_id: &SnapshotId,
         conn: &mut SqliteConnection,
-    ) -> anyhow::Result<Option<Index>> {
+    ) -> anyhow::Result<Option<Snapshot>> {
         let cluster_ids = {
-            let index_id = index_id.as_ref();
+            let snapshot_id = snapshot_id.as_ref();
             sqlx::query!(
                 "
-                SELECT cluster_index, cluster_id FROM index_content WHERE index_id = ?;
+                SELECT cluster_index, cluster_id FROM snapshot_content WHERE snapshot_id = ?;
                 ",
-                index_id
+                snapshot_id
             )
             .fetch(conn)
             .map_err(|e| anyhow::Error::from(e))
@@ -661,18 +664,25 @@ impl Inventory {
             return Ok(None);
         }
 
-        let mut index = IndexMut::from_index(specs.zero_index(cluster_ids.len()), specs.clone());
+        let mut snapshot =
+            SnapshotMut::from_snapshot(specs.zero_snapshot(cluster_ids.len()), specs.clone());
         for (idx, cluster_id) in cluster_ids {
-            if idx >= index.clusters().len() {
-                return Err(anyhow!("database entry for index [{}] invalid", index_id));
+            if idx >= snapshot.clusters().len() {
+                return Err(anyhow!(
+                    "database entry for snapshot [{}] invalid",
+                    snapshot_id
+                ));
             }
-            index.clusters()[idx] = cluster_id
+            snapshot.clusters()[idx] = cluster_id
         }
-        let index = index.finalize();
-        if index.content_id() == index_id {
-            Ok(Some(index))
+        let snapshot = snapshot.finalize();
+        if snapshot.content_id() == snapshot_id {
+            Ok(Some(snapshot))
         } else {
-            Err(anyhow!("database entry for index [{}] invalid", index_id))
+            Err(anyhow!(
+                "database entry for snapshot [{}] invalid",
+                snapshot_id
+            ))
         }
     }
 
@@ -726,16 +736,16 @@ impl Inventory {
         }
     }
 
-    #[instrument[skip(tx), fields(index = %index.content_id())]]
-    async fn sync_index_content(
-        index: &Index,
+    #[instrument[skip(tx), fields(snapshot = %snapshot.content_id())]]
+    async fn sync_snapshot_content(
+        snapshot: &Snapshot,
         zero_cluster_id: &ClusterId,
         tx: &mut SqliteConnection,
     ) -> anyhow::Result<u64> {
         let mut rows_affected = 0;
-        let index_id = index.content_id().as_ref();
+        let snapshot_id = snapshot.content_id().as_ref();
 
-        let non_zero_clusters = index
+        let non_zero_clusters = snapshot
             .cluster_ids()
             .into_iter()
             .enumerate()
@@ -749,9 +759,9 @@ impl Inventory {
         let num_clusters = {
             let r = sqlx::query!(
                 "
-                SELECT COUNT(*) AS count FROM index_content WHERE index_id = ?;
+                SELECT COUNT(*) AS count FROM snapshot_content WHERE snapshot_id = ?;
                 ",
-                index_id
+                snapshot_id
             )
             .fetch_one(&mut *tx)
             .await?;
@@ -766,9 +776,9 @@ impl Inventory {
             // invalid, delete
             rows_affected += sqlx::query!(
                 "
-                DELETE FROM index_content WHERE index_id = ?;
+                DELETE FROM snapshot_content WHERE snapshot_id = ?;
                 ",
-                index_id
+                snapshot_id
             )
             .execute(&mut *tx)
             .await?
@@ -780,10 +790,10 @@ impl Inventory {
             let cluster_id = cluster_id.as_ref();
             rows_affected += sqlx::query!(
                 "
-                    INSERT INTO index_content (index_id, cluster_index, cluster_id)
+                    INSERT INTO snapshot_content (snapshot_id, cluster_index, cluster_id)
                     VALUES (?, ?, ?)
                     ",
-                index_id,
+                snapshot_id,
                 idx,
                 cluster_id,
             )
@@ -881,7 +891,7 @@ impl Inventory {
             )
             .chain(
                 tx_details
-                    .indices
+                    .snapshots
                     .iter()
                     .map(|(c, offset)| (c.into(), *offset)),
             );
@@ -891,19 +901,19 @@ impl Inventory {
             let branch = tx_details.branch.as_ref();
             let commit_id = tx_details.commit.content_id.as_ref();
             let preceding_commit_id = tx_details.commit.preceding_commit.as_ref();
-            let index_id = tx_details.commit.index.as_ref();
+            let snapshot_id = tx_details.commit.snapshot.as_ref();
             let committed = tx_details.commit.committed.timestamp_micros();
             let num_clusters = tx_details.commit.num_clusters as i64;
             sqlx::query!(
                 "
-                INSERT INTO wal_commits (wal_id, branch, commit_id, preceding_commit_id, index_id, committed, num_clusters)
+                INSERT INTO wal_commits (wal_id, branch, commit_id, preceding_commit_id, snapshot_id, committed, num_clusters)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ",
                 wal_id,
                 branch,
                 commit_id,
                 preceding_commit_id,
-                index_id,
+                snapshot_id,
                 committed,
                 num_clusters
             ).execute(&mut *tx).await?;
@@ -912,14 +922,14 @@ impl Inventory {
         for (id, offset) in items.into_iter() {
             let offset = offset as i64;
             let id_bytes = id.as_bytes();
-            let (content_type, block_id, cluster_id, index_id) = match &id {
+            let (content_type, block_id, cluster_id, snapshot_id) = match &id {
                 Id::BlockId(_) => ("B", Some(id_bytes), None, None),
                 Id::ClusterId(_) => ("C", None, Some(id_bytes), None),
-                Id::IndexId(_) => ("I", None, None, Some(id_bytes)),
+                Id::SnapshotId(_) => ("S", None, None, Some(id_bytes)),
             };
             rows_affected += sqlx::query!(
             "
-                    INSERT INTO available_content (source_type, wal_id, offset, content_type, block_id, cluster_id, index_id)
+                    INSERT INTO available_content (source_type, wal_id, offset, content_type, block_id, cluster_id, snapshot_id)
                     VALUES ('W', ?, ?, ?, ?, ?, ?);
                     ",
             wal_id,
@@ -927,7 +937,7 @@ impl Inventory {
             content_type,
             block_id,
             cluster_id,
-            index_id
+            snapshot_id
             )
                 .execute(&mut *tx)
                 .await?.rows_affected();
@@ -1092,42 +1102,42 @@ impl Inventory {
         tracing::info!("syncing commits");
 
         let mut rows_deleted = sqlx::query!(
-            "DELETE FROM index_content WHERE index_id NOT IN (SELECT DISTINCT index_id FROM commits);"
+            "DELETE FROM snapshot_content WHERE snapshot_id NOT IN (SELECT DISTINCT snapshot_id FROM commits);"
         )
             .execute(&mut *conn)
             .await?
             .rows_affected();
 
         if rows_deleted > 0 {
-            tracing::debug!(rows_deleted, "removed inactive index_content rows");
+            tracing::debug!(rows_deleted, "removed inactive snapshot_content rows");
         }
 
-        let missing_index_content = sqlx::query!(
+        let missing_snapshot_content = sqlx::query!(
             "
-            SELECT DISTINCT index_id FROM commits
-            WHERE index_id NOT IN (SELECT DISTINCT index_id FROM index_content);
+            SELECT DISTINCT snapshot_id FROM commits
+            WHERE snapshot_id NOT IN (SELECT DISTINCT snapshot_id FROM snapshot_content);
             "
         )
         .fetch_all(&mut *conn)
         .await?
         .into_iter()
-        .map(|r| Hash::try_from((r.index_id.as_slice(), hash_algo)).map(|h| h.into()))
-        .collect::<Result<Vec<IndexId>, _>>()?;
+        .map(|r| Hash::try_from((r.snapshot_id.as_slice(), hash_algo)).map(|h| h.into()))
+        .collect::<Result<Vec<SnapshotId>, _>>()?;
 
         let mut rows_inserted = 0;
-        for index_id in missing_index_content {
-            if let Some(index) =
-                Self::_index_by_id(specs, wal_man, volume, &index_id, &mut *conn).await?
+        for snapshot_id in missing_snapshot_content {
+            if let Some(snapshot) =
+                Self::_snapshot_by_id(specs, wal_man, volume, &snapshot_id, &mut *conn).await?
             {
                 rows_inserted +=
-                    Self::sync_index_content(&index, &zero_cluster_id, &mut *conn).await?;
+                    Self::sync_snapshot_content(&snapshot, &zero_cluster_id, &mut *conn).await?;
             } else {
-                tracing::warn!(index_id = %index_id, "index for index_id unavailable");
+                tracing::warn!(snapshot_id = %snapshot_id, "snapshot for snapshot_id unavailable");
             }
         }
 
         let cluster_rows_deleted = sqlx::query!(
-            "DELETE FROM cluster_content WHERE cluster_id NOT IN (SELECT DISTINCT cluster_id FROM index_content);"
+            "DELETE FROM cluster_content WHERE cluster_id NOT IN (SELECT DISTINCT cluster_id FROM snapshot_content);"
         )
             .execute(&mut *conn)
             .await?
@@ -1143,7 +1153,7 @@ impl Inventory {
 
         let missing_cluster_content = sqlx::query!(
             "
-            SELECT DISTINCT cluster_id FROM index_content
+            SELECT DISTINCT cluster_id FROM snapshot_content
             WHERE cluster_id NOT IN (SELECT DISTINCT cluster_id FROM cluster_content);
             "
         )
@@ -1237,7 +1247,7 @@ impl Inventory {
                 SELECT wc.branch,
                     wc.commit_id,
                     wc.preceding_commit_id,
-                    wc.index_id,
+                    wc.snapshot_id,
                     wc.committed,
                     wc.num_clusters
                 FROM wal_commits wc
@@ -1251,7 +1261,7 @@ impl Inventory {
             UPDATE commits
             SET commit_id = latest_wc.commit_id,
                 preceding_commit_id = latest_wc.preceding_commit_id,
-                index_id = latest_wc.index_id,
+                snapshot_id = latest_wc.snapshot_id,
                 committed = latest_wc.committed,
                 num_clusters = latest_wc.num_clusters
             FROM latest_wc
@@ -1372,19 +1382,19 @@ async fn update_commit<S: AsRef<str>>(
 ) -> anyhow::Result<()> {
     let commit_id = commit.content_id().as_ref();
     let preceding_commit_id = commit.preceding_commit().as_ref();
-    let index_id = commit.index().as_ref();
+    let snapshot_id = commit.snapshot().as_ref();
     let commited = commit.committed().timestamp_micros();
     let num_clusters = commit.num_clusters() as i64;
     let branch = branch.as_ref();
     sqlx::query!(
         "
         UPDATE commits SET
-        commit_id = ?, preceding_commit_id = ?, index_id = ?, committed = ?, num_clusters = ?
+        commit_id = ?, preceding_commit_id = ?, snapshot_id = ?, committed = ?, num_clusters = ?
         WHERE name = ? and type = 'B'
         ",
         commit_id,
         preceding_commit_id,
-        index_id,
+        snapshot_id,
         commited,
         num_clusters,
         branch
@@ -1402,7 +1412,7 @@ async fn commit_from_db(
     let branch = branch.as_ref();
     let r = sqlx::query!(
         "
-        SELECT commit_id, preceding_commit_id, index_id, committed, num_clusters
+        SELECT commit_id, preceding_commit_id, snapshot_id, committed, num_clusters
         FROM commits WHERE name = ? AND type = 'B'
         ",
         branch
@@ -1413,7 +1423,7 @@ async fn commit_from_db(
         content_id: Hash::try_from((r.commit_id.as_slice(), specs.meta_hash()))?.into(),
         preceding_commit: Hash::try_from((r.preceding_commit_id.as_slice(), specs.meta_hash()))?
             .into(),
-        index: Hash::try_from((r.index_id.as_slice(), specs.meta_hash()))?.into(),
+        snapshot: Hash::try_from((r.snapshot_id.as_slice(), specs.meta_hash()))?.into(),
         committed: DateTime::from_timestamp_micros(r.committed)
             .ok_or(anyhow!("invalid timestamp"))?,
         num_clusters: r.num_clusters as usize,
@@ -1529,15 +1539,15 @@ async fn db_init(
     .await?;
 
     for num_clusters in branches.values().into_iter().map(|b| b.commit.num_clusters) {
-        let zero_index = specs.zero_index(num_clusters);
-        let index_id = zero_index.content_id().as_ref();
+        let zero_snapshot = specs.zero_snapshot(num_clusters);
+        let snapshot_id = zero_snapshot.content_id().as_ref();
         sqlx::query!(
             "
-            INSERT INTO known_content (content_type, index_id, used, chunk_avail, wal_avail)
-            VALUES ('I', ?, 0, 1, 0)
-            ON CONFLICT(index_id) DO UPDATE SET chunk_avail = 1;
+            INSERT INTO known_content (content_type, snapshot_id, used, chunk_avail, wal_avail)
+            VALUES ('S', ?, 0, 1, 0)
+            ON CONFLICT(snapshot_id) DO UPDATE SET chunk_avail = 1;
             ",
-            index_id
+            snapshot_id
         )
         .execute(tx.as_mut())
         .await?;
@@ -1573,13 +1583,13 @@ async fn db_init(
     for (branch, commit) in branches.iter().map(|(s, b)| (s, &b.commit)) {
         let commit_id = commit.content_id().as_ref();
         let preceding_commit_id = commit.preceding_commit().as_ref();
-        let index_id = commit.index().as_ref();
+        let snapshot_id = commit.snapshot().as_ref();
         let committed = commit.committed().timestamp_micros();
         let num_clusters = commit.num_clusters() as i64;
         let branch = branch.as_ref();
         sqlx::query!(
             "
-            INSERT INTO commits (name, type, commit_id, preceding_commit_id, index_id, committed, num_clusters)
+            INSERT INTO commits (name, type, commit_id, preceding_commit_id, snapshot_id, committed, num_clusters)
             SELECT ?, 'B', ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
                 SELECT 1 FROM commits WHERE name = ? and type = 'B'
@@ -1588,7 +1598,7 @@ async fn db_init(
             branch,
             commit_id,
             preceding_commit_id,
-            index_id,
+            snapshot_id,
             committed,
             num_clusters,
             branch
@@ -1720,24 +1730,24 @@ async fn insert_chunk_content(chunk: &Chunk, tx: &mut SqliteConnection) -> anyho
 
     for (offset, content) in chunk.content().into_iter() {
         let offset = offset as i64;
-        let (content_type, block_id, cluster_id, index_id) = match content {
+        let (content_type, block_id, cluster_id, snapshot_id) = match content {
             ChunkEntry::BlockId(block_id) => ("B", Some(block_id.as_ref()), None, None),
             ChunkEntry::ClusterId(cluster_id) => ("C", None, Some(cluster_id.as_ref()), None),
-            ChunkEntry::IndexId(index_id) => ("I", None, None, Some(index_id.as_ref())),
+            ChunkEntry::SnapshotId(snapshot_id) => ("S", None, None, Some(snapshot_id.as_ref())),
         };
 
         sqlx::query!(
-                    "
-                    INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, index_id)
-                    VALUES ('C', ?, ?, ?, ?, ?, ?)
-                    ",
-                    id,
-                    offset,
-                    content_type,
-                    block_id,
-                    cluster_id,
-                    index_id,
-                ).execute(&mut *tx).await?;
+            "
+            INSERT INTO available_content (source_type, chunk_id, offset, content_type, block_id, cluster_id, snapshot_id)
+            VALUES ('C', ?, ?, ?, ?, ?, ?)
+            ",
+            id,
+            offset,
+            content_type,
+            block_id,
+            cluster_id,
+            snapshot_id,
+        ).execute(&mut *tx).await?;
     }
 
     Ok(())

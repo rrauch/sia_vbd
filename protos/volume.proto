@@ -22,14 +22,14 @@ message ChunkContent {
     common.Hash cid = 1;
   }
 
-  message Index {
+  message Snapshot {
     common.Hash cid = 1;
   }
 
   oneof type {
     Block block = 11;
     Cluster cluster = 12;
-    Index index = 13;
+    Snapshot snapshot = 13;
   }
 }
 

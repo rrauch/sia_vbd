@@ -4,7 +4,7 @@ use crate::repository::{BranchInfo, VolumeInfo};
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
 use crate::serde::protos::frame;
 use crate::serde::{framed, protos, Body, BodyType, Compressed, Compression, Compressor};
-use crate::vbd::{Block, BlockId, Cluster, ClusterId, FixedSpecs, Index, IndexId, Position};
+use crate::vbd::{Block, BlockId, Cluster, ClusterId, FixedSpecs, Position, Snapshot, SnapshotId};
 use crate::wal::{FileHeader as WalInfo, TxBegin, TxCommit};
 use anyhow::anyhow;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -119,18 +119,18 @@ impl<'a, R: InnerReader + 'a> DecodedReadFrame<ClusterId, R, Cluster> {
     }
 }
 
-impl<'a, R: InnerReader + 'a> DecodedReadFrame<IndexId, R, Index> {
-    pub async fn read_body(&mut self) -> Result<Index, DecodingError> {
+impl<'a, R: InnerReader + 'a> DecodedReadFrame<SnapshotId, R, Snapshot> {
+    pub async fn read_body(&mut self) -> Result<Snapshot, DecodingError> {
         let mut bytes = self.read_body_bytes().await?;
-        let proto_index = protos::Index::decode(&mut bytes)?;
-        let index: Index = (proto_index, self.fixed_specs.clone()).try_into()?;
-        if &self.header != index.content_id() {
-            return Err(BodyError::CommitIdMismatch(
+        let proto_snapshot = protos::Snapshot::decode(&mut bytes)?;
+        let snapshot = Snapshot::try_from((proto_snapshot, self.fixed_specs.clone()))?;
+        if &self.header != snapshot.content_id() {
+            return Err(BodyError::SnapshotIdMismatch(
                 self.header.clone(),
-                index.content_id().clone(),
+                snapshot.content_id().clone(),
             ))?;
         }
-        Ok(index)
+        Ok(snapshot)
     }
 }
 
@@ -215,10 +215,10 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
             let body = header.body.map(|b| b.try_into()).transpose()?;
             if let Some(t) = header.r#type {
                 Ok(match t {
-                    frame::header::Type::Index(index) => {
-                        let index_id: IndexId = index.try_into()?;
-                        let frame = DecodedReadFrame::new(index_id, body, frame, fixed_specs);
-                        Decoded::Index(frame)
+                    frame::header::Type::Snapshot(snapshot) => {
+                        let snapshot_id = SnapshotId::try_from(snapshot)?;
+                        let frame = DecodedReadFrame::new(snapshot_id, body, frame, fixed_specs);
+                        Decoded::Snapshot(frame)
                     }
                     frame::header::Type::Cluster(cluster) => {
                         let cluster_id: ClusterId = cluster.try_into()?;
@@ -360,8 +360,8 @@ pub(crate) enum BodyError {
     BlockIdMismatch(BlockId, BlockId),
     #[error("ClusterId Mismatch: [{0}] != [{1}]")]
     ClusterIdMismatch(ClusterId, ClusterId),
-    #[error("CommitId Mismatch: [{0}] != [{1}]")]
-    CommitIdMismatch(IndexId, IndexId),
+    #[error("SnapshotId Mismatch: [{0}] != [{1}]")]
+    SnapshotIdMismatch(SnapshotId, SnapshotId),
     #[error("ChunkId Mismatch: [{0}] != [{1}]")]
     ChunkIdMismatch(ChunkId, ChunkId),
 }
@@ -371,7 +371,7 @@ pub(crate) enum Decoded<R: InnerReader> {
     TxCommit(DecodedReadFrame<TxCommit, R, ()>),
     Block(DecodedReadFrame<BlockId, R, Bytes>),
     Cluster(DecodedReadFrame<ClusterId, R, Cluster>),
-    Index(DecodedReadFrame<IndexId, R, Index>),
+    Snapshot(DecodedReadFrame<SnapshotId, R, Snapshot>),
     WalInfo(DecodedReadFrame<WalInfo, R, ()>),
     VolumeInfo(DecodedReadFrame<VolumeInfo, R, ()>),
     BranchInfo(DecodedReadFrame<BranchInfo, R, ()>),
@@ -387,7 +387,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::TxCommit(f) => f.position(),
             Self::Block(f) => f.position(),
             Self::Cluster(f) => f.position(),
-            Self::Index(f) => f.position(),
+            Self::Snapshot(f) => f.position(),
             Self::WalInfo(f) => f.position(),
             Self::VolumeInfo(f) => f.position(),
             Self::BranchInfo(f) => f.position(),
@@ -403,7 +403,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::TxCommit(f) => f.body.as_ref(),
             Self::Block(f) => f.body.as_ref(),
             Self::Cluster(f) => f.body.as_ref(),
-            Self::Index(f) => f.body.as_ref(),
+            Self::Snapshot(f) => f.body.as_ref(),
             Self::WalInfo(f) => f.body.as_ref(),
             Self::VolumeInfo(f) => f.body.as_ref(),
             Self::BranchInfo(f) => f.body.as_ref(),
@@ -500,16 +500,16 @@ impl Converter {
                 };
                 (header, Some(bytes), compression.is_some())
             }
-            Encodable::Index(index) => {
+            Encodable::Snapshot(snapshot) => {
                 let mut buf = self.body_buf.get();
-                Into::<protos::Index>::into(index).encode(&mut buf)?;
+                Into::<protos::Snapshot>::into(snapshot).encode(&mut buf)?;
                 let bytes = buf.freeze();
                 let compression = self.compression(bytes.len() as u64);
                 let header = frame::Header {
-                    r#type: Some(frame::header::Type::Index(index.content_id().into())),
+                    r#type: Some(frame::header::Type::Snapshot(snapshot.content_id().into())),
                     body: Some(
                         (&Body {
-                            body_type: BodyType::Index,
+                            body_type: BodyType::Snapshot,
                             compressed: compression.as_ref().map(|c| {
                                 Compressed {
                                     compression: c.clone(),
@@ -604,7 +604,7 @@ pub(crate) enum Encodable<'a> {
     TxCommit(&'a TxCommit),
     Block(&'a Block),
     Cluster(&'a Cluster),
-    Index(&'a Index),
+    Snapshot(&'a Snapshot),
     WalInfo(&'a WalInfo),
     VolumeInfo(&'a VolumeInfo),
     BranchInfo(&'a BranchInfo),
@@ -636,9 +636,9 @@ impl<'a> From<&'a Cluster> for Encodable<'a> {
     }
 }
 
-impl<'a> From<&'a Index> for Encodable<'a> {
-    fn from(value: &'a Index) -> Self {
-        Encodable::Index(value)
+impl<'a> From<&'a Snapshot> for Encodable<'a> {
+    fn from(value: &'a Snapshot) -> Self {
+        Encodable::Snapshot(value)
     }
 }
 
@@ -704,12 +704,12 @@ impl<'a> Display for Encodable<'a> {
                     cluster.len()
                 )
             }
-            Self::Index(commit) => {
+            Self::Snapshot(snapshot) => {
                 write!(
                     f,
-                    "Commit[content_id={}, len={}]",
-                    commit.content_id(),
-                    commit.len()
+                    "Snapshot[content_id={}, len={}]",
+                    snapshot.content_id(),
+                    snapshot.len()
                 )
             }
             Self::WalInfo(wal_info) => {

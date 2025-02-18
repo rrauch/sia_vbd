@@ -1,4 +1,4 @@
-use crate::vbd::{ClusterId, IndexId};
+use crate::vbd::{ClusterId, SnapshotId};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 
@@ -229,17 +229,17 @@ impl From<&crate::vbd::Commit> for Commit {
             cid: Some(value.content_id().into()),
             preceding_cid: Some(value.preceding_commit().into()),
             committed: Some(value.committed().into()),
-            index_id: Some(value.index().into()),
+            snapshot_id: Some(value.snapshot().into()),
             clusters: value.num_clusters() as u64,
         }
     }
 }
 
-impl TryFrom<(Index, crate::vbd::FixedSpecs)> for crate::vbd::Index {
+impl TryFrom<(Snapshot, crate::vbd::FixedSpecs)> for crate::vbd::Snapshot {
     type Error = anyhow::Error;
 
-    fn try_from((value, specs): (Index, crate::vbd::FixedSpecs)) -> Result<Self, Self::Error> {
-        let index_id: IndexId = value
+    fn try_from((value, specs): (Snapshot, crate::vbd::FixedSpecs)) -> Result<Self, Self::Error> {
+        let snapshot_id: SnapshotId = value
             .cid
             .map(|c| c.try_into())
             .transpose()?
@@ -252,18 +252,18 @@ impl TryFrom<(Index, crate::vbd::FixedSpecs)> for crate::vbd::Index {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| frame::Error::ContentIdInvalid)?;
 
-        let index =
-            crate::vbd::IndexMut::from_cluster_ids(cluster_ids.into_iter(), specs).finalize();
+        let snapshot =
+            crate::vbd::SnapshotMut::from_cluster_ids(cluster_ids.into_iter(), specs).finalize();
 
-        if index.content_id() != &index_id {
+        if snapshot.content_id() != &snapshot_id {
             Err(anyhow!(
-                "IndexIds do not match: {} != {}",
-                index.content_id(),
-                index_id
+                "SnapshotIds do not match: {} != {}",
+                snapshot.content_id(),
+                snapshot_id
             ))?;
         }
 
-        Ok(index)
+        Ok(snapshot)
     }
 }
 
@@ -276,8 +276,8 @@ impl From<&crate::vbd::Cluster> for Cluster {
     }
 }
 
-impl From<&crate::vbd::Index> for Index {
-    fn from(value: &crate::vbd::Index) -> Self {
+impl From<&crate::vbd::Snapshot> for Snapshot {
+    fn from(value: &crate::vbd::Snapshot) -> Self {
         Self {
             cid: Some(value.content_id().into()),
             cluster_ids: value.cluster_ids().map(|c| c.into()).collect(),
@@ -289,8 +289,8 @@ pub(crate) mod frame {
     use self::Error::*;
     use crate::inventory::chunk::ChunkId;
     use crate::serde::{BodyType, Compressed};
-    use crate::vbd::{BlockId, ClusterId, IndexId};
-    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, IndexFrameError};
+    use crate::vbd::{BlockId, ClusterId, SnapshotId};
+    use crate::wal::{BlockFrameError, ClusterFrameError, CommitFrameError, SnapshotFrameError};
     use thiserror::Error;
 
     include!(concat!(env!("OUT_DIR"), "/protos/frame.rs"));
@@ -298,7 +298,7 @@ pub(crate) mod frame {
     impl From<&BodyType> for body::Type {
         fn from(value: &BodyType) -> Self {
             match value {
-                &BodyType::Index => body::Type::IndexProto3,
+                &BodyType::Snapshot => body::Type::SnapshotProto3,
                 &BodyType::BlockContent => body::Type::BlockContent,
                 &BodyType::Cluster => body::Type::ClusterProto3,
                 &BodyType::ChunkIndex => body::Type::ChunkIndexProto3,
@@ -312,7 +312,7 @@ pub(crate) mod frame {
         fn try_from(value: body::Type) -> Result<Self, Self::Error> {
             match value {
                 body::Type::ClusterProto3 => Ok(BodyType::Cluster),
-                body::Type::IndexProto3 => Ok(BodyType::Index),
+                body::Type::SnapshotProto3 => Ok(BodyType::Snapshot),
                 body::Type::BlockContent => Ok(BodyType::BlockContent),
                 body::Type::ChunkIndexProto3 => Ok(BodyType::ChunkIndex),
             }
@@ -365,18 +365,18 @@ pub(crate) mod frame {
         }
     }
 
-    impl From<&IndexId> for header::Index {
-        fn from(value: &IndexId) -> Self {
+    impl From<&SnapshotId> for header::Snapshot {
+        fn from(value: &SnapshotId) -> Self {
             Self {
                 cid: Some(value.into()),
             }
         }
     }
 
-    impl TryFrom<header::Index> for IndexId {
+    impl TryFrom<header::Snapshot> for SnapshotId {
         type Error = Error;
 
-        fn try_from(value: header::Index) -> Result<Self, Self::Error> {
+        fn try_from(value: header::Snapshot) -> Result<Self, Self::Error> {
             Ok(value
                 .cid
                 .ok_or(ContentIdInvalid)?
@@ -418,7 +418,7 @@ pub(crate) mod frame {
     impl From<ChunkId> for header::Chunk {
         fn from(value: ChunkId) -> Self {
             header::Chunk {
-                id: Some(value.into())
+                id: Some(value.into()),
             }
         }
     }
@@ -443,6 +443,6 @@ pub(crate) mod frame {
         ClusterFrameError(#[from] ClusterFrameError),
         /// State Frame error
         #[error(transparent)]
-        IndexFrameError(#[from] IndexFrameError),
+        SnapshotFrameError(#[from] SnapshotFrameError),
     }
 }

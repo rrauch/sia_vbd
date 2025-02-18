@@ -26,7 +26,7 @@ message Header {
     common.Hash cid = 1;
   }
 
-  message Index {
+  message Snapshot {
     common.Hash cid = 1;
   }
 
@@ -41,7 +41,7 @@ message Header {
     TxCommit tx_commit = 11;
     Block block = 12;
     Cluster cluster = 13;
-    Index index = 14;
+    Snapshot snapshot = 14;
     wal.FileInfo wal_info = 15;
     volume.VolumeInfo volume_info = 16;
     volume.BranchInfo branch_info = 17;
@@ -55,7 +55,7 @@ message Body {
   enum Type {
     BLOCK_CONTENT = 0;
     CLUSTER_PROTO3 = 1;
-    INDEX_PROTO3 = 2;
+    SNAPSHOT_PROTO3 = 2;
     CHUNK_INDEX_PROTO3 = 3;
   }
 

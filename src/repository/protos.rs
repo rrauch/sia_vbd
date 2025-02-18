@@ -72,8 +72,8 @@ pub(crate) mod volume {
                         cid: Some(id.into()),
                     })),
                 },
-                crate::inventory::chunk::ChunkEntry::IndexId(id) => ChunkContent {
-                    r#type: Some(chunk_content::Type::Index(chunk_content::Index {
+                crate::inventory::chunk::ChunkEntry::SnapshotId(id) => ChunkContent {
+                    r#type: Some(chunk_content::Type::Snapshot(chunk_content::Snapshot {
                         cid: Some(id.into()),
                     })),
                 },
@@ -102,13 +102,15 @@ pub(crate) mod volume {
                             .ok_or(anyhow!("cluster id is missing"))?,
                     )
                 }
-                chunk_content::Type::Index(index) => crate::inventory::chunk::ChunkEntry::IndexId(
-                    index
-                        .cid
-                        .map(|h| h.try_into())
-                        .transpose()?
-                        .ok_or(anyhow!("index id is missing"))?,
-                ),
+                chunk_content::Type::Snapshot(snapshot) => {
+                    crate::inventory::chunk::ChunkEntry::SnapshotId(
+                        snapshot
+                            .cid
+                            .map(|h| h.try_into())
+                            .transpose()?
+                            .ok_or(anyhow!("snapshot id is missing"))?,
+                    )
+                }
             })
         }
     }

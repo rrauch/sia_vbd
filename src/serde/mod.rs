@@ -109,7 +109,7 @@ impl Compressed {
 pub(crate) enum BodyType {
     BlockContent,
     Cluster,
-    Index,
+    Snapshot,
     ChunkIndex,
 }
 

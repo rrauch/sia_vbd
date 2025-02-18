@@ -189,7 +189,7 @@ impl FixedSpecs {
                 meta_hash: meta_hash.clone(),
                 zero_block: None,
                 zero_cluster: None,
-                zero_indices: ArcSwap::from_pointee(HashMap::default()),
+                zero_snapshots: ArcSwap::from_pointee(HashMap::default()),
             }),
         };
 
@@ -204,7 +204,7 @@ impl FixedSpecs {
                 meta_hash: dummy.inner.meta_hash.clone(),
                 zero_block: Some(zero_block.clone()),
                 zero_cluster: None,
-                zero_indices: ArcSwap::from_pointee(HashMap::default()),
+                zero_snapshots: ArcSwap::from_pointee(HashMap::default()),
             }),
         };
 
@@ -219,7 +219,7 @@ impl FixedSpecs {
                 meta_hash,
                 zero_block: Some(zero_block),
                 zero_cluster: Some(zero_cluster),
-                zero_indices: ArcSwap::from_pointee(HashMap::default()),
+                zero_snapshots: ArcSwap::from_pointee(HashMap::default()),
             }),
         }
     }
@@ -252,24 +252,24 @@ impl FixedSpecs {
         self.inner.zero_cluster.as_ref().unwrap().clone()
     }
 
-    pub fn zero_index(&self, num_clusters: usize) -> Index {
-        let guard = self.inner.zero_indices.load();
-        if let Some(index) = guard.get(&num_clusters) {
-            return index.clone();
+    pub fn zero_snapshot(&self, num_clusters: usize) -> Snapshot {
+        let guard = self.inner.zero_snapshots.load();
+        if let Some(snapshot) = guard.get(&num_clusters) {
+            return snapshot.clone();
         }
         let mut map = guard.as_ref().clone();
         drop(guard);
 
-        let index = IndexMut::zeroed(self.clone(), num_clusters).finalize();
-        map.insert(num_clusters, index.clone());
-        self.inner.zero_indices.store(Arc::new(map));
-        index
+        let snapshot = SnapshotMut::zeroed(self.clone(), num_clusters).finalize();
+        map.insert(num_clusters, snapshot.clone());
+        self.inner.zero_snapshots.store(Arc::new(map));
+        snapshot
     }
 
-    pub fn zero_indices(&self) -> impl Iterator<Item = Index> {
+    pub fn zero_snapshots(&self) -> impl Iterator<Item = Snapshot> {
         let vec = self
             .inner
-            .zero_indices
+            .zero_snapshots
             .load()
             .values()
             .into_iter()
@@ -287,7 +287,7 @@ struct FixedSpecsInner {
     meta_hash: HashAlgorithm,
     zero_block: Option<Block>,
     zero_cluster: Option<Cluster>,
-    zero_indices: ArcSwap<HashMap<usize, Index>>,
+    zero_snapshots: ArcSwap<HashMap<usize, Snapshot>>,
 }
 
 impl PartialEq for FixedSpecsInner {
@@ -327,10 +327,10 @@ impl State {
         }
     }
 
-    fn index(&self) -> &Index {
+    fn snapshot(&self) -> &Snapshot {
         match &self {
-            State::Committed(state) => &state.index,
-            State::Uncommitted(state) => &state.previous_index,
+            State::Committed(state) => &state.snapshot,
+            State::Uncommitted(state) => &state.previous_snapshot,
             State::Poisoned => unreachable!("poisoned state"),
         }
     }
@@ -339,7 +339,7 @@ impl State {
 struct Committed {
     branch: BranchName,
     commit: Commit,
-    index: Index,
+    snapshot: Snapshot,
     inventory: Arc<RwLock<Inventory>>,
     wal: Option<WalWriter>,
 }
@@ -387,7 +387,7 @@ impl Committed {
             wal,
             self.branch.clone(),
             self.commit.clone(),
-            self.index.clone(),
+            self.snapshot.clone(),
             config,
             self.inventory.clone(),
             wal_man,
@@ -402,7 +402,7 @@ impl Committed {
                     Self {
                         branch: self.branch,
                         commit: self.commit,
-                        index: self.index,
+                        snapshot: self.snapshot,
                         wal,
                         inventory: self.inventory,
                     },
@@ -487,7 +487,7 @@ impl ModifiedData {
 struct Uncommitted {
     branch: BranchName,
     previous_commit: Commit,
-    previous_index: Index,
+    previous_snapshot: Snapshot,
     config: Arc<Config>,
     last_modified: Instant,
     data: ModifiedData,
@@ -503,7 +503,7 @@ impl Uncommitted {
         wal: WalWriter,
         branch: BranchName,
         previous_commit: Commit,
-        previous_index: Index,
+        previous_snapshot: Snapshot,
         config: Arc<Config>,
         inventory: Arc<RwLock<Inventory>>,
         wal_man: Arc<WalMan>,
@@ -521,7 +521,7 @@ impl Uncommitted {
         Ok(Self {
             branch,
             previous_commit,
-            previous_index,
+            previous_snapshot,
             config,
             data: ModifiedData {
                 unflushed_blocks: HashMap::default(),
@@ -617,19 +617,20 @@ impl Uncommitted {
     async fn try_commit(mut self) -> Result<Committed, (BlockError, Committed)> {
         async fn apply_changes(
             mut modified_data: ModifiedData,
-            previous_index: &Index,
+            previous_snapshot: &Snapshot,
             inventory: &Inventory,
             config: &Config,
             wal: &mut WalTx,
             wal_blocks: &mut HashMap<BlockId, u64>,
-        ) -> Result<Index, BlockError> {
+        ) -> Result<Snapshot, BlockError> {
             modified_data.flush(config, wal, wal_blocks).await?;
-            let mut index = IndexMut::from_index(previous_index.clone(), config.specs.clone());
+            let mut snapshot =
+                SnapshotMut::from_snapshot(previous_snapshot.clone(), config.specs.clone());
 
             let mut non_zero_clusters = 0;
 
             for (cluster_no, modified_blocks) in modified_data.clusters.drain() {
-                let cluster_id = previous_index
+                let cluster_id = previous_snapshot
                     .clusters
                     .get(cluster_no)
                     .expect("cluster no in bounds");
@@ -650,22 +651,22 @@ impl Uncommitted {
                     wal.put(&cluster).await?;
                     non_zero_clusters += 1;
                 }
-                index.clusters[cluster_no] = cluster.content_id.clone();
+                snapshot.clusters[cluster_no] = cluster.content_id.clone();
             }
 
-            let index = index.finalize();
+            let snapshot = snapshot.finalize();
             if non_zero_clusters > 0 {
-                wal.put(&index).await?;
+                wal.put(&snapshot).await?;
             }
 
-            Ok(index)
+            Ok(snapshot)
         }
         tracing::debug!("commit started");
         let mut inventory = self.inventory.write().await;
 
-        let (new_commit, new_index) = match apply_changes(
+        let (new_commit, new_snapshot) = match apply_changes(
             self.data,
-            &self.previous_index,
+            &self.previous_snapshot,
             inventory.deref_mut(),
             &self.config,
             &mut self.wal_tx,
@@ -673,13 +674,13 @@ impl Uncommitted {
         )
         .await
         {
-            Ok(index) => {
+            Ok(snapshot) => {
                 let mut commit =
                     CommitMut::from_commit(self.config.specs.clone(), &self.previous_commit);
-                commit.update_num_clusters(index.len());
-                commit.update_index(index.content_id());
+                commit.update_num_clusters(snapshot.len());
+                commit.update_snapshot(snapshot.content_id());
                 let commit = commit.finalize();
-                (commit, index)
+                (commit, snapshot)
             }
             Err(err) => {
                 tracing::error!(error = %err, "commit failed, beginning rollback");
@@ -700,7 +701,7 @@ impl Uncommitted {
                     Committed {
                         branch: self.branch,
                         commit: self.previous_commit,
-                        index: self.previous_index,
+                        snapshot: self.previous_snapshot,
                         wal,
                         inventory: self.inventory,
                     },
@@ -719,7 +720,7 @@ impl Uncommitted {
                     Committed {
                         branch: self.branch,
                         commit: new_commit,
-                        index: new_index,
+                        snapshot: new_snapshot,
                         wal: Some(wal),
                         inventory: self.inventory,
                     }
@@ -734,7 +735,7 @@ impl Uncommitted {
                     Committed {
                         branch: self.branch,
                         commit: self.previous_commit,
-                        index: self.previous_index,
+                        snapshot: self.previous_snapshot,
                         wal,
                         inventory: self.inventory,
                     },
@@ -804,10 +805,10 @@ impl VirtualBlockDevice {
         };
 
         let commit = lock.current_commit().clone();
-        let index = lock
-            .index_by_id(commit.index())
+        let snapshot = lock
+            .snapshot_by_id(commit.snapshot())
             .await?
-            .ok_or(anyhow!("unable to load index [{}]", commit.index()))?;
+            .ok_or(anyhow!("unable to load snapshot [{}]", commit.snapshot()))?;
         drop(lock);
 
         eprintln!("vbd id: {}", config.specs.vbd_id());
@@ -817,9 +818,9 @@ impl VirtualBlockDevice {
         eprintln!("branch: {}", branch);
         eprintln!("commit: {} @ {}", commit.content_id(), commit.committed);
         eprintln!(
-            "index: {} @ {} clusters",
-            index.content_id(),
-            index.clusters.len()
+            "snapshot: {} @ {} clusters",
+            snapshot.content_id(),
+            snapshot.clusters.len()
         );
 
         Ok(Self {
@@ -827,7 +828,7 @@ impl VirtualBlockDevice {
             state: State::Committed(Committed {
                 branch,
                 commit,
-                index,
+                snapshot,
                 wal: None,
                 inventory: inventory.clone(),
             }),
@@ -860,7 +861,8 @@ impl VirtualBlockDevice {
             let cluster_no = block_no / cluster_size;
             let relative_block_no = block_no % cluster_size;
 
-            if cluster_no >= self.state.index().clusters.len() || relative_block_no >= cluster_size
+            if cluster_no >= self.state.snapshot().clusters.len()
+                || relative_block_no >= cluster_size
             {
                 return Err(BlockError::OutOfRange { block_no });
             }
@@ -891,7 +893,13 @@ impl VirtualBlockDevice {
             }
         }
 
-        let cluster_id = self.state.index().clusters.get(cluster_no).unwrap().clone();
+        let cluster_id = self
+            .state
+            .snapshot()
+            .clusters
+            .get(cluster_no)
+            .unwrap()
+            .clone();
 
         if &cluster_id == self.config.zero_cluster.content_id() {
             // the whole cluster is empty
@@ -1029,7 +1037,7 @@ impl VirtualBlockDevice {
     }
 
     pub fn blocks(&self) -> usize {
-        *self.config.specs.cluster_size() * self.state.index().len()
+        *self.config.specs.cluster_size() * self.state.snapshot().len()
     }
 
     pub fn cluster_size(&self) -> usize {
@@ -1200,13 +1208,13 @@ impl Cluster {
 }
 
 #[derive(Clone)]
-pub struct Index {
-    content_id: IndexId,
+pub struct Snapshot {
+    content_id: SnapshotId,
     clusters: Arc<Vec<ClusterId>>,
 }
 
-impl Index {
-    pub fn content_id(&self) -> &IndexId {
+impl Snapshot {
+    pub fn content_id(&self) -> &SnapshotId {
         &self.content_id
     }
 
@@ -1220,12 +1228,12 @@ impl Index {
 }
 
 #[derive(Clone)]
-pub(crate) struct IndexMut {
+pub(crate) struct SnapshotMut {
     clusters: Vec<ClusterId>,
     specs: FixedSpecs,
 }
 
-impl IndexMut {
+impl SnapshotMut {
     pub fn zeroed(specs: FixedSpecs, num_clusters: usize) -> Self {
         assert!(num_clusters > 0);
         let zero_cluster_id = specs.zero_cluster().content_id().clone();
@@ -1235,9 +1243,9 @@ impl IndexMut {
         }
     }
 
-    pub fn from_index(index: Index, specs: FixedSpecs) -> Self {
+    pub fn from_snapshot(snapshot: Snapshot, specs: FixedSpecs) -> Self {
         Self {
-            clusters: Arc::try_unwrap(index.clusters)
+            clusters: Arc::try_unwrap(snapshot.clusters)
                 .unwrap_or_else(|clusters| clusters.as_ref().clone()),
             specs,
         }
@@ -1254,9 +1262,9 @@ impl IndexMut {
         &mut self.clusters
     }
 
-    fn calc_content_id(&self) -> IndexId {
+    fn calc_content_id(&self) -> SnapshotId {
         let mut hasher = self.specs.meta_hash().new();
-        hasher.update("--sia_vbd index hash v1 start--\n".as_bytes());
+        hasher.update("--sia_vbd snapshot hash v1 start--\n".as_bytes());
         hasher.update("vbd_id: ".as_bytes());
         hasher.update(&self.specs.vbd_id().as_bytes());
         hasher.update("\nblock_size: ".as_bytes());
@@ -1274,26 +1282,26 @@ impl IndexMut {
             hasher.update(c.as_ref());
             hasher.update("\n--cluster entry end--".as_bytes());
         });
-        hasher.update("\n--sia_vbd index hash v1 end--".as_bytes());
+        hasher.update("\n--sia_vbd snapshot hash v1 end--".as_bytes());
         hasher.finalize().into()
     }
 
-    pub fn finalize(self) -> Index {
+    pub fn finalize(self) -> Snapshot {
         self.into()
     }
 }
 
-impl From<IndexMut> for Index {
-    fn from(value: IndexMut) -> Self {
+impl From<SnapshotMut> for Snapshot {
+    fn from(value: SnapshotMut) -> Self {
         let content_id = value.calc_content_id();
-        Index {
+        Snapshot {
             content_id,
             clusters: Arc::new(value.clusters),
         }
     }
 }
 
-pub type IndexId = ContentId<Index>;
+pub type SnapshotId = ContentId<Snapshot>;
 
 pub type CommitId = ContentId<Commit>;
 
@@ -1302,7 +1310,7 @@ pub struct Commit {
     pub(crate) content_id: CommitId,
     pub(crate) preceding_commit: CommitId,
     pub(crate) committed: DateTime<Utc>,
-    pub(crate) index: IndexId,
+    pub(crate) snapshot: SnapshotId,
     pub(crate) num_clusters: usize,
 }
 
@@ -1319,8 +1327,8 @@ impl Commit {
         &self.committed
     }
 
-    pub fn index(&self) -> &IndexId {
-        &self.index
+    pub fn snapshot(&self) -> &SnapshotId {
+        &self.snapshot
     }
 
     pub fn num_clusters(&self) -> usize {
@@ -1338,7 +1346,7 @@ impl PartialOrd for Commit {
 pub(crate) struct CommitMut {
     preceding_commit: CommitId,
     timestamp: DateTime<Utc>,
-    index: IndexId,
+    snapshot: SnapshotId,
     num_clusters: usize,
     specs: FixedSpecs,
 }
@@ -1349,12 +1357,12 @@ impl CommitMut {
             .meta_hash()
             .hash(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
             .into();
-        let zero_index = specs.zero_index(num_clusters);
+        let zero_snapshot = specs.zero_snapshot(num_clusters);
 
         Self {
             preceding_commit,
             timestamp: now(),
-            index: zero_index.content_id,
+            snapshot: zero_snapshot.content_id,
             num_clusters,
             specs,
         }
@@ -1364,14 +1372,14 @@ impl CommitMut {
         Self {
             preceding_commit: commit.content_id.clone(),
             timestamp: commit.committed.clone(),
-            index: commit.index.clone(),
+            snapshot: commit.snapshot.clone(),
             num_clusters: commit.num_clusters,
             specs,
         }
     }
 
-    pub fn update_index(&mut self, index: &IndexId) {
-        self.index = index.clone();
+    pub fn update_snapshot(&mut self, snapshot: &SnapshotId) {
+        self.snapshot = snapshot.clone();
     }
 
     pub fn update_num_clusters(&mut self, num_clusters: usize) {
@@ -1390,9 +1398,9 @@ impl CommitMut {
         hasher.update("number_of_clusters: ".as_bytes());
         hasher.update(&self.num_clusters.to_be_bytes());
         hasher.update("\ncontent: ".as_bytes());
-        hasher.update("\nindex hash: ".as_bytes());
-        hasher.update(self.index.as_ref());
-        hasher.update("\n preceding index hash: ".as_bytes());
+        hasher.update("\nsnapshot hash: ".as_bytes());
+        hasher.update(self.snapshot.as_ref());
+        hasher.update("\n preceding commit hash: ".as_bytes());
         hasher.update(self.preceding_commit.as_ref());
         hasher.update("\n timestamp: ".as_bytes());
         hasher.update(self.timestamp.timestamp_micros().to_be_bytes());
@@ -1413,7 +1421,7 @@ impl From<CommitMut> for Commit {
             content_id,
             preceding_commit: value.preceding_commit,
             committed: value.timestamp,
-            index: value.index,
+            snapshot: value.snapshot,
             num_clusters: value.num_clusters,
         }
     }
@@ -1681,7 +1689,7 @@ pub(crate) enum BlockError {
 
 mod protos {
     use crate::hash::Hash;
-    use crate::vbd::{BlockId, ClusterId, Commit, CommitId, IndexId, VbdId};
+    use crate::vbd::{BlockId, ClusterId, Commit, CommitId, SnapshotId, VbdId};
     use anyhow::anyhow;
     use uuid::Uuid;
 
@@ -1697,19 +1705,19 @@ mod protos {
         }
     }
 
-    impl From<IndexId> for crate::serde::protos::Hash {
-        fn from(value: IndexId) -> Self {
+    impl From<SnapshotId> for crate::serde::protos::Hash {
+        fn from(value: SnapshotId) -> Self {
             value.0.into()
         }
     }
 
-    impl From<&IndexId> for crate::serde::protos::Hash {
-        fn from(value: &IndexId) -> Self {
+    impl From<&SnapshotId> for crate::serde::protos::Hash {
+        fn from(value: &SnapshotId) -> Self {
             (&value.0).into()
         }
     }
 
-    impl TryFrom<crate::serde::protos::Hash> for IndexId {
+    impl TryFrom<crate::serde::protos::Hash> for SnapshotId {
         type Error = <Hash as TryFrom<crate::serde::protos::Hash>>::Error;
 
         fn try_from(value: crate::serde::protos::Hash) -> Result<Self, Self::Error> {
@@ -1779,8 +1787,8 @@ mod protos {
                     .map(|c| c.try_into())
                     .transpose()?
                     .ok_or(anyhow!("invalid commit message"))?,
-                index: value
-                    .index_id
+                snapshot: value
+                    .snapshot_id
                     .map(|i| i.try_into())
                     .transpose()?
                     .ok_or(anyhow!("invalid commit message"))?,

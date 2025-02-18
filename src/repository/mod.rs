@@ -12,7 +12,7 @@ use crate::repository::renterd::{RenterdRepository, RenterdVolume};
 use crate::serde::encoded::{Decoded, DecodedStream, Decoder, EncodingSinkBuilder};
 use crate::serde::Compressor;
 use crate::vbd::{
-    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Index, VbdId,
+    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Snapshot, VbdId,
 };
 use crate::{now, Etag};
 use anyhow::{anyhow, bail};
@@ -454,11 +454,11 @@ impl VolumeHandler {
         bail!("unexpected content found in chunk, expected cluster");
     }
 
-    pub async fn index(&self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Index> {
-        if let ChunkContent::Index(index) = self.read_chunk_content(chunk_id, offset).await? {
-            return Ok(index);
+    pub async fn snapshot(&self, chunk_id: &ChunkId, offset: u64) -> anyhow::Result<Snapshot> {
+        if let ChunkContent::Snapshot(snapshot) = self.read_chunk_content(chunk_id, offset).await? {
+            return Ok(snapshot);
         }
-        bail!("unexpected content found in chunk, expected index");
+        bail!("unexpected content found in chunk, expected snapshot");
     }
 
     #[instrument(skip_all, fields(chunk_id = %chunk.id(), num_entries = chunk.len(), len))]
@@ -560,9 +560,9 @@ async fn try_convert_chunk<IO: Reader>(
             let cluster = frame.read_body().await?;
             Ok(ChunkContent::Cluster(cluster))
         }
-        Decoded::Index(mut frame) => {
+        Decoded::Snapshot(mut frame) => {
             let commit = frame.read_body().await?;
-            Ok(ChunkContent::Index(commit))
+            Ok(ChunkContent::Snapshot(commit))
         }
         _ => {
             bail!("invalid content in chunk");

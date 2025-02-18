@@ -5,7 +5,7 @@ pub(crate) mod writer;
 
 use crate::io::{ReadOnly, ReadWrite, TokioFile};
 use crate::vbd::{
-    BlockId, BranchName, ClusterId, Commit, CommitId, FixedSpecs, IndexId, TypedUuid, VbdId,
+    BlockId, BranchName, ClusterId, Commit, CommitId, FixedSpecs, SnapshotId, TypedUuid, VbdId,
 };
 use chrono::{DateTime, Duration, Utc};
 use futures::{AsyncRead, AsyncSeek, AsyncWrite};
@@ -52,7 +52,7 @@ pub(crate) struct TxDetails {
     pub created: DateTime<Utc>,
     pub blocks: HashMap<BlockId, u64>,
     pub clusters: HashMap<ClusterId, u64>,
-    pub indices: HashMap<IndexId, u64>,
+    pub snapshots: HashMap<SnapshotId, u64>,
 }
 
 impl TxDetails {
@@ -71,7 +71,7 @@ struct TxDetailBuilder {
     created: DateTime<Utc>,
     blocks: HashMap<BlockId, u64>,
     clusters: HashMap<ClusterId, u64>,
-    indices: HashMap<IndexId, u64>,
+    snapshots: HashMap<SnapshotId, u64>,
 }
 
 impl TxDetailBuilder {
@@ -92,7 +92,7 @@ impl TxDetailBuilder {
             created,
             blocks: HashMap::default(),
             clusters: HashMap::default(),
-            indices: HashMap::default(),
+            snapshots: HashMap::default(),
         }
     }
 
@@ -107,7 +107,7 @@ impl TxDetailBuilder {
             created: self.created,
             blocks: self.blocks,
             clusters: self.clusters,
-            indices: self.indices,
+            snapshots: self.snapshots,
         }
     }
 }
@@ -254,7 +254,7 @@ pub enum ClusterFrameError {
 }
 
 #[derive(Error, Debug)]
-pub enum IndexFrameError {
+pub enum SnapshotFrameError {
     /// Content Id Invalid
     #[error("Content Id Invalid")]
     ContentIdInvalid,
