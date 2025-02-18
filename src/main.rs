@@ -98,8 +98,8 @@ enum VolumeCommands {
 
 #[derive(Deserialize)]
 struct Config {
-    server: BTreeMap<String, ServerConfig>,
-    repository: BTreeMap<String, RepoConfig>,
+    server: Option<BTreeMap<String, ServerConfig>>,
+    repository: Option<BTreeMap<String, RepoConfig>>,
     volume: Option<Vec<VolumeConfig>>,
 }
 
@@ -306,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut servers = config
         .server
+        .unwrap_or_default()
         .into_iter()
         .map(|(name, conf)| Builder::try_from(conf).map(|b| (name, b)))
         .collect::<Result<BTreeMap<String, Builder>, anyhow::Error>>()
@@ -313,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
 
     let repositories = config
         .repository
+        .unwrap_or_default()
         .into_iter()
         .map(|(name, conf)| RepositoryHandler::try_from(conf).map(|h| (name, h)))
         .collect::<Result<BTreeMap<String, RepositoryHandler>, anyhow::Error>>()

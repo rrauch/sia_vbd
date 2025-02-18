@@ -53,3 +53,7 @@ prost-build = "0.13"
 protoc-bin-vendored = "3.1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 tokio = { version = "1.41", features = ["full"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
