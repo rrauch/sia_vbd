@@ -18,6 +18,7 @@ pub mod repository;
 pub mod serde;
 pub mod vbd;
 pub mod wal;
+mod cache;
 
 static ZEROES: Lazy<Bytes> = Lazy::new(|| BytesMut::zeroed(1024 * 256).freeze());
 

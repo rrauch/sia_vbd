@@ -1,3 +1,4 @@
+use crate::cache::Cache;
 use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::Inventory;
 use crate::io::{ReadWrite, TokioFile};
@@ -9,6 +10,7 @@ use anyhow::{anyhow, bail};
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::cmp::{min, Ordering};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -30,7 +32,12 @@ const BS16K: usize = 16 * 1024;
 const BS64K: usize = 64 * 1024;
 const BS256K: usize = 256 * 1024;
 
-pub struct ContentId<T>(Hash, PhantomData<T>);
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "cid")]
+pub struct ContentId<T>(
+    #[serde(rename = "h")] Hash,
+    #[serde(rename = "t")] PhantomData<T>,
+);
 
 impl<T> From<Hash> for ContentId<T> {
     fn from(value: Hash) -> Self {
@@ -772,7 +779,7 @@ impl VirtualBlockDevice {
                 wal_dir.display()
             ),
         }
-
+        let cache = Cache::new(1024 * 1024 * 1, 1024 * 1024 * 1024, "/tmp/foo/cache/").await?;
         let wal_man = Arc::new(WalMan::new(&wal_dir, max_wal_size));
         let name = volume.volume_info().name.clone();
         let inventory = Arc::new(RwLock::new(
@@ -782,6 +789,7 @@ impl VirtualBlockDevice {
                 max_chunk_size,
                 branch.clone(),
                 wal_man.clone(),
+                cache,
                 volume,
                 initial_sync_delay,
                 sync_interval,
@@ -1065,9 +1073,12 @@ impl VirtualBlockDevice {
 
 pub type ClusterId = ContentId<Cluster>;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename = "b")]
 pub struct Block {
+    #[serde(rename = "cid")]
     content_id: BlockId,
+    #[serde(rename = "d")]
     data: Bytes,
 }
 
@@ -1187,7 +1198,7 @@ impl From<ClusterMut> for Cluster {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Cluster {
     content_id: ClusterId,
     blocks: Arc<Vec<BlockId>>,
@@ -1207,7 +1218,7 @@ impl Cluster {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     content_id: SnapshotId,
     clusters: Arc<Vec<ClusterId>>,

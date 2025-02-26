@@ -1,6 +1,7 @@
 pub(crate) mod chunk;
 mod syncer;
 
+use crate::cache::Cache;
 use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId, Manifest, ManifestId};
 use crate::inventory::syncer::Syncer;
@@ -36,6 +37,7 @@ pub(crate) struct Inventory {
     wal_man: Arc<WalMan>,
     volume: Arc<VolumeHandler>,
     syncer: Option<Syncer>,
+    cache: Cache,
 }
 
 enum Id<'a> {
@@ -134,6 +136,7 @@ impl Inventory {
         max_chunk_size: u64,
         current_branch: BranchName,
         wal_man: Arc<WalMan>,
+        cache: Cache,
         volume: VolumeHandler,
         initial_sync_delay: Duration,
         sync_interval: Duration,
@@ -177,6 +180,7 @@ impl Inventory {
             wal_man,
             volume,
             syncer: None,
+            cache,
         };
 
         this.sync_chunks().await?;
@@ -205,6 +209,7 @@ impl Inventory {
         if let Some(syncer) = self.syncer.take() {
             syncer.close().await?;
         }
+        self.cache.close().await?;
         Ok(())
     }
 
@@ -225,18 +230,28 @@ impl Inventory {
         if block_id == self.specs().zero_block().content_id() {
             return Ok(Some(self.specs().zero_block().clone()));
         }
+        self.cache
+            .get(block_id, {
+                let pool = &self.pool;
+                let wal_man = &self.wal_man;
+                let volume = &self.volume;
+                async move {
+                    // check the local WALs
+                    if let Ok(Some(block)) = Self::block_from_wal(&block_id, &pool, &wal_man).await
+                    {
+                        return Ok(Some(block));
+                    }
 
-        // check the local WALs
-        if let Ok(Some(block)) = self.block_from_wal(block_id).await {
-            return Ok(Some(block));
-        }
+                    // get from chunk
+                    if let Ok(Some(block)) = Self::block_from_chunk(&block_id, &pool, &volume).await
+                    {
+                        return Ok(Some(block));
+                    }
 
-        // get from chunk
-        if let Ok(Some(block)) = self.block_from_chunk(block_id).await {
-            return Ok(Some(block));
-        }
-
-        Ok(None)
+                    Ok(None)
+                }
+            })
+            .await
     }
 
     #[instrument[skip(self)]]
@@ -245,6 +260,7 @@ impl Inventory {
         let res = Self::_cluster_by_id(
             &self.specs,
             &self.wal_man,
+            &self.cache,
             &self.volume,
             cluster_id,
             conn.as_mut(),
@@ -258,6 +274,7 @@ impl Inventory {
     async fn _cluster_by_id(
         specs: &FixedSpecs,
         wal_man: &WalMan,
+        cache: &Cache,
         volume: &VolumeHandler,
         cluster_id: &ClusterId,
         conn: &mut SqliteConnection,
@@ -266,32 +283,48 @@ impl Inventory {
             return Ok(Some(specs.zero_cluster().clone()));
         }
 
-        // try to load directly from database
-        {
-            if let Ok(Some(cluster)) = Self::cluster_from_db(specs, cluster_id, &mut *conn).await {
-                return Ok(Some(cluster));
-            }
-        }
+        cache
+            .get(cluster_id, {
+                async move {
+                    // try to load directly from database
+                    {
+                        if let Ok(Some(cluster)) =
+                            Self::cluster_from_db(&specs, cluster_id, &mut *conn).await
+                        {
+                            return Ok(Some(cluster));
+                        }
+                    }
 
-        // check the local WALs
-        if let Ok(Some(cluster)) = Self::cluster_from_wal(wal_man, cluster_id, &mut *conn).await {
-            return Ok(Some(cluster));
-        }
+                    // check the local WALs
+                    if let Ok(Some(cluster)) =
+                        Self::cluster_from_wal(&wal_man, cluster_id, &mut *conn).await
+                    {
+                        return Ok(Some(cluster));
+                    }
 
-        // get from chunk
-        if let Ok(Some(cluster)) = Self::cluster_from_chunk(volume, cluster_id, &mut *conn).await {
-            return Ok(Some(cluster));
-        }
+                    // get from chunk
+                    if let Ok(Some(cluster)) =
+                        Self::cluster_from_chunk(volume, cluster_id, &mut *conn).await
+                    {
+                        return Ok(Some(cluster));
+                    }
 
-        Ok(None)
+                    Ok(None)
+                }
+            })
+            .await
     }
 
     #[instrument[skip(self)]]
-    pub async fn snapshot_by_id(&self, snapshot_id: &SnapshotId) -> anyhow::Result<Option<Snapshot>> {
+    pub async fn snapshot_by_id(
+        &self,
+        snapshot_id: &SnapshotId,
+    ) -> anyhow::Result<Option<Snapshot>> {
         let mut conn = self.pool.read().acquire().await?;
         let res = Self::_snapshot_by_id(
             &self.specs,
             &self.wal_man,
+            &self.cache,
             &self.volume,
             snapshot_id,
             conn.as_mut(),
@@ -305,6 +338,7 @@ impl Inventory {
     async fn _snapshot_by_id(
         specs: &FixedSpecs,
         wal_man: &WalMan,
+        cache: &Cache,
         volume: &VolumeHandler,
         snapshot_id: &SnapshotId,
         conn: &mut SqliteConnection,
@@ -315,27 +349,36 @@ impl Inventory {
             }
         }
 
-        // try to load directly from database
-        {
-            if let Ok(Some(snapshot)) = Self::snapshot_from_db(specs, snapshot_id, &mut *conn).await
-            {
-                return Ok(Some(snapshot));
-            }
-        }
+        cache
+            .get(snapshot_id, {
+                async move {
+                    // try to load directly from database
+                    {
+                        if let Ok(Some(snapshot)) =
+                            Self::snapshot_from_db(specs, snapshot_id, &mut *conn).await
+                        {
+                            return Ok(Some(snapshot));
+                        }
+                    }
 
-        // check the local WALs
-        if let Ok(Some(snapshot)) = Self::snapshot_from_wal(wal_man, snapshot_id, &mut *conn).await
-        {
-            return Ok(Some(snapshot));
-        }
+                    // check the local WALs
+                    if let Ok(Some(snapshot)) =
+                        Self::snapshot_from_wal(wal_man, snapshot_id, &mut *conn).await
+                    {
+                        return Ok(Some(snapshot));
+                    }
 
-        // get from chunk
-        if let Ok(Some(snapshot)) = Self::snapshot_from_chunk(volume, snapshot_id, &mut *conn).await
-        {
-            return Ok(Some(snapshot));
-        }
+                    // get from chunk
+                    if let Ok(Some(snapshot)) =
+                        Self::snapshot_from_chunk(volume, snapshot_id, &mut *conn).await
+                    {
+                        return Ok(Some(snapshot));
+                    }
 
-        Ok(None)
+                    Ok(None)
+                }
+            })
+            .await
     }
 
     #[instrument[skip_all]]
@@ -446,13 +489,17 @@ impl Inventory {
         }
     }
 
-    #[instrument[skip(self)]]
-    async fn block_from_wal(&self, block_id: &BlockId) -> anyhow::Result<Option<Block>> {
+    #[instrument[skip(pool, wal_man)]]
+    async fn block_from_wal(
+        block_id: &BlockId,
+        pool: &SqlitePool,
+        wal_man: &WalMan,
+    ) -> anyhow::Result<Option<Block>> {
         for (wal_id, offsets) in {
-            let mut conn = self.pool.read().acquire().await?;
+            let mut conn = pool.read().acquire().await?;
             Self::wal_offsets_for_id(block_id, conn.as_mut()).await?
         } {
-            let mut wal_reader = match self.wal_man.open_reader(&wal_id).await {
+            let mut wal_reader = match wal_man.open_reader(&wal_id).await {
                 Ok(wal_reader) => wal_reader,
                 Err(err) => {
                     tracing::error!(error = %err, wal_id = %wal_id, "opening wal reader failed");
@@ -471,17 +518,21 @@ impl Inventory {
         Ok(None)
     }
 
-    #[instrument[skip(self)]]
-    async fn block_from_chunk(&self, block_id: &BlockId) -> anyhow::Result<Option<Block>> {
+    #[instrument[skip(pool, volume)]]
+    async fn block_from_chunk(
+        block_id: &BlockId,
+        pool: &SqlitePool,
+        volume: &VolumeHandler,
+    ) -> anyhow::Result<Option<Block>> {
         tracing::trace!("reading block from chunk");
         let mut last_error = None;
 
         for (chunk_id, offsets) in {
-            let mut conn = self.pool.read().acquire().await?;
+            let mut conn = pool.read().acquire().await?;
             Self::chunk_offsets_for_id(block_id, conn.as_mut()).await?
         } {
             for offset in offsets {
-                match self.volume.block(&chunk_id, offset).await {
+                match volume.block(&chunk_id, offset).await {
                     Ok(block) => return Ok(Some(block)),
                     Err(err) => {
                         tracing::error!(error = %err, chunk_id = %chunk_id, offset, "reading block failed");
@@ -1083,7 +1134,14 @@ impl Inventory {
     #[instrument[skip_all]]
     async fn sync_commits(&mut self) -> anyhow::Result<()> {
         let mut tx = self.pool.write().begin().await?;
-        Self::_sync_commits(&self.specs, &self.wal_man, &self.volume, tx.as_mut()).await?;
+        Self::_sync_commits(
+            &self.specs,
+            &self.wal_man,
+            &self.cache,
+            &self.volume,
+            tx.as_mut(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1092,6 +1150,7 @@ impl Inventory {
     async fn _sync_commits(
         specs: &FixedSpecs,
         wal_man: &WalMan,
+        cache: &Cache,
         volume: &VolumeHandler,
         conn: &mut SqliteConnection,
     ) -> anyhow::Result<()> {
@@ -1127,7 +1186,8 @@ impl Inventory {
         let mut rows_inserted = 0;
         for snapshot_id in missing_snapshot_content {
             if let Some(snapshot) =
-                Self::_snapshot_by_id(specs, wal_man, volume, &snapshot_id, &mut *conn).await?
+                Self::_snapshot_by_id(specs, wal_man, &cache, volume, &snapshot_id, &mut *conn)
+                    .await?
             {
                 rows_inserted +=
                     Self::sync_snapshot_content(&snapshot, &zero_cluster_id, &mut *conn).await?;
@@ -1165,7 +1225,7 @@ impl Inventory {
 
         for cluster_id in missing_cluster_content {
             if let Some(cluster) =
-                Self::_cluster_by_id(specs, wal_man, volume, &cluster_id, &mut *conn).await?
+                Self::_cluster_by_id(specs, wal_man, cache, volume, &cluster_id, &mut *conn).await?
             {
                 rows_inserted +=
                     Self::sync_cluster_content(&cluster, &zero_block_id, &mut *conn).await?;
@@ -1365,7 +1425,14 @@ impl Inventory {
 
             Self::process_tx_details(tx_details, tx.as_mut()).await?;
             update_commit(self.branch(), &tx_details.commit, tx.as_mut()).await?;
-            Self::_sync_commits(&self.specs, &self.wal_man, &self.volume, tx.as_mut()).await?;
+            Self::_sync_commits(
+                &self.specs,
+                &self.wal_man,
+                &self.cache,
+                &self.volume,
+                tx.as_mut(),
+            )
+            .await?;
 
             tx.commit().await?;
 

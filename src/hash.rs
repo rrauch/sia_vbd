@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 
@@ -87,11 +88,46 @@ impl Hasher {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Hash {
+    #[serde(rename = "t")]
     Tent([u8; 20]),
+    #[serde(
+        rename = "b",
+        serialize_with = "serialize_blake3",
+        deserialize_with = "deserialize_blake3"
+    )]
     Blake3(blake3::Hash),
+    #[serde(rename = "x")]
     XXH3([u8; 16]),
+}
+
+fn serialize_blake3<S: serde::Serializer>(value: &blake3::Hash, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bytes(value.as_bytes())
+}
+
+fn deserialize_blake3<'de, D: serde::Deserializer<'de>>(d: D) -> Result<blake3::Hash, D::Error> {
+    struct ByteVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ByteVisitor {
+        type Value = blake3::Hash;
+
+        fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+            formatter.write_str("bytes")
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if v.len() != 32 {
+                return Err(E::custom("invalid byte length"));
+            }
+            Ok(blake3::Hash::from_bytes(v.try_into().unwrap()))
+        }
+    }
+
+    d.deserialize_bytes(ByteVisitor)
 }
 
 impl Hash {
