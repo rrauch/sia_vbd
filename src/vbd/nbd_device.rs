@@ -3,7 +3,8 @@ use crate::nbd::block_device::{BlockDevice, Error, Options, RequestContext};
 use crate::vbd::{BlockError, VirtualBlockDevice};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::{AsyncRead, AsyncReadExt};
+use futures::stream::FuturesUnordered;
+use futures::{AsyncRead, AsyncReadExt, StreamExt};
 use std::io::ErrorKind;
 use std::ops::Range;
 use tokio::sync::RwLock;
@@ -56,7 +57,7 @@ impl BlockDevice for NbdDevice {
         _ctx: &RequestContext,
     ) -> crate::nbd::block_device::Result<()> {
         let blocks = self.block_calc.blocks(offset, length);
-
+        let mut futs = FuturesUnordered::new();
         for block in blocks.into_iter() {
             let abs_offset = self
                 .block_calc
@@ -65,18 +66,32 @@ impl BlockDevice for NbdDevice {
             let length = block.range.end - block.range.start;
             assert!(length > 0 && length <= self.block_size);
 
-            let bytes = {
-                let lock = self.vbd.as_ref().unwrap().read().await;
+            let fut = {
+                let vbd = self.vbd.as_ref().unwrap();
+                async move {
+                    let res = {
+                        let lock = vbd.read().await;
 
-                lock.get(block.block_no as usize).await?.map(|b| {
-                    if block.partial {
-                        b.slice((block.range.start as usize)..(block.range.end as usize))
-                    } else {
-                        b
-                    }
-                })
+                        lock.get(block.block_no as usize).await.map(|b| {
+                            b.map(|b| {
+                                if block.partial {
+                                    b.slice(
+                                        (block.range.start as usize)..(block.range.end as usize),
+                                    )
+                                } else {
+                                    b
+                                }
+                            })
+                        })
+                    };
+                    (res, abs_offset, length)
+                }
             };
+            futs.push(fut);
+        }
 
+        while let Some((res, abs_offset, length)) = futs.next().await {
+            let bytes = res?;
             if let Some(bytes) = bytes {
                 queue.data(abs_offset, length, bytes).await?;
             } else {
