@@ -761,6 +761,9 @@ impl VirtualBlockDevice {
         max_chunk_size: u64,
         db_file: impl AsRef<Path>,
         max_db_connections: u8,
+        cache_dir: impl AsRef<Path>,
+        cache_memory_use: usize,
+        cache_disk_use: u64,
         branch: BranchName,
         volume: VolumeHandler,
         initial_sync_delay: Duration,
@@ -779,7 +782,7 @@ impl VirtualBlockDevice {
                 wal_dir.display()
             ),
         }
-        let cache = Cache::new(1024 * 1024 * 1, 1024 * 1024 * 1024, "/tmp/foo/cache/").await?;
+        let cache = Cache::new(cache_memory_use, cache_disk_use, cache_dir).await?;
         let wal_man = Arc::new(WalMan::new(&wal_dir, max_wal_size));
         let name = volume.volume_info().name.clone();
         let inventory = Arc::new(RwLock::new(

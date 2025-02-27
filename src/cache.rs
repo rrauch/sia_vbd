@@ -99,7 +99,7 @@ impl CacheId for SnapshotId {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 pub(crate) enum CacheKey {
     #[serde(rename = "B")]
     Block(BlockId),
@@ -157,7 +157,7 @@ pub struct Cache {
 impl Cache {
     pub async fn new(
         max_memory_use: usize,
-        max_disk_use: usize,
+        max_disk_use: u64,
         disk_path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
         let admission_picker = Arc::new(AdmitAllPicker::default());
@@ -180,7 +180,9 @@ impl Cache {
                     .with_eviction_pickers(vec![Box::<FifoPicker>::default()]),
             )
             .with_admission_picker(admission_picker)
-            .with_device_options(DirectFsDeviceOptions::new(disk_path).with_capacity(max_disk_use))
+            .with_device_options(
+                DirectFsDeviceOptions::new(disk_path).with_capacity(max_disk_use as usize),
+            )
             .build()
             .await?;
 

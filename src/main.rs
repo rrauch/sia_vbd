@@ -139,6 +139,14 @@ fn default_read_only() -> bool {
     false
 }
 
+fn default_cache_max_memory() -> ByteSize {
+    ByteSize::mib(64)
+}
+
+fn default_cache_max_disk() -> ByteSize {
+    ByteSize::gib(4)
+}
+
 #[derive(Deserialize)]
 struct VolumeConfig {
     repository: String,
@@ -155,6 +163,11 @@ struct VolumeConfig {
     #[serde(default = "default_max_chunk_size")]
     max_chunk_size: ByteSize,
     inventory: PathBuf,
+    cache: PathBuf,
+    #[serde(default = "default_cache_max_memory")]
+    cache_max_memory: ByteSize,
+    #[serde(default = "default_cache_max_disk")]
+    cache_max_disk: ByteSize,
     #[serde(default = "default_max_db_connections")]
     max_db_connections: u8,
     #[serde(default = "default_branch")]
@@ -435,6 +448,9 @@ async fn main() -> anyhow::Result<()> {
             config.max_chunk_size.as_u64(),
             config.inventory.join("sia_vbd_inventory.sqlite"),
             config.max_db_connections,
+            config.cache,
+            config.cache_max_memory.as_u64() as usize,
+            config.cache_max_disk.as_u64(),
             config.branch.try_into()?,
             volume_handler,
             config.initial_sync_delay,
