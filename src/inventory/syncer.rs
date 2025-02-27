@@ -1,5 +1,7 @@
 use crate::hash::Hash;
-use crate::inventory::chunk::{Chunk, ChunkContent, ChunkEntry, ChunkId, ChunkWriter, Manifest};
+use crate::inventory::chunk::{
+    Chunk, ChunkContent, ChunkEntry, ChunkId, ChunkWriter, Manifest, ManifestId,
+};
 use crate::inventory::{commit_from_db, sync_chunk, sync_chunk_file, sync_manifest};
 use crate::repository::VolumeHandler;
 use crate::vbd::{BlockId, BranchName, ClusterId, Commit, FixedSpecs, SnapshotId};
@@ -185,7 +187,86 @@ async fn sync_loop(
         {
             tracing::error!(error = %err, "error packing chunks");
         }
+
+        if ct.is_cancelled() {
+            return (chunk_writer, incomplete_commit);
+        }
+
+        if let Err(err) = gc(&pool, &volume).await {
+            tracing::error!(error = %err, "error during garbage collection");
+        }
     }
+}
+
+async fn gc(pool: &SqlitePool, volume: &VolumeHandler) -> anyhow::Result<()> {
+    tracing::debug!("deleting obsolete chunks");
+    let mut chunks_deleted = 0;
+    loop {
+        let mut tx = pool.write().begin().await?;
+        match sqlx::query!("SELECT chunk_id FROM chunk_files WHERE critical = 0 LIMIT 1")
+            .fetch_optional(tx.as_mut())
+            .await?
+            .map(|r| TryInto::<ChunkId>::try_into(r.chunk_id.as_slice()))
+            .transpose()?
+        {
+            Some(chunk_id) => {
+                tracing::debug!(chunk_id = %chunk_id, "deleting obsolete chunk");
+                let id = chunk_id.as_bytes().as_slice();
+                let rows_affected = sqlx::query!("DELETE FROM chunk_files WHERE chunk_id = ?", id)
+                    .execute(tx.as_mut())
+                    .await?
+                    .rows_affected();
+                if rows_affected > 0 {
+                    tracing::trace!(rows_affected, "database entry deleted");
+                }
+                volume.delete_chunk(&chunk_id).await?;
+                tx.commit().await?;
+                chunks_deleted += 1;
+            }
+            None => {
+                tx.commit().await?;
+                break;
+            }
+        }
+    }
+    if chunks_deleted > 0 {
+        tracing::info!(chunks_deleted, "deleted obsolete chunks");
+    }
+
+    let mut manifests_deleted = 0;
+    tracing::debug!("deleting obsolete manifests");
+    loop {
+        let mut tx = pool.write().begin().await?;
+        match sqlx::query!("SELECT id FROM manifests WHERE prunable >= entries LIMIT 1")
+            .fetch_optional(tx.as_mut())
+            .await?
+            .map(|r| TryInto::<ManifestId>::try_into(r.id.as_slice()))
+            .transpose()?
+        {
+            Some(manifest_id) => {
+                tracing::debug!(manifest_id = %manifest_id, "deleting obsolete manifest");
+                let id = manifest_id.as_bytes().as_slice();
+                let rows_affected = sqlx::query!("DELETE FROM manifests WHERE id = ?", id)
+                    .execute(tx.as_mut())
+                    .await?
+                    .rows_affected();
+                if rows_affected > 0 {
+                    tracing::trace!(rows_affected, "database entry deleted");
+                }
+                volume.delete_manifest(&manifest_id).await?;
+                tx.commit().await?;
+                manifests_deleted += 1;
+            }
+            None => {
+                tx.commit().await?;
+                break;
+            }
+        }
+    }
+    if manifests_deleted > 0 {
+        tracing::info!(manifests_deleted, "deleted obsolete manifests");
+    }
+    Ok(())
 }
 
 async fn delete_expendable_wal_files(pool: &SqlitePool, wal_man: &WalMan) -> anyhow::Result<()> {
