@@ -17,14 +17,13 @@ SET critical = (SELECT COUNT(*)
                                   OR ac.snapshot_id = kc.snapshot_id)
                 WHERE ac.chunk_id = chunk_files.chunk_id
                   AND kc.used > 0
-                  AND kc.wal_avail = 0
                   AND kc.chunk_avail <= 1);
 
 CREATE TRIGGER adjust_chunk_critical_after_insert
     AFTER INSERT
     ON known_content
     FOR EACH ROW
-    WHEN (NEW.used > 0 AND NEW.chunk_avail = 1 AND NEW.wal_avail = 0)
+    WHEN (NEW.used > 0 AND NEW.chunk_avail <= 1)
 BEGIN
     UPDATE chunk_files
     SET critical = critical + 1
@@ -43,9 +42,8 @@ CREATE TRIGGER adjust_chunk_critical_after_update_activated
     FOR EACH ROW
     WHEN (
         NEW.used > 0 AND
-        NEW.chunk_avail = 1 AND
-        NEW.wal_avail = 0 AND
-        (OLD.used IS NULL OR OLD.used = 0 OR OLD.wal_avail > 0)
+        NEW.chunk_avail <= 1 AND
+        (OLD.used IS NULL OR OLD.used = 0 OR OLD.chunk_avail > 1)
         )
 BEGIN
     UPDATE chunk_files
@@ -65,11 +63,9 @@ CREATE TRIGGER adjust_chunk_critical_after_update_deactivated
     FOR EACH ROW
     WHEN (
         (NEW.used = 0 OR
-         NEW.wal_avail > 0 OR
-         NEW.chunk_avail != 1) AND
-        OLD.chunk_avail = 1 AND
-        OLD.used > 0 AND
-        OLD.wal_avail = 0
+         NEW.chunk_avail > 1) AND
+        OLD.chunk_avail <= 1 AND
+        OLD.used > 0
         )
 BEGIN
     UPDATE chunk_files
