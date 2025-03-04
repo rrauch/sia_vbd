@@ -12,7 +12,8 @@ use crate::repository::renterd::{RenterdRepository, RenterdVolume};
 use crate::serde::encoded::{Decoded, DecodedStream, Decoder, EncodingSinkBuilder};
 use crate::serde::Compressor;
 use crate::vbd::{
-    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitMut, FixedSpecs, Snapshot, VbdId,
+    Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitId, CommitMut, FixedSpecs,
+    Snapshot, VbdId,
 };
 use crate::{now, Etag};
 use anyhow::{anyhow, bail};
@@ -78,6 +79,17 @@ pub trait Repository: Send {
         initial_commit: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
     fn delete(&self, vbd_id: &VbdId) -> impl Future<Output = Result<(), Self::Error>>;
+    fn write_branch(
+        &self,
+        vbd_id: &VbdId,
+        branch_name: &BranchName,
+        data: Bytes,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn delete_branch(
+        &self,
+        vbd_id: &VbdId,
+        branch_name: &BranchName,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 pub(crate) trait Volume: Send {
@@ -205,14 +217,16 @@ impl RepositoryHandler {
                 let (info, stream) = fs.details(vbd_id).await?;
                 (
                     info,
-                    Box::new(stream) as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
+                    Box::new(stream)
+                        as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
                 )
             }
             Self::RenterdRepo(renterd) => {
                 let (info, stream) = renterd.details(vbd_id).await?;
                 (
                     info,
-                    Box::new(stream) as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
+                    Box::new(stream)
+                        as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
                 )
             }
         };
@@ -312,6 +326,60 @@ impl RepositoryHandler {
         }
 
         Ok(vbd_id)
+    }
+
+    pub async fn create_branch(
+        &self,
+        name: impl AsRef<str>,
+        volume_id: &VbdId,
+        commit_id: &CommitId,
+    ) -> anyhow::Result<(BranchName, BranchInfo)> {
+        let branch_name = BranchName::try_from(name.as_ref())
+            .map_err(|e| anyhow!("invalid branch name: {}", e))?;
+        let (_, mut branches) = self.volume_details(volume_id).await?;
+        let mut commit = None;
+        while let Some((existing, info)) = branches.try_next().await? {
+            if &branch_name == &existing {
+                bail!("branch {} already exists", branch_name);
+            }
+            if info.commit.content_id() == commit_id {
+                commit = Some(info.commit);
+            }
+        }
+        let commit = commit.ok_or(anyhow!("commit {} not found", commit_id))?;
+        let branch_info = BranchInfo { commit };
+        let mut buf = BytesMut::zeroed(4096);
+        let mut cursor = Cursor::new(buf.as_mut());
+        write_branch(&mut cursor, &branch_info).await?;
+        let len = cursor.position() as usize;
+        drop(cursor);
+        buf.truncate(len);
+        let branch_bytes = buf.freeze();
+
+        match self {
+            Self::FsRepo(fs) => {
+                fs.write_branch(&volume_id, &branch_name, branch_bytes)
+                    .await?
+            }
+            Self::RenterdRepo(renterd) => {
+                renterd
+                    .write_branch(&volume_id, &branch_name, branch_bytes)
+                    .await?
+            }
+        }
+
+        Ok((branch_name, branch_info))
+    }
+
+    pub async fn delete_branch(
+        &self,
+        volume_id: &VbdId,
+        branch_name: &BranchName,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::FsRepo(fs) => fs.delete_branch(&volume_id, &branch_name).await,
+            Self::RenterdRepo(renterd) => renterd.delete_branch(&volume_id, &branch_name).await,
+        }
     }
 }
 
@@ -753,10 +821,7 @@ impl WrappedVolume {
         })
     }
 
-    async fn manifest_reader(
-        &self,
-        id: &ManifestId,
-    ) -> anyhow::Result<Box<dyn Reader + 'static>> {
+    async fn manifest_reader(&self, id: &ManifestId) -> anyhow::Result<Box<dyn Reader + 'static>> {
         Ok(match &self {
             WrappedVolume::FsVolume(fs) => Box::new(fs.read_manifest(id).await?),
             WrappedVolume::RenterdVolume(renterd) => Box::new(renterd.read_manifest(id).await?),

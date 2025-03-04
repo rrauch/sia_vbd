@@ -56,6 +56,10 @@ impl RenterdRepository {
             .path
             .try_join(format!("{}.volume", vbd_id).as_str(), true)?)
     }
+
+    fn commits_path(&self, vbd_id: &VbdId) -> anyhow::Result<Path> {
+        self.volume_path(vbd_id)?.try_join("commits", true)
+    }
 }
 
 impl Repository for RenterdRepository {
@@ -195,13 +199,7 @@ impl Repository for RenterdRepository {
             let name = format!("{:02x}", i);
             mkdir(&self.renterd, name.as_str(), chunk_dir.path(), &self.bucket).await?;
         }
-        mkdir(
-            &self.renterd,
-            "manifests",
-            volume_dir.path(),
-            &self.bucket,
-        )
-        .await?;
+        mkdir(&self.renterd, "manifests", volume_dir.path(), &self.bucket).await?;
         Ok(())
     }
 
@@ -211,6 +209,39 @@ impl Repository for RenterdRepository {
             .worker()
             .object()
             .delete(&path, Some(self.bucket.to_string()), true)
+            .await?;
+        Ok(())
+    }
+
+    async fn write_branch(
+        &self,
+        vbd_id: &VbdId,
+        branch_name: &BranchName,
+        data: Bytes,
+    ) -> anyhow::Result<()> {
+        let len = data.len() as u64;
+        write_file(
+            &self.renterd,
+            &self.commits_path(vbd_id)?,
+            format!("{}.branch", branch_name.as_ref()).as_str(),
+            &self.bucket,
+            None,
+            Cursor::new(data),
+            Some(len),
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_branch(&self, vbd_id: &VbdId, branch_name: &BranchName) -> anyhow::Result<()> {
+        let path = self
+            .commits_path(vbd_id)?
+            .try_join(format!("{}.branch", branch_name.as_ref()).as_str(), false)?;
+        self.renterd
+            .bus()
+            .object()
+            .delete(path, Some(self.bucket.to_string()), false)
             .await?;
         Ok(())
     }
@@ -437,10 +468,7 @@ impl Volume for RenterdVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn read_manifest(
-        &self,
-        id: &ManifestId,
-    ) -> Result<impl Reader + 'static, Self::Error> {
+    async fn read_manifest(&self, id: &ManifestId) -> Result<impl Reader + 'static, Self::Error> {
         let path = self
             .manifests
             .path()

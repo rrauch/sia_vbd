@@ -296,7 +296,7 @@ this may take some time. Make sure the process is not killed prematurely.
 - **cache_max_memory:** Maximum size of L1 (in-memory) content cache. *Optional, default: `64MiB`*
 - **cache_max_disk:** Maximum size of L2 (on-disk) content cache. *Optional, default: `4GiB`*
 - **max_db_connections:** Maximum number of simultaneous database connections. *Optional, default: `25`*
-- **branch:** Name of the default `Branch`. *Optional, default: `main`*
+- **branch:** Name of the `Branch` to use. *Optional, default: `main`*
 - **initial_sync_delay:** Delay after startup before running background synchronisation. *Optional, default: `60s`
 - **sync_interval:** Interval at which to run background synchronisation. *Optional, default `300s`*
 - **read_only:** `Volume` should be exported `read-only`. *Optional, default `false`*

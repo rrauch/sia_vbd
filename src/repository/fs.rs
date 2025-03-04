@@ -195,6 +195,25 @@ impl Repository for FsRepository {
         tokio::fs::remove_dir(&volume_dir).await?;
         Ok(())
     }
+
+    async fn write_branch(
+        &self,
+        vbd_id: &VbdId,
+        branch_name: &BranchName,
+        data: Bytes,
+    ) -> anyhow::Result<()> {
+        let volume_dir = self.root_dir.join(format!("{}", &vbd_id));
+        write_commit(&volume_dir.join("commits"), branch_name, data).await
+    }
+
+    async fn delete_branch(&self, vbd_id: &VbdId, branch_name: &BranchName) -> anyhow::Result<()> {
+        let volume_dir = self.root_dir.join(format!("{}", &vbd_id));
+        let path = volume_dir
+            .join("commits")
+            .join(format!("{}.branch", branch_name));
+        tokio::fs::remove_file(path).await?;
+        Ok(())
+    }
 }
 
 async fn etag(path: impl AsRef<Path>) -> Result<Etag, std::io::Error> {
@@ -320,10 +339,7 @@ impl Volume for FsVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn read_manifest(
-        &self,
-        id: &ManifestId,
-    ) -> Result<impl Reader + 'static, Self::Error> {
+    async fn read_manifest(&self, id: &ManifestId) -> Result<impl Reader + 'static, Self::Error> {
         let path = self.manifest_dir.join(format!("{}.manifest", id));
         Ok(TokioFile::open(&path).await?)
     }
@@ -401,9 +417,7 @@ impl Volume for FsVolume {
     }
 
     async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
-        let path = self.commits_dir.join(format!("{}.branch", branch.as_ref()));
-        write_file(&path, Cursor::new(commit)).await?;
-        Ok(())
+        write_commit(&self.commits_dir, branch, commit).await
     }
 
     async fn read_commit(&self, branch: &BranchName) -> Result<Bytes, Self::Error> {
@@ -414,6 +428,16 @@ impl Volume for FsVolume {
 async fn read_commit(commits_dir: &Path, branch: &BranchName) -> Result<Bytes, anyhow::Error> {
     let path = commits_dir.join(format!("{}.branch", branch.as_ref()));
     read_file(&path, MAX_COMMIT_FILE_SIZE).await
+}
+
+async fn write_commit(
+    commits_dir: &Path,
+    branch: &BranchName,
+    commit: Bytes,
+) -> Result<(), anyhow::Error> {
+    let path = commits_dir.join(format!("{}.branch", branch.as_ref()));
+    write_file(&path, Cursor::new(commit)).await?;
+    Ok(())
 }
 
 async fn list_branches(

@@ -6,13 +6,13 @@ use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use indicatif::ProgressBar;
 use serde::Deserialize;
-use sia_vbd::hash::HashAlgorithm;
+use sia_vbd::hash::{Hash, HashAlgorithm};
 use sia_vbd::nbd::{Builder, RunGuard};
 use sia_vbd::repository::fs::FsRepository;
 use sia_vbd::repository::renterd::RenterdRepository;
 use sia_vbd::repository::{RepositoryHandler, VolumeHandler};
 use sia_vbd::vbd::nbd_device::NbdDevice;
-use sia_vbd::vbd::{BlockSize, BranchName, ClusterSize, VbdId, VirtualBlockDevice};
+use sia_vbd::vbd::{BlockSize, BranchName, ClusterSize, CommitId, VbdId, VirtualBlockDevice};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,9 @@ enum Commands {
     /// Volume related actions
     #[command(subcommand)]
     Volume(VolumeCommands),
+    /// Branch related actions
+    #[command(subcommand)]
+    Branch(BranchCommands),
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,6 +96,30 @@ enum VolumeCommands {
         repo: String,
         /// Id of the volume to delete
         volume_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BranchCommands {
+    /// Create a new Branch from a given Commit Id
+    Create {
+        /// Name of new Branch
+        name: String,
+        /// Existing Commit Id the new Branch should be based on
+        commit: String,
+        /// Name of repository
+        repo: String,
+        /// Id of the volume
+        volume_id: String,
+    },
+    /// Delete a specific Branch
+    Delete {
+        /// Name of repository
+        repo: String,
+        /// Id of the volume
+        volume_id: String,
+        /// Name of Branch to delete
+        name: String,
     },
 }
 
@@ -384,6 +411,33 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or(anyhow!("repository [{}] not found", repo_name))?;
 
                 delete_volume(&repo, repo_name.as_str(), volume_id).await?;
+                return Ok(());
+            }
+        },
+        Some(Commands::Branch(cmd)) => match cmd {
+            BranchCommands::Create {
+                name,
+                commit,
+                repo,
+                volume_id,
+            } => {
+                let repo_name = repo;
+                let repo = repositories
+                    .get(&repo_name)
+                    .ok_or(anyhow!("repository [{}] not found", repo_name))?;
+                create_branch(&repo, repo_name.as_str(), volume_id, name, commit).await?;
+                return Ok(());
+            }
+            BranchCommands::Delete {
+                repo,
+                volume_id,
+                name,
+            } => {
+                let repo_name = repo;
+                let repo = repositories
+                    .get(&repo_name)
+                    .ok_or(anyhow!("repository [{}] not found", repo_name))?;
+                delete_branch(&repo, repo_name.as_str(), volume_id, name).await?;
                 return Ok(());
             }
         },
@@ -694,6 +748,141 @@ async fn delete_volume(
 
     repo.delete_volume(&vbd_id).await?;
     pb.finish_with_message("Volume deleted successfully");
+    println!();
+    println!();
+    Ok(())
+}
+
+async fn create_branch(
+    repo: &RepositoryHandler,
+    repo_name: &str,
+    volume_id: String,
+    branch_name: String,
+    commit: String,
+) -> anyhow::Result<()> {
+    println!("Selected Repository: {} - {}", repo_name, repo);
+    println!();
+
+    let vbd_id =
+        VbdId::try_from(volume_id.as_str()).map_err(|e| anyhow!("volume id is invalid: {}", e))?;
+
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.set_message("retrieving volume details");
+
+    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
+
+    pb.finish_and_clear();
+
+    println!(
+        "Selected Volume: {}",
+        volume_info
+            .name
+            .as_ref()
+            .map(|n| format!("{} ({})", n, &vbd_id))
+            .unwrap_or(vbd_id.to_string())
+    );
+    println!();
+
+    let commit_id = CommitId::try_from(
+        Hash::try_from((commit.as_str(), volume_info.specs.meta_hash()))
+            .map_err(|e| anyhow!("commit id in invalid: {}", e))?,
+    )?;
+
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.set_message("Branch creation in progress");
+
+    let (branch_name, branch_info) = repo.create_branch(branch_name, &vbd_id, &commit_id).await?;
+
+    pb.finish_with_message("Branch created successfully");
+    println!();
+    println!();
+    let cluster_size_bytes = *volume_info.specs.block_size() * *volume_info.specs.cluster_size();
+    let cluster_size_display = ByteSize::b(cluster_size_bytes as u64);
+    let size = ByteSize::b((branch_info.commit.num_clusters() * cluster_size_bytes) as u64);
+    println!("Branch Name:   {}", branch_name);
+    println!("Latest Commit: {}", branch_info.commit.content_id());
+    println!("Committed at:  {}", branch_info.commit.committed());
+    println!(
+        "Size:          {} ({} clusters @ {})",
+        size.to_string_as(true),
+        branch_info.commit.num_clusters(),
+        cluster_size_display.to_string_as(true)
+    );
+    println!();
+    Ok(())
+}
+
+async fn delete_branch(
+    repo: &RepositoryHandler,
+    repo_name: &str,
+    volume_id: String,
+    branch_name: String,
+) -> anyhow::Result<()> {
+    let branch_name =
+        BranchName::try_from(branch_name).map_err(|e| anyhow!("invalid branch name: {}", e))?;
+    println!("Selected Repository: {} - {}", repo_name, repo);
+    println!();
+
+    let vbd_id =
+        VbdId::try_from(volume_id.as_str()).map_err(|e| anyhow!("volume id is invalid: {}", e))?;
+
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.set_message("retrieving volume details");
+
+    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
+    let mut branch_info = None;
+
+    while let Some((existing, info)) = branches.try_next().await? {
+        if &branch_name == &existing {
+            branch_info = Some(info);
+            break;
+        }
+    }
+
+    pb.finish_and_clear();
+
+    let branch_info = branch_info.ok_or(anyhow!("branch {} not found", branch_name))?;
+
+    println!(
+        "Selected Volume: {}",
+        volume_info
+            .name
+            .as_ref()
+            .map(|n| format!("{} ({})", n, &vbd_id))
+            .unwrap_or(vbd_id.to_string())
+    );
+    println!();
+
+    println!("Deletion of the following Branch:");
+    let cluster_size_bytes = *volume_info.specs.block_size() * *volume_info.specs.cluster_size();
+    let cluster_size_display = ByteSize::b(cluster_size_bytes as u64);
+    let size = ByteSize::b((branch_info.commit.num_clusters() * cluster_size_bytes) as u64);
+    println!("Branch Name:   {}", branch_name);
+    println!("Latest Commit: {}", branch_info.commit.content_id());
+    println!("Committed at:  {}", branch_info.commit.committed());
+    println!(
+        "Size:          {} ({} clusters @ {})",
+        size.to_string_as(true),
+        branch_info.commit.num_clusters(),
+        cluster_size_display.to_string_as(true)
+    );
+    println!();
+    println!("WARNING: This operation can NOT be undone. DATA LOSS IMMINENT!");
+    println!("Only proceed if you are sure you want to PERMANENTLY DELETE the above branch!");
+    println!();
+    if !ask_confirmation("Are you sure you want to delete this branch (y/n)?").await {
+        println!("Aborting");
+        return Ok(());
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.set_message("Branch deletion in progress");
+
+    repo.delete_branch(&vbd_id, &branch_name).await?;
+    pb.finish_with_message("Branch deleted successfully");
     println!();
     println!();
     Ok(())
