@@ -10,15 +10,17 @@ use sia_vbd::hash::{Hash, HashAlgorithm};
 use sia_vbd::nbd::{Builder, RunGuard};
 use sia_vbd::repository::fs::FsRepository;
 use sia_vbd::repository::renterd::RenterdRepository;
-use sia_vbd::repository::{RepositoryHandler, VolumeHandler};
+use sia_vbd::repository::RepositoryHandler;
 use sia_vbd::vbd::nbd_device::NbdDevice;
 use sia_vbd::vbd::{BlockSize, BranchName, ClusterSize, CommitId, VbdId, VirtualBlockDevice};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::Level;
+use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -89,6 +91,19 @@ enum VolumeCommands {
         #[arg(short = 'm')]
         #[clap(default_value = "blake3")]
         meta_hash: HashAlgorithm,
+    },
+    /// Resize a specific volume
+    Resize {
+        /// Name of repository
+        repo: String,
+        /// Id of the volume to resize
+        volume_id: String,
+        /// Branch to resize
+        #[arg(short = 'b')]
+        #[clap(default_value = "main")]
+        branch: String,
+        /// New size of Volume
+        size: ByteSize,
     },
     /// Delete a specific volume
     Delete {
@@ -312,13 +327,14 @@ impl TryFrom<RepoConfig> for RepositoryHandler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        //.without_time()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(Level::INFO.into())
-                .from_env_lossy(),
-        )
+    let filter = EnvFilter::builder()
+        .with_default_directive(Level::INFO.into())
+        .from_env_lossy();
+    let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::Layer::default())
         .init();
 
     let arguments = Arguments::parse();
@@ -404,6 +420,43 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
                 return Ok(());
             }
+            VolumeCommands::Resize {
+                repo,
+                volume_id,
+                branch,
+                size,
+            } => {
+                let repo_name = repo;
+                let repo = repositories
+                    .get(&repo_name)
+                    .ok_or(anyhow!("repository [{}] not found", repo_name))?;
+
+                let volume_config = config
+                    .volume
+                    .as_ref()
+                    .ok_or(anyhow!("no volumes configured"))?
+                    .iter()
+                    .find(|v| &v.repository == &repo_name && &v.volume_id == &volume_id)
+                    .ok_or(anyhow!("no config found for volume {}", volume_id))?;
+
+                reload_handle.modify(|layer| {
+                    *layer = EnvFilter::builder()
+                        .with_default_directive(Level::ERROR.into())
+                        .with_env_var("__DISABLE_RUST_LOG__")
+                        .from_env_lossy()
+                })?;
+
+                resize_volume(
+                    &repo,
+                    repo_name.as_str(),
+                    volume_id,
+                    volume_config,
+                    branch,
+                    size.as_u64(),
+                )
+                .await?;
+                return Ok(());
+            }
             VolumeCommands::Delete { repo, volume_id } => {
                 let repo_name = repo;
                 let repo = repositories
@@ -477,13 +530,13 @@ async fn main() -> anyhow::Result<()> {
             "configuration error: repository [{}] not found",
             &config.repository
         ))?;
-        let branch = BranchName::try_from(&config.branch).map_err(|e| {
+        let branch = BranchName::try_from(&config.branch).map_err(|_| {
             anyhow!(
                 "configuration error: invalid branch name [{}]",
                 config.branch
             )
         })?;
-        let vbd_id = VbdId::try_from(config.volume_id.as_str()).map_err(|e| {
+        let vbd_id = VbdId::try_from(config.volume_id.as_str()).map_err(|_| {
             anyhow!(
                 "configuration error: invalid volume_id [{}]",
                 config.volume_id
@@ -721,6 +774,120 @@ inventory = "<path to inventory directory>"
     Ok(())
 }
 
+async fn resize_volume(
+    repo: &RepositoryHandler,
+    repo_name: &str,
+    volume_id: String,
+    config: &VolumeConfig,
+    branch_name: String,
+    size: u64,
+) -> anyhow::Result<()> {
+    let vbd_id =
+        VbdId::try_from(volume_id.as_str()).map_err(|e| anyhow!("volume id is invalid: {}", e))?;
+    let branch_name =
+        BranchName::try_from(branch_name).map_err(|e| anyhow!("invalid branch name: {}", e))?;
+
+    println!("Selected Repository: {} - {}", repo_name, repo);
+    println!();
+    println!("Resize the following Volume:");
+    println!();
+    volume_details(repo, &vbd_id).await?;
+    println!();
+
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.set_message("retrieving volume details");
+    let mut branch_info = None;
+    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
+    let specs = volume_info.specs;
+    while let Some((name, info)) = branches.try_next().await? {
+        if &name == &branch_name {
+            branch_info = Some(info);
+            break;
+        }
+    }
+    pb.finish_and_clear();
+    let branch_info = branch_info.ok_or(anyhow!("branch {} not found", branch_name))?;
+    let cluster_size_bytes = *specs.block_size() * *specs.cluster_size();
+    let cluster_size_display = ByteSize::b(cluster_size_bytes as u64);
+
+    if size < cluster_size_bytes as u64 {
+        bail!(
+            "'size' must be equivalent to at least {} bytes",
+            cluster_size_bytes
+        );
+    }
+
+    let old_size = ByteSize::b((branch_info.commit.num_clusters() * cluster_size_bytes) as u64);
+    let num_clusters = (size as usize + cluster_size_bytes - 1) / cluster_size_bytes;
+
+    println!(
+        "Current Size: {} ({} clusters @ {})",
+        old_size.to_string_as(true),
+        branch_info.commit.num_clusters(),
+        cluster_size_display.to_string_as(true)
+    );
+
+    println!(
+        "New Size: {} ({} clusters @ {})",
+        ByteSize::b(size).to_string_as(true),
+        num_clusters,
+        cluster_size_display.to_string_as(true)
+    );
+
+    println!();
+
+    if num_clusters == branch_info.commit.num_clusters() {
+        println!("Size is already as requested. Nothing needs to be done.");
+        println!();
+        return Ok(());
+    }
+
+    if num_clusters < branch_info.commit.num_clusters() {
+        println!("WARNING: You are SHRINKING the volume. Any existing data beyond the new size WILL BE LOST!");
+    }
+    println!("Only proceed if you are sure you want to PERMANENTLY RESIZE the above volume!");
+    println!();
+    if !ask_confirmation("Are you sure you want to resize this volume (y/n)?").await {
+        println!("Aborting");
+        return Ok(());
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.set_message("Volume resize in progress");
+
+    let volume_handler = repo
+        .open_volume(&vbd_id, &branch_name)
+        .await
+        .map_err(|e| anyhow!("unable to open volume [{}]: {}", vbd_id, e))?;
+
+    let mut vbd = VirtualBlockDevice::new(
+        config.max_write_buffer.as_u64() as usize,
+        &config.wal,
+        config.max_wal_size.as_u64(),
+        config.max_tx_size.as_u64(),
+        config.max_chunk_size.as_u64(),
+        config.inventory.join("sia_vbd_inventory.sqlite"),
+        config.max_db_connections,
+        &config.cache,
+        config.cache_max_memory.as_u64() as usize,
+        config.cache_max_disk.as_u64(),
+        branch_name,
+        volume_handler,
+        config.initial_sync_delay,
+        config.sync_interval,
+    )
+    .await
+    .map_err(|e| anyhow!("unable to instantiate volume [{}]: {}", vbd_id, e))?;
+    vbd.resize(num_clusters).await?;
+    vbd.close().await?;
+
+    pb.finish_with_message("Volume resized successfully");
+    println!();
+    println!();
+    Ok(())
+}
+
 async fn delete_volume(
     repo: &RepositoryHandler,
     repo_name: &str,
@@ -770,7 +937,7 @@ async fn create_branch(
     pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_message("retrieving volume details");
 
-    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
+    let (volume_info, _) = repo.volume_details(&vbd_id).await?;
 
     pb.finish_and_clear();
 

@@ -634,8 +634,6 @@ impl Uncommitted {
             let mut snapshot =
                 SnapshotMut::from_snapshot(previous_snapshot.clone(), config.specs.clone());
 
-            let mut non_zero_clusters = 0;
-
             for (cluster_no, modified_blocks) in modified_data.clusters.drain() {
                 let cluster_id = previous_snapshot
                     .clusters
@@ -656,13 +654,13 @@ impl Uncommitted {
 
                 if cluster.content_id() != config.zero_cluster.content_id() {
                     wal.put(&cluster).await?;
-                    non_zero_clusters += 1;
                 }
                 snapshot.clusters[cluster_no] = cluster.content_id.clone();
             }
 
             let snapshot = snapshot.finalize();
-            if non_zero_clusters > 0 {
+            // making sure this is not an empty snapshot
+            if snapshot.content_id() != config.specs.zero_snapshot(snapshot.len()).content_id() {
                 wal.put(&snapshot).await?;
             }
 
@@ -822,16 +820,15 @@ impl VirtualBlockDevice {
             .ok_or(anyhow!("unable to load snapshot [{}]", commit.snapshot()))?;
         drop(lock);
 
-        eprintln!("vbd id: {}", config.specs.vbd_id());
-        if let Some(name) = name {
-            eprintln!("vbd name: {}", name);
-        }
-        eprintln!("branch: {}", branch);
-        eprintln!("commit: {} @ {}", commit.content_id(), commit.committed);
-        eprintln!(
-            "snapshot: {} @ {} clusters",
-            snapshot.content_id(),
-            snapshot.clusters.len()
+        tracing::info!(
+            vbd_id = %config.specs.vbd_id(),
+            vbd_name = name,
+            branch = %branch,
+            commit_id = %commit.content_id(),
+            commit_time = %commit.committed,
+            snapshot_id = %snapshot.content_id(),
+            snapshot_len = snapshot.len(),
+            "volume instantiated"
         );
 
         Ok(Self {
@@ -889,6 +886,26 @@ impl VirtualBlockDevice {
         }
 
         Ok(clustered_blocks)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn resize(&mut self, num_clusters: usize) -> Result<(), anyhow::Error> {
+        tracing::trace!("resize called");
+        // commit any pending changes first
+        self.commit().await?;
+
+        // create new snapshot & resize
+        let mut snapshot =
+            SnapshotMut::from_snapshot(self.state.snapshot().clone(), self.config.specs.clone());
+        snapshot.resize(num_clusters);
+        let snapshot = snapshot.finalize();
+
+        // start new tx & commit new snapshot
+        let state = self.prepare_writing().await?;
+        state.previous_snapshot = snapshot;
+        self.commit().await?;
+
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -1274,6 +1291,12 @@ impl SnapshotMut {
 
     pub fn clusters(&mut self) -> &mut Vec<ClusterId> {
         &mut self.clusters
+    }
+
+    pub fn resize(&mut self, num_clusters: usize) {
+        let zero_cluster = self.specs.zero_cluster();
+        self.clusters
+            .resize_with(num_clusters, || zero_cluster.content_id().clone());
     }
 
     fn calc_content_id(&self) -> SnapshotId {
