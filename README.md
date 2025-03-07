@@ -15,6 +15,8 @@ branching, and are deduplicated and compressed.
   held data remains available (until eventual garbage collection).
 - **Content-Addressed Storage:** All data is hashed and identified by its content ID for integrity and deduplication.
 - **Content Compression:** Transparently compresses content (`Zstd`) before uploading.
+- **Branching & Tagging:** Volumes support multiple active branches. Tagging and retaining specific states is also
+  possible.
 - **Transactional Writes:** Atomic writes with automatic rollback on failure.
 - **Write-Ahead Logging:** Records transactions in a local, durable `WAL` before being committed to eventual storage.
 - **Caching:** Recently accessed content is cached locally, improving read performance significantly. The cache is
@@ -23,6 +25,7 @@ branching, and are deduplicated and compressed.
 - **Background Synchronization:** Continuously uploads new data to the backend in the background, allowing fast writes
   and avoids blocking reads.
 - **Automatic Garbage Collection:** Unreferenced data will be deleted eventually.
+- **Resizing:** Volumes can be freely resized on a per-branch basis.
 - **Multiple Block Devices and Backends:** Supports multiple block devices, across one or more `renterd` instances.
 - **Single Binary, Single Process:** Delivered as a single, self-contained binary that runs as a single
   process, making deployment easy and straightforward.
@@ -30,15 +33,6 @@ branching, and are deduplicated and compressed.
   configure and fine-tune.
 - **CLI Interface:** Includes an easy-to-use CLI for common operations.
 - **`Docker` and `systemd` support**,
-
-## Missing Features
-
-The following features are currently missing, listed in order of importance:
-
-- **Resizing:** Block Devices can not be resized for the time being.
-- **Branching CLI Support:** Although branching functionality has been implemented, users currently cannot interact with
-  it. CLI functions will be added to enable branch operations.
-- **Tags:** Tagging is not currently supported.
 
 ## Possible Future Improvements
 
@@ -53,23 +47,16 @@ The following features are currently missing, listed in order of importance:
 
 ## Status
 
-**Milestone 3**: `sia_vbd` is fully functional - with *minor caveats*.
+**Version 0.4.0**: `sia_vbd` is fully functional at this point.
 
-This release is a fully functional version of `sia_vbd`. *Almost* everything has been implemented in accordance with
+This release is a fully functional version of `sia_vbd`. Everything has been implemented in accordance with
 its [initial proposal](https://forum.sia.tech/t/small-grant-sia-virtual-block-device-sia-vbd/743).
-
-Only minor functions, such as **Resizing** and **Tagging** are missing.
 
 A modern, fully-featured `NBD` server has been implemented and tested against Linux's built-in client as well as
 against [nbdublk](https://libguestfs.org/nbdublk.1.html) - a modern userland `nbd` client backed
 by [ublk](https://docs.kernel.org/block/ublk.html) & [nbdkit](https://www.libguestfs.org/nbdkit.1.html).
 
 `ext4` and `xfs` have been used during testing and both work well.
-
-*This release is to be considered a *beta* version and data loss - while not expected - is possible. Do **NOT** store
-critical data on it.*
-
-*While the data format *SHOULD* not change, it is still a possibility that it *MIGHT* change in the coming release.*
 
 ## Usage
 
@@ -92,6 +79,8 @@ Usage: sia_vbd --config <CONFIG> [COMMAND]
 Commands:
   repos   List all configured repositories
   volume  Volume related actions
+  branch  Branch related actions
+  tag     Tag related actions
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -180,8 +169,8 @@ Arguments:
 Options:
   -n <NAME>              Optional descriptive name
   -d <BRANCH>            Name of the default branch [default: main]
-  -b <BLOCK_SIZE>        Block size in KiB. Possible values are: 16, 64, 256 [default: 64]
-  -c <CLUSTER_SIZE>      Cluster size, in number of Blocks. Possible values are: 256 [default: 256]
+  -b <BLOCK_SIZE>        Block size in KiB. Possible values are: 16, 64, 256, 1024 [default: 64]
+  -c <CLUSTER_SIZE>      Cluster size, in number of Blocks. Possible values are: 64, 128, 256 [default: 256]
   -o <CONTENT_HASH>      Hash Algorithm to use for Block Content Hashing. Possible values are: blake3, tent, xxh128 [default: blake3]
   -m <META_HASH>         Hash Algorithm to use for Metadata Hashing. Possible values are: blake3, tent, xxh128 [default: blake3]
   -h, --help             Print help
@@ -208,18 +197,18 @@ y
   Volume created successfully                                                                                                                                                       
 
 01951f48-907c-7160-9f8e-42503e762e32
-    Name:          MyVolume1
-    Created at:    2025-02-19 17:36:44.158980 UTC
-    Block Size:    64KiB
-    Cluster Size:  256
-    Content Hash:  BLAKE3
-    Metadata Hash: BLAKE3
-    Branches:
-        Branch Name:   main
-        Latest Commit: 0e327a1a93a1495eab55605431af0e3a739640e7f776810c3c5858904e976fed
-        Committed at:  2025-02-19 17:36:44.163708 UTC
-        Size:          10.0 GiB (640 clusters @ 16.0 MiB)
-------------------------------------
+    Name:            MyVolume1
+    Created at:      2025-02-19 17:36:44.158980 UTC
+    Block Size:      64KiB
+    Cluster Size:    256
+    Content Hash:    BLAKE3
+    Metadata Hash:   BLAKE3
+    Branches & Tags:
+            Branch Name: main
+          Latest Commit: 0e327a1a93a1495eab55605431af0e3a739640e7f776810c3c5858904e976fed
+           Committed at: 2025-02-19 17:36:44.163708 UTC
+                   Size: 10.0 GiB (640 clusters @ 16.0 MiB)
+          ------------------------------------------
 
 You can now add this volume to your configuration:
 
