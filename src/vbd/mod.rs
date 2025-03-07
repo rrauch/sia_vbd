@@ -31,6 +31,7 @@ pub mod nbd_device;
 const BS16K: usize = 16 * 1024;
 const BS64K: usize = 64 * 1024;
 const BS256K: usize = 256 * 1024;
+const BS1M: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "cid")]
@@ -1575,12 +1576,16 @@ fn is_valid_branch_tag_name(s: impl AsRef<str>) -> bool {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ClusterSize {
+    Cs64,
+    Cs128,
     Cs256,
 }
 
 impl Display for ClusterSize {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            Self::Cs64 => "64",
+            Self::Cs128 => "128",
             Self::Cs256 => "256",
         };
 
@@ -1593,6 +1598,8 @@ impl TryFrom<usize> for ClusterSize {
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         match value {
+            64 => Ok(ClusterSize::Cs64),
+            128 => Ok(ClusterSize::Cs128),
             256 => Ok(ClusterSize::Cs256),
             _ => Err(anyhow!("invalid cluster size: {}", value)),
         }
@@ -1604,6 +1611,8 @@ impl Deref for ClusterSize {
 
     fn deref(&self) -> &Self::Target {
         match self {
+            ClusterSize::Cs64 => &(64),
+            ClusterSize::Cs128 => &(128),
             ClusterSize::Cs256 => &(256),
         }
     }
@@ -1614,6 +1623,8 @@ impl FromStr for ClusterSize {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim() {
+            "64" => Ok(ClusterSize::Cs64),
+            "128" => Ok(ClusterSize::Cs128),
             "256" => Ok(ClusterSize::Cs256),
             _ => Err(anyhow!("'{}' not a valid or supported cluster size.", s)),
         }
@@ -1625,6 +1636,7 @@ pub enum BlockSize {
     Bs16k,
     Bs64k,
     Bs256k,
+    Bs1m,
 }
 
 impl Display for BlockSize {
@@ -1633,6 +1645,7 @@ impl Display for BlockSize {
             Self::Bs16k => "16KiB",
             Self::Bs64k => "64KiB",
             Self::Bs256k => "256KiB",
+            Self::Bs1m => "1MiB",
         };
 
         write!(f, "{}", s)
@@ -1647,6 +1660,7 @@ impl TryFrom<usize> for BlockSize {
             BS16K => Ok(BlockSize::Bs16k),
             BS64K => Ok(BlockSize::Bs64k),
             BS256K => Ok(BlockSize::Bs256k),
+            BS1M => Ok(BlockSize::Bs1m),
             _ => Err(anyhow!("unsupported block size: {}", value)),
         }
     }
@@ -1660,6 +1674,7 @@ impl Deref for BlockSize {
             BlockSize::Bs16k => &BS16K,
             BlockSize::Bs64k => &BS64K,
             BlockSize::Bs256k => &BS256K,
+            BlockSize::Bs1m => &BS1M,
         }
     }
 }
@@ -1672,6 +1687,7 @@ impl FromStr for BlockSize {
             "16" => Ok(BlockSize::Bs16k),
             "64" => Ok(BlockSize::Bs64k),
             "256" => Ok(BlockSize::Bs256k),
+            "1024" => Ok(BlockSize::Bs1m),
             _ => Err(anyhow!("'{}' not a valid or supported block size.", s)),
         }
     }

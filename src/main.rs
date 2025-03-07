@@ -77,12 +77,12 @@ enum VolumeCommands {
         #[clap(default_value = "main")]
         branch: String,
         /// Block size in KiB.
-        /// Possible values are: 16, 64, 256.
+        /// Possible values are: 16, 64, 256, 1024.
         #[arg(short = 'b')]
         #[clap(default_value = "64")]
         block_size: BlockSize,
         /// Cluster size, in number of Blocks.
-        /// Possible values are: 256.
+        /// Possible values are: 64, 128, 256.
         #[arg(short = 'c')]
         #[clap(default_value = "256")]
         cluster_size: ClusterSize,
@@ -99,16 +99,16 @@ enum VolumeCommands {
     },
     /// Resize a specific volume
     Resize {
-        /// Name of repository
-        repo: String,
-        /// Id of the volume to resize
-        volume_id: String,
         /// Branch to resize
         #[arg(short = 'b')]
         #[clap(default_value = "main")]
         branch: String,
         /// New size of Volume
         size: ByteSize,
+        /// Name of repository
+        repo: String,
+        /// Id of the volume to resize
+        volume_id: String,
     },
     /// Delete a specific volume
     Delete {
@@ -870,6 +870,7 @@ export_server = "{}"
 export_name = "<export as>"
 wal = "<path to wal directory>"
 inventory = "<path to inventory directory>"
+cache = "<path to cache directory>"
 "###,
         repo_name, &vbd_id, server
     );
