@@ -1,6 +1,6 @@
 use crate::inventory::chunk::ManifestId;
 use crate::io::{AsyncReadExtBuffered, TokioFile};
-use crate::repository::{ChunkId, Reader, Repository, Stream, Volume, VolumeInfo};
+use crate::repository::{ChunkId, CommitType, Reader, Repository, Stream, Volume, VolumeInfo};
 use crate::vbd::{BranchName, VbdId};
 use crate::Etag;
 use anyhow::{anyhow, bail};
@@ -74,7 +74,7 @@ impl Repository for FsRepository {
     ) -> Result<
         (
             VolumeInfo,
-            impl Stream<Item = Result<(BranchName, Bytes), Self::Error>> + 'static,
+            impl Stream<Item = Result<(CommitType, Bytes), Self::Error>> + 'static,
         ),
         Self::Error,
     > {
@@ -86,12 +86,12 @@ impl Repository for FsRepository {
         let volume_info = super::read_volume(volume_info).await?;
         let commits_dir = volume_dir.join("commits");
 
-        let stream = list_branches(&commits_dir).await?.then(move |r| {
+        let stream = list_commits(&commits_dir).await?.then(move |r| {
             let commits_dir = commits_dir.clone();
             async move {
                 match r {
-                    Ok(branch_name) => match read_commit(&commits_dir, &branch_name).await {
-                        Ok(bytes) => Ok((branch_name, bytes)),
+                    Ok(commit_type) => match read_commit(&commits_dir, &commit_type).await {
+                        Ok(bytes) => Ok((commit_type, bytes)),
                         Err(err) => Err(err),
                     },
                     Err(err) => Err(err),
@@ -196,21 +196,23 @@ impl Repository for FsRepository {
         Ok(())
     }
 
-    async fn write_branch(
+    async fn write_commit(
         &self,
         vbd_id: &VbdId,
-        branch_name: &BranchName,
+        commit_type: &CommitType,
         data: Bytes,
     ) -> anyhow::Result<()> {
         let volume_dir = self.root_dir.join(format!("{}", &vbd_id));
-        write_commit(&volume_dir.join("commits"), branch_name, data).await
+        write_commit(&volume_dir.join("commits"), commit_type, data).await
     }
 
-    async fn delete_branch(&self, vbd_id: &VbdId, branch_name: &BranchName) -> anyhow::Result<()> {
+    async fn delete_commit(&self, vbd_id: &VbdId, commit_type: &CommitType) -> anyhow::Result<()> {
         let volume_dir = self.root_dir.join(format!("{}", &vbd_id));
-        let path = volume_dir
-            .join("commits")
-            .join(format!("{}.branch", branch_name));
+        let commits_dir = volume_dir.join("commits");
+        let path = match commit_type {
+            CommitType::Branch(branch_name) => commits_dir.join(format!("{}.branch", branch_name)),
+            CommitType::Tag(tag_name) => commits_dir.join(format!("{}.tag", tag_name)),
+        };
         tokio::fs::remove_file(path).await?;
         Ok(())
     }
@@ -410,39 +412,49 @@ impl Volume for FsVolume {
         Ok(())
     }
 
-    async fn branches(
+    async fn commits(
         &self,
-    ) -> Result<impl Stream<Item = Result<BranchName, Self::Error>> + 'static, Self::Error> {
-        list_branches(&self.commits_dir).await
+    ) -> Result<impl Stream<Item = Result<CommitType, Self::Error>> + 'static, Self::Error> {
+        list_commits(&self.commits_dir).await
     }
 
-    async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
-        write_commit(&self.commits_dir, branch, commit).await
+    async fn write_commit(
+        &self,
+        commit_type: &CommitType,
+        commit: Bytes,
+    ) -> Result<(), Self::Error> {
+        write_commit(&self.commits_dir, commit_type, commit).await
     }
 
-    async fn read_commit(&self, branch: &BranchName) -> Result<Bytes, Self::Error> {
-        read_commit(&self.commits_dir, branch).await
+    async fn read_commit(&self, commit_type: &CommitType) -> Result<Bytes, Self::Error> {
+        read_commit(&self.commits_dir, commit_type).await
     }
 }
 
-async fn read_commit(commits_dir: &Path, branch: &BranchName) -> Result<Bytes, anyhow::Error> {
-    let path = commits_dir.join(format!("{}.branch", branch.as_ref()));
+async fn read_commit(commits_dir: &Path, commit_type: &CommitType) -> Result<Bytes, anyhow::Error> {
+    let path = match commit_type {
+        CommitType::Branch(branch_name) => commits_dir.join(format!("{}.branch", branch_name)),
+        CommitType::Tag(tag_name) => commits_dir.join(format!("{}.tag", tag_name)),
+    };
     read_file(&path, MAX_COMMIT_FILE_SIZE).await
 }
 
 async fn write_commit(
     commits_dir: &Path,
-    branch: &BranchName,
+    commit_type: &CommitType,
     commit: Bytes,
 ) -> Result<(), anyhow::Error> {
-    let path = commits_dir.join(format!("{}.branch", branch.as_ref()));
+    let path = match commit_type {
+        CommitType::Branch(branch_name) => commits_dir.join(format!("{}.branch", branch_name)),
+        CommitType::Tag(tag_name) => commits_dir.join(format!("{}.tag", tag_name)),
+    };
     write_file(&path, Cursor::new(commit)).await?;
     Ok(())
 }
 
-async fn list_branches(
+async fn list_commits(
     commits_dir: &Path,
-) -> Result<impl Stream<Item = Result<BranchName, anyhow::Error>> + 'static, anyhow::Error> {
+) -> Result<impl Stream<Item = Result<CommitType, anyhow::Error>> + 'static, anyhow::Error> {
     let stream =
         tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(commits_dir).await?);
     let stream = stream
@@ -452,7 +464,12 @@ async fn list_branches(
                     if let Some(file_name) = e.file_name().to_str() {
                         if let Some(branch) = file_name.strip_suffix(".branch") {
                             Ok(match branch.try_into() {
-                                Ok(branch) => Some(branch),
+                                Ok(branch) => Some(CommitType::Branch(branch)),
+                                Err(_) => None,
+                            })
+                        } else if let Some(tag) = file_name.strip_suffix(".tag") {
+                            Ok(match tag.try_into() {
+                                Ok(tag) => Some(CommitType::Tag(tag)),
                                 Err(_) => None,
                             })
                         } else {

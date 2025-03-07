@@ -13,6 +13,10 @@ message BranchInfo {
   common.Commit commit = 1;
 }
 
+message TagInfo {
+  common.Commit commit = 1;
+}
+
 message ChunkContent {
   message Block {
     common.Hash cid = 1;

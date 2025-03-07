@@ -13,7 +13,7 @@ use crate::serde::encoded::{Decoded, DecodedStream, Decoder, EncodingSinkBuilder
 use crate::serde::Compressor;
 use crate::vbd::{
     Block, BlockSize, BranchName, Cluster, ClusterSize, Commit, CommitId, CommitMut, FixedSpecs,
-    Snapshot, VbdId,
+    Snapshot, TagName, VbdId,
 };
 use crate::{now, Etag};
 use anyhow::{anyhow, bail};
@@ -24,7 +24,6 @@ use futures::lock::OwnedMutexGuard;
 use futures::{
     AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SinkExt, StreamExt, TryStreamExt,
 };
-use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
 use std::io::{ErrorKind, SeekFrom};
@@ -41,9 +40,40 @@ const BRANCH_MAGIC_NUMBER: &'static [u8; 16] = &[
     0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x42, 0x52, 0x41, 0x00, 0x00, 0x01,
 ];
 
+const TAG_MAGIC_NUMBER: &'static [u8; 16] = &[
+    0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x54, 0x41, 0x47, 0x00, 0x00, 0x01,
+];
+
 const MANIFEST_MAGIC_NUMBER: &'static [u8; 16] = &[
     0x00, 0xFF, 0x73, 0x69, 0x61, 0x5F, 0x76, 0x62, 0x64, 0x20, 0x4D, 0x41, 0x4E, 0x00, 0x00, 0x01,
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum CommitType {
+    Branch(BranchName),
+    Tag(TagName),
+}
+
+impl Display for CommitType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitType::Branch(b) => Display::fmt(&b, f),
+            CommitType::Tag(t) => Display::fmt(&t, f),
+        }
+    }
+}
+
+impl From<BranchName> for CommitType {
+    fn from(value: BranchName) -> Self {
+        CommitType::Branch(value)
+    }
+}
+
+impl From<TagName> for CommitType {
+    fn from(value: TagName) -> Self {
+        CommitType::Tag(value)
+    }
+}
 
 pub trait Repository: Send {
     type Volume: Volume + Send;
@@ -66,7 +96,7 @@ pub trait Repository: Send {
         Output = Result<
             (
                 VolumeInfo,
-                impl Stream<Item = Result<(BranchName, Bytes), Self::Error>> + 'static,
+                impl Stream<Item = Result<(CommitType, Bytes), Self::Error>> + 'static,
             ),
             Self::Error,
         >,
@@ -79,16 +109,16 @@ pub trait Repository: Send {
         initial_commit: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
     fn delete(&self, vbd_id: &VbdId) -> impl Future<Output = Result<(), Self::Error>>;
-    fn write_branch(
+    fn write_commit(
         &self,
         vbd_id: &VbdId,
-        branch_name: &BranchName,
+        commit_type: &CommitType,
         data: Bytes,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
-    fn delete_branch(
+    fn delete_commit(
         &self,
         vbd_id: &VbdId,
-        branch_name: &BranchName,
+        commit_type: &CommitType,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
@@ -150,21 +180,21 @@ pub(crate) trait Volume: Send {
         chunk_id: &ChunkId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn branches(
+    fn commits(
         &self,
     ) -> impl Future<
-        Output = Result<impl Stream<Item = Result<BranchName, Self::Error>> + 'static, Self::Error>,
+        Output = Result<impl Stream<Item = Result<CommitType, Self::Error>> + 'static, Self::Error>,
     > + Send;
 
     fn write_commit(
         &self,
-        branch: &BranchName,
+        commit_type: &CommitType,
         commit: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     fn read_commit(
         &self,
-        branch: &BranchName,
+        commit_type: &CommitType,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send;
 }
 
@@ -208,7 +238,7 @@ impl RepositoryHandler {
     ) -> anyhow::Result<
         (
             VolumeInfo,
-            impl Stream<Item = anyhow::Result<(BranchName, BranchInfo)>> + 'static + use<'_>,
+            impl Stream<Item = anyhow::Result<CommitInfo>> + 'static + use<'_>,
         ),
         anyhow::Error,
     > {
@@ -218,7 +248,7 @@ impl RepositoryHandler {
                 (
                     info,
                     Box::new(stream)
-                        as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
+                        as Box<dyn Stream<Item = anyhow::Result<(CommitType, Bytes)>> + Unpin>,
                 )
             }
             Self::RenterdRepo(renterd) => {
@@ -226,7 +256,7 @@ impl RepositoryHandler {
                 (
                     info,
                     Box::new(stream)
-                        as Box<dyn Stream<Item = anyhow::Result<(BranchName, Bytes)>> + Unpin>,
+                        as Box<dyn Stream<Item = anyhow::Result<(CommitType, Bytes)>> + Unpin>,
                 )
             }
         };
@@ -236,7 +266,7 @@ impl RepositoryHandler {
             let specs = specs.clone();
             async move {
                 match r {
-                    Ok((name, data)) => read_branch(data, specs).await.map(|bi| (name, bi)),
+                    Ok((commit_type, data)) => read_commit(data, commit_type, specs).await,
                     Err(err) => Err(err),
                 }
             }
@@ -304,10 +334,10 @@ impl RepositoryHandler {
         let volume_bytes = buf.freeze();
 
         let commit = CommitMut::zeroed(volume_info.specs.clone(), num_clusters).finalize();
-        let branch_info = BranchInfo { commit };
+        let commit_info = CommitInfo::Branch(default_branch_name.clone(), BranchInfo { commit });
         let mut buf = BytesMut::zeroed(4096);
         let mut cursor = Cursor::new(buf.as_mut());
-        write_branch(&mut cursor, &branch_info).await?;
+        write_commit(&mut cursor, &commit_info).await?;
         let len = cursor.position() as usize;
         drop(cursor);
         buf.truncate(len);
@@ -328,29 +358,43 @@ impl RepositoryHandler {
         Ok(vbd_id)
     }
 
-    pub async fn create_branch(
+    pub async fn create_commit(
         &self,
-        name: impl AsRef<str>,
+        commit_type: &CommitType,
         volume_id: &VbdId,
         commit_id: &CommitId,
-    ) -> anyhow::Result<(BranchName, BranchInfo)> {
-        let branch_name = BranchName::try_from(name.as_ref())
-            .map_err(|e| anyhow!("invalid branch name: {}", e))?;
-        let (_, mut branches) = self.volume_details(volume_id).await?;
+    ) -> anyhow::Result<CommitInfo> {
+        let (_, mut commits) = self.volume_details(volume_id).await?;
         let mut commit = None;
-        while let Some((existing, info)) = branches.try_next().await? {
-            if &branch_name == &existing {
-                bail!("branch {} already exists", branch_name);
+        while let Some(commit_info) = commits.try_next().await? {
+            match (&commit_info, commit_type) {
+                (CommitInfo::Branch(existing, _), CommitType::Branch(branch_name))
+                    if branch_name == existing =>
+                {
+                    bail!("branch {} already exists", branch_name);
+                }
+                (CommitInfo::Tag(existing, _), CommitType::Tag(tag_name))
+                    if tag_name == existing =>
+                {
+                    bail!("tag {} already exists", tag_name);
+                }
+                _ => {}
             }
-            if info.commit.content_id() == commit_id {
-                commit = Some(info.commit);
+            if commit_info.commit().content_id() == commit_id {
+                commit = Some(commit_info.commit().clone());
+                break;
             }
         }
         let commit = commit.ok_or(anyhow!("commit {} not found", commit_id))?;
-        let branch_info = BranchInfo { commit };
+        let commit_info = match commit_type {
+            CommitType::Branch(branch_name) => {
+                CommitInfo::Branch(branch_name.clone(), BranchInfo { commit })
+            }
+            CommitType::Tag(tag_name) => CommitInfo::Tag(tag_name.clone(), TagInfo { commit }),
+        };
         let mut buf = BytesMut::zeroed(4096);
         let mut cursor = Cursor::new(buf.as_mut());
-        write_branch(&mut cursor, &branch_info).await?;
+        write_commit(&mut cursor, &commit_info).await?;
         let len = cursor.position() as usize;
         drop(cursor);
         buf.truncate(len);
@@ -358,27 +402,27 @@ impl RepositoryHandler {
 
         match self {
             Self::FsRepo(fs) => {
-                fs.write_branch(&volume_id, &branch_name, branch_bytes)
+                fs.write_commit(&volume_id, &commit_type, branch_bytes)
                     .await?
             }
             Self::RenterdRepo(renterd) => {
                 renterd
-                    .write_branch(&volume_id, &branch_name, branch_bytes)
+                    .write_commit(&volume_id, &commit_type, branch_bytes)
                     .await?
             }
         }
 
-        Ok((branch_name, branch_info))
+        Ok(commit_info)
     }
 
-    pub async fn delete_branch(
+    pub async fn delete_commit(
         &self,
         volume_id: &VbdId,
-        branch_name: &BranchName,
+        commit_type: &CommitType,
     ) -> anyhow::Result<()> {
         match self {
-            Self::FsRepo(fs) => fs.delete_branch(&volume_id, &branch_name).await,
-            Self::RenterdRepo(renterd) => renterd.delete_branch(&volume_id, &branch_name).await,
+            Self::FsRepo(fs) => fs.delete_commit(&volume_id, &commit_type).await,
+            Self::RenterdRepo(renterd) => renterd.delete_commit(&volume_id, &commit_type).await,
         }
     }
 }
@@ -410,11 +454,17 @@ impl VolumeHandler {
     ) -> anyhow::Result<Self> {
         let wrapper = volume.into();
         let volume_info = read_volume(wrapper.read_volume().await?).await?;
-        let branch_info = read_branch(
-            wrapper.read_branch(&branch_name).await?,
+        let commit_type = CommitType::Branch(branch_name);
+        let (branch_name, branch_info) = match read_commit(
+            wrapper.read_commit(&commit_type).await?,
+            commit_type,
             volume_info.specs.clone(),
         )
-        .await?;
+        .await?
+        {
+            CommitInfo::Branch(branch_name, branch_info) => Ok((branch_name, branch_info)),
+            _ => Err(anyhow!("incorrect commit type")),
+        }?;
 
         Ok(Self {
             wrapper,
@@ -425,19 +475,14 @@ impl VolumeHandler {
         })
     }
 
-    pub async fn list_branches(
-        &self,
-    ) -> anyhow::Result<impl Iterator<Item = (BranchName, BranchInfo)> + 'static> {
-        let mut map = HashMap::new();
-        for name in self.wrapper.list_branches().await? {
-            let info = read_branch(
-                self.wrapper.read_branch(&name).await?,
-                self.volume_info.specs.clone(),
-            )
-            .await?;
-            map.insert(name, info);
+    pub async fn list_commits(&self) -> anyhow::Result<impl Iterator<Item = CommitInfo> + 'static> {
+        let mut vec = vec![];
+        for commit_type in self.wrapper.list_commits().await? {
+            let data = self.wrapper.read_commit(&commit_type).await?;
+            let info = read_commit(data, commit_type, self.volume_info.specs.clone()).await?;
+            vec.push(info);
         }
-        Ok(map.into_iter())
+        Ok(vec.into_iter())
     }
 
     pub async fn list_chunks(
@@ -486,20 +531,23 @@ impl VolumeHandler {
     }
 
     pub async fn update_branch_commit(&self, commit: &Commit) -> anyhow::Result<()> {
-        let info = BranchInfo {
-            commit: commit.clone(),
-        };
+        let info = CommitInfo::Branch(
+            self.branch_name.clone(),
+            BranchInfo {
+                commit: commit.clone(),
+            },
+        );
 
         let mut buf = BytesMut::zeroed(4096);
         let mut cursor = Cursor::new(buf.as_mut());
-        write_branch(&mut cursor, &info).await?;
+        write_commit(&mut cursor, &info).await?;
         let len = cursor.position() as usize;
         drop(cursor);
         buf.truncate(len);
         let branch_bytes = buf.freeze();
 
         self.wrapper
-            .write_branch(&self.branch_name, branch_bytes)
+            .write_commit(&CommitType::Branch(self.branch_name.clone()), branch_bytes)
             .await?;
         Ok(())
     }
@@ -713,30 +761,48 @@ async fn read_manifest(
     Ok(manifest)
 }
 
-async fn read_branch(data: Bytes, fixed_specs: FixedSpecs) -> anyhow::Result<BranchInfo> {
+async fn read_commit(
+    data: Bytes,
+    commit_type: CommitType,
+    fixed_specs: FixedSpecs,
+) -> anyhow::Result<CommitInfo> {
     let mut io = Cursor::new(data);
-    let mut buf = BytesMut::with_capacity(BRANCH_MAGIC_NUMBER.len());
-    io.read_exact_buffered(&mut buf, BRANCH_MAGIC_NUMBER.len())
-        .await?;
-    if buf.as_ref() != BRANCH_MAGIC_NUMBER {
+    let magic_number = match &commit_type {
+        CommitType::Branch(_) => BRANCH_MAGIC_NUMBER,
+        CommitType::Tag(_) => TAG_MAGIC_NUMBER,
+    };
+    let mut buf = BytesMut::with_capacity(magic_number.len());
+    io.read_exact_buffered(&mut buf, magic_number.len()).await?;
+    if buf.as_ref() != magic_number {
         bail!("invalid magic number");
     }
 
     let decoder = Decoder::new(fixed_specs);
     match decoder.read(io).await?.ok_or(anyhow!("unexpected eof"))? {
-        Decoded::BranchInfo(b) => Ok(b.into_header()),
-        _ => Err(anyhow!("incorrect entry, expected branch_info")),
+        Decoded::BranchInfo(b) => match commit_type {
+            CommitType::Branch(branch_name) => Ok(CommitInfo::Branch(branch_name, b.into_header())),
+            _ => Err(anyhow!("incorrect entry, expected branch_info")),
+        },
+        Decoded::TagInfo(t) => match commit_type {
+            CommitType::Tag(tag_info) => Ok(CommitInfo::Tag(tag_info, t.into_header())),
+            _ => Err(anyhow!("incorrect entry, expected tag_info")),
+        },
+        _ => Err(anyhow!("incorrect entry, commit info type entry")),
     }
 }
 
-async fn write_branch<IO: AsyncWrite + Send + Unpin>(
+async fn write_commit<IO: AsyncWrite + Send + Unpin>(
     mut io: IO,
-    branch_info: &BranchInfo,
+    commit_info: &CommitInfo,
 ) -> anyhow::Result<()> {
-    io.write_all(BRANCH_MAGIC_NUMBER).await?;
+    let (magic_number, encodable) = match commit_info {
+        CommitInfo::Branch(_, branch_info) => (BRANCH_MAGIC_NUMBER, branch_info.into()),
+        CommitInfo::Tag(_, tag_info) => (TAG_MAGIC_NUMBER, tag_info.into()),
+    };
+    io.write_all(magic_number).await?;
 
     let mut sink = EncodingSinkBuilder::from_writer(&mut io).build();
-    sink.send(branch_info.into()).await?;
+    sink.send(encodable).await?;
     sink.close().await?;
 
     io.flush().await?;
@@ -757,15 +823,15 @@ impl WrappedVolume {
         })
     }
 
-    async fn list_branches(&self) -> anyhow::Result<impl Iterator<Item = BranchName> + 'static> {
+    async fn list_commits(&self) -> anyhow::Result<impl Iterator<Item = CommitType> + 'static> {
         Ok(match &self {
             Self::FsVolume(fs) => {
-                let stream = fs.branches().await?;
+                let stream = fs.commits().await?;
                 let res: Result<Vec<_>, <FsVolume as Volume>::Error> = stream.try_collect().await;
                 res?.into_iter()
             }
             Self::RenterdVolume(renterd) => {
-                let stream = renterd.branches().await?;
+                let stream = renterd.commits().await?;
                 let res: Result<Vec<_>, <RenterdVolume as Volume>::Error> =
                     stream.try_collect().await;
                 res?.into_iter()
@@ -789,17 +855,17 @@ impl WrappedVolume {
         })
     }
 
-    async fn read_branch(&self, branch: &BranchName) -> anyhow::Result<Bytes> {
+    async fn read_commit(&self, commit_type: &CommitType) -> anyhow::Result<Bytes> {
         Ok(match &self {
-            Self::FsVolume(fs) => fs.read_commit(branch).await?,
-            Self::RenterdVolume(renterd) => renterd.read_commit(branch).await?,
+            Self::FsVolume(fs) => fs.read_commit(commit_type).await?,
+            Self::RenterdVolume(renterd) => renterd.read_commit(commit_type).await?,
         })
     }
 
-    async fn write_branch(&self, branch: &BranchName, content: Bytes) -> anyhow::Result<()> {
+    async fn write_commit(&self, commit_type: &CommitType, content: Bytes) -> anyhow::Result<()> {
         Ok(match &self {
-            Self::FsVolume(fs) => fs.write_commit(branch, content).await?,
-            Self::RenterdVolume(renterd) => renterd.write_commit(branch, content).await?,
+            Self::FsVolume(fs) => fs.write_commit(commit_type, content).await?,
+            Self::RenterdVolume(renterd) => renterd.write_commit(commit_type, content).await?,
         })
     }
 
@@ -899,4 +965,31 @@ pub struct VolumeInfo {
 #[derive(Clone)]
 pub struct BranchInfo {
     pub commit: Commit,
+}
+
+#[derive(Clone)]
+pub struct TagInfo {
+    pub commit: Commit,
+}
+
+#[derive(Clone)]
+pub enum CommitInfo {
+    Branch(BranchName, BranchInfo),
+    Tag(TagName, TagInfo),
+}
+
+impl CommitInfo {
+    pub fn commit(&self) -> &Commit {
+        match self {
+            CommitInfo::Branch(_, info) => &info.commit,
+            CommitInfo::Tag(_, info) => &info.commit,
+        }
+    }
+
+    pub fn to_commit_type(&self) -> CommitType {
+        match self {
+            CommitInfo::Branch(name, _) => CommitType::Branch(name.clone()),
+            CommitInfo::Tag(name, _) => CommitType::Tag(name.clone()),
+        }
+    }
 }

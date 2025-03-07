@@ -59,6 +59,28 @@ pub(crate) mod volume {
         }
     }
 
+    impl From<&super::super::TagInfo> for TagInfo {
+        fn from(value: &super::super::TagInfo) -> Self {
+            TagInfo {
+                commit: Some((&value.commit).into()),
+            }
+        }
+    }
+
+    impl TryFrom<TagInfo> for super::super::TagInfo {
+        type Error = anyhow::Error;
+
+        fn try_from(value: TagInfo) -> Result<Self, Self::Error> {
+            Ok(super::super::TagInfo {
+                commit: value
+                    .commit
+                    .map(|c| c.try_into())
+                    .transpose()?
+                    .ok_or(anyhow!("commit is missing"))?,
+            })
+        }
+    }
+
     impl From<&crate::inventory::chunk::ChunkEntry> for ChunkContent {
         fn from(value: &crate::inventory::chunk::ChunkEntry) -> Self {
             match value {

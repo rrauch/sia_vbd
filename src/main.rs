@@ -10,9 +10,11 @@ use sia_vbd::hash::{Hash, HashAlgorithm};
 use sia_vbd::nbd::{Builder, RunGuard};
 use sia_vbd::repository::fs::FsRepository;
 use sia_vbd::repository::renterd::RenterdRepository;
-use sia_vbd::repository::RepositoryHandler;
+use sia_vbd::repository::{CommitInfo, CommitType, RepositoryHandler};
 use sia_vbd::vbd::nbd_device::NbdDevice;
-use sia_vbd::vbd::{BlockSize, BranchName, ClusterSize, CommitId, VbdId, VirtualBlockDevice};
+use sia_vbd::vbd::{
+    BlockSize, BranchName, ClusterSize, CommitId, TagName, VbdId, VirtualBlockDevice,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -49,6 +51,9 @@ enum Commands {
     /// Branch related actions
     #[command(subcommand)]
     Branch(BranchCommands),
+    /// Tag related actions
+    #[command(subcommand)]
+    Tag(TagCommands),
 }
 
 #[derive(Debug, Subcommand)]
@@ -116,12 +121,12 @@ enum VolumeCommands {
 
 #[derive(Debug, Subcommand)]
 enum BranchCommands {
-    /// Create a new Branch from a given Commit Id
+    /// Create a new Branch from a given Branch, Tag or Commit Id
     Create {
         /// Name of new Branch
         name: String,
-        /// Existing Commit Id the new Branch should be based on
-        commit: String,
+        /// Existing Branch, Tag or Commit Id the new Branch should be based on
+        source: String,
         /// Name of repository
         repo: String,
         /// Id of the volume
@@ -129,12 +134,36 @@ enum BranchCommands {
     },
     /// Delete a specific Branch
     Delete {
+        /// Name of Branch to delete
+        name: String,
         /// Name of repository
         repo: String,
         /// Id of the volume
         volume_id: String,
-        /// Name of Branch to delete
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TagCommands {
+    /// Create a new Tag from a given Branch, Tag or Commit Id
+    Create {
+        /// Name of new Tag
         name: String,
+        /// Existing Branch, Tag or Commit Id the new Tag should be based on
+        source: String,
+        /// Name of repository
+        repo: String,
+        /// Id of the volume
+        volume_id: String,
+    },
+    /// Delete a specific Tag
+    Delete {
+        /// Name of Tag to delete
+        name: String,
+        /// Name of repository
+        repo: String,
+        /// Id of the volume
+        volume_id: String,
     },
 }
 
@@ -470,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Branch(cmd)) => match cmd {
             BranchCommands::Create {
                 name,
-                commit,
+                source,
                 repo,
                 volume_id,
             } => {
@@ -478,7 +507,16 @@ async fn main() -> anyhow::Result<()> {
                 let repo = repositories
                     .get(&repo_name)
                     .ok_or(anyhow!("repository [{}] not found", repo_name))?;
-                create_branch(&repo, repo_name.as_str(), volume_id, name, commit).await?;
+                let branch_name = BranchName::try_from(name.as_str())
+                    .map_err(|e| anyhow!("invalid branch name: {}", e))?;
+                create_commit(
+                    &repo,
+                    repo_name.as_str(),
+                    volume_id,
+                    CommitType::Branch(branch_name),
+                    source,
+                )
+                .await?;
                 return Ok(());
             }
             BranchCommands::Delete {
@@ -490,7 +528,59 @@ async fn main() -> anyhow::Result<()> {
                 let repo = repositories
                     .get(&repo_name)
                     .ok_or(anyhow!("repository [{}] not found", repo_name))?;
-                delete_branch(&repo, repo_name.as_str(), volume_id, name).await?;
+                let branch_name = BranchName::try_from(name.as_str())
+                    .map_err(|e| anyhow!("invalid branch name: {}", e))?;
+                delete_commit(
+                    &repo,
+                    repo_name.as_str(),
+                    volume_id,
+                    CommitType::Branch(branch_name),
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+        Some(Commands::Tag(cmd)) => match cmd {
+            TagCommands::Create {
+                name,
+                source,
+                repo,
+                volume_id,
+            } => {
+                let repo_name = repo;
+                let repo = repositories
+                    .get(&repo_name)
+                    .ok_or(anyhow!("repository [{}] not found", repo_name))?;
+                let tag_name = TagName::try_from(name.as_str())
+                    .map_err(|e| anyhow!("invalid tag name: {}", e))?;
+                create_commit(
+                    &repo,
+                    repo_name.as_str(),
+                    volume_id,
+                    CommitType::Tag(tag_name),
+                    source,
+                )
+                .await?;
+                return Ok(());
+            }
+            TagCommands::Delete {
+                repo,
+                volume_id,
+                name,
+            } => {
+                let repo_name = repo;
+                let repo = repositories
+                    .get(&repo_name)
+                    .ok_or(anyhow!("repository [{}] not found", repo_name))?;
+                let tag_name = TagName::try_from(name.as_str())
+                    .map_err(|e| anyhow!("invalid tag name: {}", e))?;
+                delete_commit(
+                    &repo,
+                    repo_name.as_str(),
+                    volume_id,
+                    CommitType::Tag(tag_name),
+                )
+                .await?;
                 return Ok(());
             }
         },
@@ -655,7 +745,7 @@ async fn volume_details(repo: &RepositoryHandler, vbd_id: &VbdId) -> anyhow::Res
     pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_message("retrieving volume details");
 
-    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
+    let (volume_info, mut commits) = repo.volume_details(&vbd_id).await?;
 
     pb.finish_and_clear();
 
@@ -663,27 +753,40 @@ async fn volume_details(repo: &RepositoryHandler, vbd_id: &VbdId) -> anyhow::Res
     let cluster_size_display = ByteSize::b(cluster_size_bytes as u64);
 
     if let Some(name) = volume_info.name.as_ref() {
-        println!("    Name:          {}", name)
+        println!("    Name:            {}", name)
     }
-    println!("    Created at:    {}", &volume_info.created);
-    println!("    Block Size:    {}", volume_info.specs.block_size());
-    println!("    Cluster Size:  {}", volume_info.specs.cluster_size());
-    println!("    Content Hash:  {}", volume_info.specs.content_hash());
-    println!("    Metadata Hash: {}", volume_info.specs.meta_hash());
-    println!("    Branches:");
+    println!("    Created at:      {}", &volume_info.created);
+    println!("    Block Size:      {}", volume_info.specs.block_size());
+    println!("    Cluster Size:    {}", volume_info.specs.cluster_size());
+    println!("    Content Hash:    {}", volume_info.specs.content_hash());
+    println!("    Metadata Hash:   {}", volume_info.specs.meta_hash());
+    println!("    Branches & Tags: ");
 
-    while let Some((branch_name, branch_info)) = branches.try_next().await? {
-        let size = ByteSize::b((branch_info.commit.num_clusters() * cluster_size_bytes) as u64);
-        println!("        Branch Name:   {}", branch_name);
-        println!("        Latest Commit: {}", branch_info.commit.content_id());
-        println!("        Committed at:  {}", branch_info.commit.committed());
+    while let Some(commit_info) = commits.try_next().await? {
+        let size = ByteSize::b((commit_info.commit().num_clusters() * cluster_size_bytes) as u64);
+        match &commit_info {
+            CommitInfo::Branch(branch_name, _) => {
+                println!("            Branch Name: {}", branch_name);
+            }
+            CommitInfo::Tag(tag_name, _) => {
+                println!("               Tag Name: {}", tag_name);
+            }
+        }
         println!(
-            "        Size:          {} ({} clusters @ {})",
+            "          Latest Commit: {}",
+            commit_info.commit().content_id()
+        );
+        println!(
+            "           Committed at: {}",
+            commit_info.commit().committed()
+        );
+        println!(
+            "                   Size: {} ({} clusters @ {})",
             size.to_string_as(true),
-            branch_info.commit.num_clusters(),
+            commit_info.commit().num_clusters(),
             cluster_size_display.to_string_as(true)
         );
-        println!("------------------------------------");
+        println!("          ------------------------------------------");
     }
     println!();
     Ok(())
@@ -798,12 +901,14 @@ async fn resize_volume(
     pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_message("retrieving volume details");
     let mut branch_info = None;
-    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
+    let (volume_info, mut commits) = repo.volume_details(&vbd_id).await?;
     let specs = volume_info.specs;
-    while let Some((name, info)) = branches.try_next().await? {
-        if &name == &branch_name {
-            branch_info = Some(info);
-            break;
+    while let Some(commit_info) = commits.try_next().await? {
+        if let CommitInfo::Branch(name, info) = commit_info {
+            if &name == &branch_name {
+                branch_info = Some(info);
+                break;
+            }
         }
     }
     pb.finish_and_clear();
@@ -920,12 +1025,12 @@ async fn delete_volume(
     Ok(())
 }
 
-async fn create_branch(
+async fn create_commit(
     repo: &RepositoryHandler,
     repo_name: &str,
     volume_id: String,
-    branch_name: String,
-    commit: String,
+    commit_type: CommitType,
+    source: String,
 ) -> anyhow::Result<()> {
     println!("Selected Repository: {} - {}", repo_name, repo);
     println!();
@@ -937,7 +1042,7 @@ async fn create_branch(
     pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_message("retrieving volume details");
 
-    let (volume_info, _) = repo.volume_details(&vbd_id).await?;
+    let (volume_info, mut commits) = repo.volume_details(&vbd_id).await?;
 
     pb.finish_and_clear();
 
@@ -951,44 +1056,87 @@ async fn create_branch(
     );
     println!();
 
-    let commit_id = CommitId::try_from(
-        Hash::try_from((commit.as_str(), volume_info.specs.meta_hash()))
-            .map_err(|e| anyhow!("commit id in invalid: {}", e))?,
-    )?;
+    let (source_type, source_id) = match source.as_str().split_once(':') {
+        Some((source_type, source_id)) => (source_type, source_id),
+        None => ("commit", source.as_str()),
+    };
+
+    let commit_id = if source_type == "commit" {
+        CommitId::try_from(
+            Hash::try_from((source_id, volume_info.specs.meta_hash()))
+                .map_err(|e| anyhow!("commit id in invalid: {}", e))?,
+        )
+        .ok()
+    } else {
+        let mut commit_id = None;
+        while let Some(commit_info) = commits.try_next().await? {
+            match (source_type, commit_info) {
+                ("branch", CommitInfo::Branch(branch_name, branch_info))
+                    if branch_name.as_ref() == source_id =>
+                {
+                    commit_id = Some(branch_info.commit.content_id().clone());
+                    break;
+                }
+                ("tag", CommitInfo::Tag(tag_name, tag_info)) if tag_name.as_ref() == source_id => {
+                    commit_id = Some(tag_info.commit.content_id().clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        commit_id
+    };
+
+    let commit_id = commit_id.ok_or(anyhow!(
+        "{} not found or not a valid source identifier",
+        source
+    ))?;
 
     let pb = ProgressBar::new_spinner();
     pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_message("Branch creation in progress");
 
-    let (branch_name, branch_info) = repo.create_branch(branch_name, &vbd_id, &commit_id).await?;
+    let commit_info = repo
+        .create_commit(&commit_type, &vbd_id, &commit_id)
+        .await?;
 
-    pb.finish_with_message("Branch created successfully");
-    println!();
-    println!();
     let cluster_size_bytes = *volume_info.specs.block_size() * *volume_info.specs.cluster_size();
     let cluster_size_display = ByteSize::b(cluster_size_bytes as u64);
-    let size = ByteSize::b((branch_info.commit.num_clusters() * cluster_size_bytes) as u64);
-    println!("Branch Name:   {}", branch_name);
-    println!("Latest Commit: {}", branch_info.commit.content_id());
-    println!("Committed at:  {}", branch_info.commit.committed());
+    let size = ByteSize::b((commit_info.commit().num_clusters() * cluster_size_bytes) as u64);
+
+    match &commit_info {
+        CommitInfo::Branch(branch_name, _) => {
+            pb.finish_with_message("Branch created successfully");
+            println!();
+            println!();
+            println!("Branch Name:   {}", branch_name);
+        }
+        CommitInfo::Tag(tag_name, _) => {
+            pb.finish_with_message("Tag created successfully");
+            println!();
+            println!();
+            println!("Tag Name:   {}", tag_name);
+        }
+    }
+
+    println!("Latest Commit: {}", commit_info.commit().content_id());
+    println!("Committed at:  {}", commit_info.commit().committed());
     println!(
         "Size:          {} ({} clusters @ {})",
         size.to_string_as(true),
-        branch_info.commit.num_clusters(),
+        commit_info.commit().num_clusters(),
         cluster_size_display.to_string_as(true)
     );
     println!();
     Ok(())
 }
 
-async fn delete_branch(
+async fn delete_commit(
     repo: &RepositoryHandler,
     repo_name: &str,
     volume_id: String,
-    branch_name: String,
+    commit_type: CommitType,
 ) -> anyhow::Result<()> {
-    let branch_name =
-        BranchName::try_from(branch_name).map_err(|e| anyhow!("invalid branch name: {}", e))?;
     println!("Selected Repository: {} - {}", repo_name, repo);
     println!();
 
@@ -999,19 +1147,30 @@ async fn delete_branch(
     pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_message("retrieving volume details");
 
-    let (volume_info, mut branches) = repo.volume_details(&vbd_id).await?;
-    let mut branch_info = None;
+    let (volume_info, mut commits) = repo.volume_details(&vbd_id).await?;
+    let mut commit_info = None;
 
-    while let Some((existing, info)) = branches.try_next().await? {
-        if &branch_name == &existing {
-            branch_info = Some(info);
-            break;
+    while let Some(c) = commits.try_next().await? {
+        match (&c, &commit_type) {
+            (CommitInfo::Branch(existing, info), (CommitType::Branch(branch_name))) => {
+                if branch_name == existing {
+                    commit_info = Some(c);
+                    break;
+                }
+            }
+            (CommitInfo::Tag(existing, info), (CommitType::Tag(tag_name))) => {
+                if tag_name == existing {
+                    commit_info = Some(c);
+                    break;
+                }
+            }
+            _ => {}
         }
     }
 
     pb.finish_and_clear();
 
-    let branch_info = branch_info.ok_or(anyhow!("branch {} not found", branch_name))?;
+    let commit_info = commit_info.ok_or(anyhow!("branch / tag not found"))?;
 
     println!(
         "Selected Volume: {}",
@@ -1023,33 +1182,43 @@ async fn delete_branch(
     );
     println!();
 
-    println!("Deletion of the following Branch:");
     let cluster_size_bytes = *volume_info.specs.block_size() * *volume_info.specs.cluster_size();
     let cluster_size_display = ByteSize::b(cluster_size_bytes as u64);
-    let size = ByteSize::b((branch_info.commit.num_clusters() * cluster_size_bytes) as u64);
-    println!("Branch Name:   {}", branch_name);
-    println!("Latest Commit: {}", branch_info.commit.content_id());
-    println!("Committed at:  {}", branch_info.commit.committed());
+    let size = ByteSize::b((commit_info.commit().num_clusters() * cluster_size_bytes) as u64);
+
+    match &commit_info {
+        CommitInfo::Branch(branch_name, _) => {
+            println!("Deletion of the following Branch:");
+            println!("Branch Name:   {}", branch_name);
+        }
+        CommitInfo::Tag(tag_name, _) => {
+            println!("Deletion of the following Tag:");
+            println!("Tag Name:   {}", tag_name);
+        }
+    }
+
+    println!("Latest Commit: {}", commit_info.commit().content_id());
+    println!("Committed at:  {}", commit_info.commit().committed());
     println!(
         "Size:          {} ({} clusters @ {})",
         size.to_string_as(true),
-        branch_info.commit.num_clusters(),
+        commit_info.commit().num_clusters(),
         cluster_size_display.to_string_as(true)
     );
     println!();
     println!("WARNING: This operation can NOT be undone. DATA LOSS IMMINENT!");
-    println!("Only proceed if you are sure you want to PERMANENTLY DELETE the above branch!");
+    println!("Only proceed if you are sure you want to PERMANENTLY DELETE the above branch / tag!");
     println!();
-    if !ask_confirmation("Are you sure you want to delete this branch (y/n)?").await {
+    if !ask_confirmation("Are you sure you want to delete this (y/n)?").await {
         println!("Aborting");
         return Ok(());
     }
     let pb = ProgressBar::new_spinner();
     pb.enable_steady_tick(Duration::from_millis(50));
-    pb.set_message("Branch deletion in progress");
+    pb.set_message("Deletion in progress");
 
-    repo.delete_branch(&vbd_id, &branch_name).await?;
-    pb.finish_with_message("Branch deleted successfully");
+    repo.delete_commit(&vbd_id, &commit_type).await?;
+    pb.finish_with_message("Deletion successful");
     println!();
     println!();
     Ok(())

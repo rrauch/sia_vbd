@@ -1,6 +1,6 @@
 use crate::inventory::chunk::{Chunk, ChunkId, Manifest};
 use crate::io::{AsyncReadExtBuffered, WrappedReader};
-use crate::repository::{BranchInfo, VolumeInfo};
+use crate::repository::{BranchInfo, TagInfo, VolumeInfo};
 use crate::serde::framed::{FramedStream, FramingSink, InnerReader, ReadFrame, WriteFrame};
 use crate::serde::protos::frame;
 use crate::serde::{framed, protos, Body, BodyType, Compressed, Compression, Compressor};
@@ -255,6 +255,11 @@ impl<'a, T: InnerReader + 'a> DecodedStream<'a, T> {
                         let frame = DecodedReadFrame::new(branch_info, body, frame, fixed_specs);
                         Decoded::BranchInfo(frame)
                     }
+                    frame::header::Type::TagInfo(tag_info) => {
+                        let tag_info: TagInfo = tag_info.try_into()?;
+                        let frame = DecodedReadFrame::new(tag_info, body, frame, fixed_specs);
+                        Decoded::TagInfo(frame)
+                    }
                     frame::header::Type::ChunkInfo(chunk_info) => {
                         let chunk_id: ChunkId = chunk_info
                             .chunk_id
@@ -375,6 +380,7 @@ pub(crate) enum Decoded<R: InnerReader> {
     WalInfo(DecodedReadFrame<WalInfo, R, ()>),
     VolumeInfo(DecodedReadFrame<VolumeInfo, R, ()>),
     BranchInfo(DecodedReadFrame<BranchInfo, R, ()>),
+    TagInfo(DecodedReadFrame<TagInfo, R, ()>),
     ChunkInfo(DecodedReadFrame<ChunkId, R, Chunk>),
     Chunk(DecodedReadFrame<ChunkId, R, Chunk>),
     Manifest(DecodedReadFrame<Manifest, R, ()>),
@@ -391,6 +397,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::WalInfo(f) => f.position(),
             Self::VolumeInfo(f) => f.position(),
             Self::BranchInfo(f) => f.position(),
+            Self::TagInfo(f) => f.position(),
             Self::ChunkInfo(f) => f.position(),
             Self::Chunk(f) => f.position(),
             Self::Manifest(f) => f.position(),
@@ -407,6 +414,7 @@ impl<R: InnerReader> Decoded<R> {
             Self::WalInfo(f) => f.body.as_ref(),
             Self::VolumeInfo(f) => f.body.as_ref(),
             Self::BranchInfo(f) => f.body.as_ref(),
+            Self::TagInfo(f) => f.body.as_ref(),
             Self::ChunkInfo(f) => f.body.as_ref(),
             Self::Chunk(f) => f.body.as_ref(),
             Self::Manifest(f) => f.body.as_ref(),
@@ -547,6 +555,14 @@ impl Converter {
                 None,
                 false,
             ),
+            Encodable::TagInfo(tag_info) => (
+                frame::Header {
+                    r#type: Some(frame::header::Type::TagInfo(tag_info.into())),
+                    body: None,
+                },
+                None,
+                false,
+            ),
             Encodable::Chunk(chunk) => {
                 let mut buf = self.body_buf.get();
                 Into::<crate::repository::protos::volume::ChunkIndex>::into(chunk)
@@ -608,6 +624,7 @@ pub(crate) enum Encodable<'a> {
     WalInfo(&'a WalInfo),
     VolumeInfo(&'a VolumeInfo),
     BranchInfo(&'a BranchInfo),
+    TagInfo(&'a TagInfo),
     Chunk(&'a Chunk),
     Manifest(&'a Manifest),
 }
@@ -657,6 +674,12 @@ impl<'a> From<&'a VolumeInfo> for Encodable<'a> {
 impl<'a> From<&'a BranchInfo> for Encodable<'a> {
     fn from(value: &'a BranchInfo) -> Self {
         Encodable::BranchInfo(value)
+    }
+}
+
+impl<'a> From<&'a TagInfo> for Encodable<'a> {
+    fn from(value: &'a TagInfo) -> Self {
+        Encodable::TagInfo(value)
     }
 }
 
@@ -730,6 +753,9 @@ impl<'a> Display for Encodable<'a> {
             }
             Self::BranchInfo(branch_info) => {
                 write!(f, "BranchInfo[commit={}]", &branch_info.commit.content_id())
+            }
+            Self::TagInfo(tag_info) => {
+                write!(f, "TagInfo[commit={}]", &tag_info.commit.content_id())
             }
             Self::Chunk(chunk) => {
                 write!(

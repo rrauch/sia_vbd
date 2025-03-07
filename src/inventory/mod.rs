@@ -5,10 +5,10 @@ use crate::cache::Cache;
 use crate::hash::{Hash, HashAlgorithm};
 use crate::inventory::chunk::{Chunk, ChunkEntry, ChunkId, Manifest, ManifestId};
 use crate::inventory::syncer::Syncer;
-use crate::repository::{BranchInfo, VolumeHandler};
+use crate::repository::{CommitInfo, CommitType, VolumeHandler};
 use crate::vbd::{
     Block, BlockId, BlockSize, BranchName, Cluster, ClusterId, ClusterMut, ClusterSize, Commit,
-    FixedSpecs, Snapshot, SnapshotId, SnapshotMut, VbdId,
+    FixedSpecs, Snapshot, SnapshotId, SnapshotMut, TagName, VbdId,
 };
 use crate::wal::man::WalMan;
 use crate::wal::{TxDetails, WalId};
@@ -142,20 +142,24 @@ impl Inventory {
         sync_interval: Duration,
     ) -> Result<Self, anyhow::Error> {
         let temp_dir = TempDir::new_with_uuid(Uuid::now_v7()).await?;
-
+        let current_branch = CommitType::from(current_branch);
         let volume = Arc::new(volume);
         let specs = volume.volume_info().specs.clone();
-        let branches = volume.list_branches().await?.collect::<HashMap<_, _>>();
-        if !branches.contains_key(&current_branch) {
+        let commits = volume
+            .list_commits()
+            .await?
+            .map(|c| (c.to_commit_type(), c))
+            .collect::<HashMap<_, _>>();
+        if !commits.contains_key(&current_branch) {
             bail!("branch {} not found", current_branch);
         }
-        let pool = db_init(db_file, max_db_connections, &specs, &branches).await?;
+        let pool = db_init(db_file, max_db_connections, &specs, &commits).await?;
 
         tracing::debug!("loading inventory");
 
-        let remote_commit = branches
+        let remote_commit = commits
             .get(&current_branch)
-            .map(|b| &b.commit)
+            .map(|b| b.commit())
             .unwrap()
             .clone();
 
@@ -172,10 +176,15 @@ impl Inventory {
             local_commit
         };
 
+        let branch = match current_branch {
+            CommitType::Branch(b) => b,
+            _ => unreachable!(),
+        };
+
         let mut this = Self {
             specs,
             pool,
-            branch: current_branch,
+            branch,
             current_commit: commit,
             wal_man,
             volume,
@@ -1335,7 +1344,12 @@ impl Inventory {
         .rows_affected()
             > 0
         {
-            let commit = commit_from_db(&self.branch, &self.specs, tx.as_mut()).await?;
+            let commit = commit_from_db(
+                &CommitType::from(self.branch.clone()),
+                &self.specs,
+                tx.as_mut(),
+            )
+            .await?;
             if &commit > &self.current_commit {
                 newer_commit = Some(commit);
             }
@@ -1424,7 +1438,12 @@ impl Inventory {
             .await?;
 
             Self::process_tx_details(tx_details, tx.as_mut()).await?;
-            update_commit(self.branch(), &tx_details.commit, tx.as_mut()).await?;
+            update_commit(
+                &CommitType::from(self.branch.clone()),
+                &tx_details.commit,
+                tx.as_mut(),
+            )
+            .await?;
             Self::_sync_commits(
                 &self.specs,
                 &self.wal_man,
@@ -1442,29 +1461,33 @@ impl Inventory {
     }
 }
 
-async fn update_commit<S: AsRef<str>>(
-    branch: S,
+async fn update_commit(
+    commit_type: &CommitType,
     commit: &Commit,
     tx: &mut SqliteConnection,
 ) -> anyhow::Result<()> {
+    let (name, r#type) = match commit_type {
+        CommitType::Branch(b) => (b.as_ref(), "B"),
+        CommitType::Tag(t) => (t.as_ref(), "T"),
+    };
     let commit_id = commit.content_id().as_ref();
     let preceding_commit_id = commit.preceding_commit().as_ref();
     let snapshot_id = commit.snapshot().as_ref();
     let commited = commit.committed().timestamp_micros();
     let num_clusters = commit.num_clusters() as i64;
-    let branch = branch.as_ref();
     sqlx::query!(
         "
         UPDATE commits SET
         commit_id = ?, preceding_commit_id = ?, snapshot_id = ?, committed = ?, num_clusters = ?
-        WHERE name = ? and type = 'B'
+        WHERE name = ? and type = ?
         ",
         commit_id,
         preceding_commit_id,
         snapshot_id,
         commited,
         num_clusters,
-        branch
+        name,
+        r#type,
     )
     .execute(&mut *tx)
     .await?;
@@ -1472,17 +1495,21 @@ async fn update_commit<S: AsRef<str>>(
 }
 
 async fn commit_from_db(
-    branch: &BranchName,
+    commit_type: &CommitType,
     specs: &FixedSpecs,
     tx: &mut SqliteConnection,
 ) -> anyhow::Result<Commit> {
-    let branch = branch.as_ref();
+    let (name, r#type) = match commit_type {
+        CommitType::Branch(b) => (b.as_ref(), "B"),
+        CommitType::Tag(t) => (t.as_ref(), "T"),
+    };
     let r = sqlx::query!(
         "
         SELECT commit_id, preceding_commit_id, snapshot_id, committed, num_clusters
-        FROM commits WHERE name = ? AND type = 'B'
+        FROM commits WHERE name = ? AND type = ?
         ",
-        branch
+        name,
+        r#type,
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -1502,7 +1529,7 @@ async fn db_init(
     db_file: &Path,
     max_connections: u8,
     specs: &FixedSpecs,
-    branches: &HashMap<BranchName, BranchInfo>,
+    commits: &HashMap<CommitType, CommitInfo>,
 ) -> anyhow::Result<SqlitePool> {
     let writer = SqlitePoolOptions::new()
         .max_connections(1)
@@ -1605,7 +1632,11 @@ async fn db_init(
     .execute(tx.as_mut())
     .await?;
 
-    for num_clusters in branches.values().into_iter().map(|b| b.commit.num_clusters) {
+    for num_clusters in commits
+        .values()
+        .into_iter()
+        .map(|c| c.commit().num_clusters)
+    {
         let zero_snapshot = specs.zero_snapshot(num_clusters);
         let snapshot_id = zero_snapshot.content_id().as_ref();
         sqlx::query!(
@@ -1620,26 +1651,34 @@ async fn db_init(
         .await?;
     }
 
-    let to_delete = sqlx::query!("SELECT name FROM commits where type = 'B';")
-        .map(|r| r.name)
+    let to_delete = sqlx::query!("SELECT name, type FROM commits where type IN ('B', 'T');")
+        .map(|r| (r.name, r.r#type))
         .fetch_all(tx.as_mut())
         .await?
         .into_iter()
-        .filter(|b| {
-            match TryInto::<BranchName>::try_into(b) {
-                Ok(b) => !branches.contains_key(&b),
+        .filter(|(name, r#type)| {
+            match match r#type.as_str() {
+                "B" => BranchName::try_from(name).map(|b| CommitType::from(b)),
+                "T" => TagName::try_from(name).map(|t| CommitType::from(t)),
+                _ => unreachable!(),
+            } {
+                Ok(c) => !commits.contains_key(&c),
                 Err(_) => {
-                    // invalid branch name, delete
+                    // invalid name, delete
                     true
                 }
             }
         })
         .collect::<Vec<_>>();
 
-    for branch in to_delete {
-        sqlx::query!("DELETE FROM commits WHERE name = ? AND type = 'B';", branch)
-            .execute(tx.as_mut())
-            .await?;
+    for (name, r#type) in to_delete {
+        sqlx::query!(
+            "DELETE FROM commits WHERE name = ? AND type = ?;",
+            name,
+            r#type
+        )
+        .execute(tx.as_mut())
+        .await?;
     }
 
     // delete locked commits
@@ -1647,28 +1686,34 @@ async fn db_init(
         .execute(tx.as_mut())
         .await?;
 
-    for (branch, commit) in branches.iter().map(|(s, b)| (s, &b.commit)) {
+    for commit_info in commits.values() {
+        let commit = commit_info.commit();
         let commit_id = commit.content_id().as_ref();
         let preceding_commit_id = commit.preceding_commit().as_ref();
         let snapshot_id = commit.snapshot().as_ref();
         let committed = commit.committed().timestamp_micros();
         let num_clusters = commit.num_clusters() as i64;
-        let branch = branch.as_ref();
+        let (name, r#type) = match commit_info {
+            CommitInfo::Branch(name, _) => (name.as_ref(), "B"),
+            CommitInfo::Tag(name, _) => (name.as_ref(), "T"),
+        };
         sqlx::query!(
             "
             INSERT INTO commits (name, type, commit_id, preceding_commit_id, snapshot_id, committed, num_clusters)
-            SELECT ?, 'B', ?, ?, ?, ?, ?
+            SELECT ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
-                SELECT 1 FROM commits WHERE name = ? and type = 'B'
+                SELECT 1 FROM commits WHERE name = ? and type = ?
             )
             ",
-            branch,
+            name,
+            r#type,
             commit_id,
             preceding_commit_id,
             snapshot_id,
             committed,
             num_clusters,
-            branch
+            name,
+            r#type,
     )
             .execute(tx.as_mut())
             .await?;

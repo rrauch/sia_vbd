@@ -3,7 +3,7 @@ use crate::inventory::chunk::{
     Chunk, ChunkContent, ChunkEntry, ChunkId, ChunkWriter, Manifest, ManifestId,
 };
 use crate::inventory::{commit_from_db, sync_chunk, sync_chunk_file, sync_manifest};
-use crate::repository::VolumeHandler;
+use crate::repository::{CommitType, VolumeHandler};
 use crate::vbd::{BlockId, BranchName, ClusterId, Commit, FixedSpecs, SnapshotId};
 use crate::wal::man::WalMan;
 use crate::wal::WalId;
@@ -318,7 +318,7 @@ async fn pack_chunks(
 ) -> anyhow::Result<()> {
     tracing::debug!("packing chunks");
     let mut tx = pool.write().begin().await?;
-    let commit = commit_from_db(branch, specs, tx.as_mut()).await?;
+    let commit = commit_from_db(&CommitType::from(branch.clone()), specs, tx.as_mut()).await?;
     {
         let commit_id = commit.content_id().as_ref();
         let preceding_commit_id = commit.preceding_commit().as_ref();

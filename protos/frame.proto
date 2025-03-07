@@ -48,6 +48,7 @@ message Header {
     volume.ChunkInfo chunk_info = 18;
     Chunk chunk = 19;
     volume.Manifest manifest = 20;
+    volume.TagInfo tag_info = 21;
   }
 }
 

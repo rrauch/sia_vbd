@@ -2,10 +2,10 @@ use crate::hash::HashAlgorithm;
 use crate::inventory::chunk::{ChunkId, ManifestId};
 use crate::io::AsyncReadExtBuffered;
 use crate::repository::{
-    read_volume, Reader, Repository, Stream, Volume, VolumeInfo, VOLUME_MAGIC_NUMBER,
+    read_volume, CommitType, Reader, Repository, Stream, Volume, VolumeInfo, VOLUME_MAGIC_NUMBER,
 };
 use crate::serde::encoded::{Decoded, Decoder};
-use crate::vbd::{BlockSize, BranchName, ClusterSize, FixedSpecs, VbdId};
+use crate::vbd::{BlockSize, BranchName, ClusterSize, FixedSpecs, TagName, VbdId};
 use crate::Etag;
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
@@ -105,7 +105,7 @@ impl Repository for RenterdRepository {
     ) -> Result<
         (
             VolumeInfo,
-            impl Stream<Item = Result<(BranchName, Bytes), Self::Error>> + 'static,
+            impl Stream<Item = Result<(CommitType, Bytes), Self::Error>> + 'static,
         ),
         Self::Error,
     > {
@@ -126,13 +126,17 @@ impl Repository for RenterdRepository {
                 match res.map(|o| {
                     o.as_file()
                         .map(|f| {
-                            f.name()
-                                .strip_suffix(".branch")
-                                .map(|name| BranchName::try_from(name))
+                            if let Some(name) = f.name().strip_suffix(".branch") {
+                                Some(BranchName::try_from(name).map(|b| CommitType::Branch(b)))
+                            } else if let Some(name) = f.name().strip_suffix(".tag") {
+                                Some(TagName::try_from(name).map(|t| CommitType::Tag(t)))
+                            } else {
+                                None
+                            }
                         })
                         .flatten()
                 }) {
-                    Ok(Some(Ok(name))) => Some(Ok(name)),
+                    Ok(Some(Ok(commit_type))) => Some(Ok(commit_type)),
                     Ok(None) => None,
                     Ok(Some(Err(err))) => Some(Err(err)),
                     Err(err) => Some(Err(err)),
@@ -144,13 +148,17 @@ impl Repository for RenterdRepository {
                 let commits_path = commits_path.clone();
                 async move {
                     match r {
-                        Ok(branch_name) => {
-                            match commits_path
-                                .try_join(format!("{}.branch", branch_name).as_str(), false)
-                            {
+                        Ok(commit_type) => {
+                            let file_name = match &commit_type {
+                                CommitType::Branch(branch_name) => {
+                                    format!("{}.branch", branch_name)
+                                }
+                                CommitType::Tag(tag_name) => format!("{}.tag", tag_name),
+                            };
+                            match commits_path.try_join(file_name.as_str(), false) {
                                 Ok(path) => read_commit(&renterd, &path, &bucket)
                                     .await
-                                    .map(|data| (branch_name, data)),
+                                    .map(|data| (commit_type, data)),
                                 Err(err) => Err(err),
                             }
                         }
@@ -213,17 +221,21 @@ impl Repository for RenterdRepository {
         Ok(())
     }
 
-    async fn write_branch(
+    async fn write_commit(
         &self,
         vbd_id: &VbdId,
-        branch_name: &BranchName,
+        commit_type: &CommitType,
         data: Bytes,
     ) -> anyhow::Result<()> {
         let len = data.len() as u64;
+        let file_name = match commit_type {
+            CommitType::Branch(branch_name) => format!("{}.branch", branch_name.as_ref()),
+            CommitType::Tag(tag_name) => format!("{}.tag", tag_name.as_ref()),
+        };
         write_file(
             &self.renterd,
             &self.commits_path(vbd_id)?,
-            format!("{}.branch", branch_name.as_ref()).as_str(),
+            file_name.as_str(),
             &self.bucket,
             None,
             Cursor::new(data),
@@ -234,10 +246,15 @@ impl Repository for RenterdRepository {
         Ok(())
     }
 
-    async fn delete_branch(&self, vbd_id: &VbdId, branch_name: &BranchName) -> anyhow::Result<()> {
+    async fn delete_commit(&self, vbd_id: &VbdId, commit_type: &CommitType) -> anyhow::Result<()> {
+        let file_name = match commit_type {
+            CommitType::Branch(branch_name) => format!("{}.branch", branch_name.as_ref()),
+            CommitType::Tag(tag_name) => format!("{}.tag", tag_name.as_ref()),
+        };
+
         let path = self
             .commits_path(vbd_id)?
-            .try_join(format!("{}.branch", branch_name.as_ref()).as_str(), false)?;
+            .try_join(file_name.as_str(), false)?;
         self.renterd
             .bus()
             .object()
@@ -371,11 +388,13 @@ impl RenterdVolume {
         Ok(dir.try_join(format!("{}.chunk", chunk_id).as_str(), false)?)
     }
 
-    fn commit_path(&self, branch_name: &BranchName) -> anyhow::Result<Path> {
-        Ok(self
-            .commits
-            .path()
-            .try_join(format!("{}.branch", branch_name.as_ref()).as_str(), false)?)
+    fn commit_path(&self, commit_type: &CommitType) -> anyhow::Result<Path> {
+        let file_name = match commit_type {
+            CommitType::Branch(branch_name) => format!("{}.branch", branch_name.as_ref()),
+            CommitType::Tag(tag_name) => format!("{}.tag", tag_name.as_ref()),
+        };
+
+        Ok(self.commits.path().try_join(file_name.as_str(), false)?)
     }
 }
 
@@ -554,23 +573,31 @@ impl Volume for RenterdVolume {
         Ok(())
     }
 
-    async fn branches(
+    async fn commits(
         &self,
-    ) -> Result<impl Stream<Item = Result<BranchName, Self::Error>> + 'static, Self::Error> {
+    ) -> Result<impl Stream<Item = Result<CommitType, Self::Error>> + 'static, Self::Error> {
         let stream = list_dir(&self.renterd, &self.bucket, self.commits.path())
             .await?
             .filter_map(|res| async {
                 match res.map(|o| {
                     o.as_file()
                         .map(|f| {
-                            f.name()
-                                .strip_suffix(".branch")
-                                .map(|name| BranchName::try_from(name).ok())
+                            if let Some(name) = f.name().strip_suffix(".branch") {
+                                Some(
+                                    BranchName::try_from(name)
+                                        .map(|b| CommitType::Branch(b))
+                                        .ok(),
+                                )
+                            } else if let Some(name) = f.name().strip_suffix(".tag") {
+                                Some(TagName::try_from(name).map(|t| CommitType::Tag(t)).ok())
+                            } else {
+                                None
+                            }
                         })
                         .flatten()
                         .flatten()
                 }) {
-                    Ok(Some(name)) => Some(Ok(name)),
+                    Ok(Some(commit_type)) => Some(Ok(commit_type)),
                     Ok(None) => None,
                     Err(err) => Some(Err(err)),
                 }
@@ -578,12 +605,20 @@ impl Volume for RenterdVolume {
         Ok(Box::pin(stream))
     }
 
-    async fn write_commit(&self, branch: &BranchName, commit: Bytes) -> Result<(), Self::Error> {
+    async fn write_commit(
+        &self,
+        commit_type: &CommitType,
+        commit: Bytes,
+    ) -> Result<(), Self::Error> {
+        let file_name = match commit_type {
+            CommitType::Branch(branch_name) => format!("{}.branch", branch_name.as_ref()),
+            CommitType::Tag(tag_name) => format!("{}.tag", tag_name.as_ref()),
+        };
         let path = self.commits.path();
         write_file(
             &self.renterd,
             &path,
-            format!("{}.branch", branch.as_ref()).as_str(),
+            file_name.as_str(),
             &self.bucket,
             None,
             Cursor::new(commit),
@@ -595,8 +630,8 @@ impl Volume for RenterdVolume {
         Ok(())
     }
 
-    async fn read_commit(&self, branch: &BranchName) -> Result<Bytes, Self::Error> {
-        let path = self.commit_path(branch)?;
+    async fn read_commit(&self, commit_type: &CommitType) -> Result<Bytes, Self::Error> {
+        let path = self.commit_path(commit_type)?;
         read_commit(&self.renterd, &path, &self.bucket).await
     }
 }
